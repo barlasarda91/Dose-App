@@ -1,0 +1,93 @@
+// Pure calculation logic for Dose analytics — no I/O, fully unit-testable.
+
+const LBS_TO_GRAMS = 453.592;
+const GALLONS_TO_ML = 3785.41;
+
+// Tally Square orders into per-item counts, per-item milk modifier counts,
+// and overall milk modifier totals.
+function aggregateOrders(orders) {
+  const itemCounts = {};
+  // itemMilk tracks per-item modifier counts: { 'Caffe Latte': { whole: 12, oat: 8, almond: 3 } }
+  const itemMilk = {};
+  const mods = { milk_whole: 0, milk_oat: 0, milk_almond: 0 };
+  for (const order of orders) {
+    for (const item of (order.line_items || [])) {
+      const name = item.name || 'Unknown';
+      const qty = parseInt(item.quantity || '1', 10);
+      itemCounts[name] = (itemCounts[name] || 0) + qty;
+      if (!itemMilk[name]) itemMilk[name] = { whole: 0, oat: 0, almond: 0 };
+      for (const mod of (item.modifiers || [])) {
+        const n = (mod.name || '').toLowerCase().trim();
+        if (n === 'whole')  { mods.milk_whole  += qty; itemMilk[name].whole  += qty; }
+        if (n === 'oat')    { mods.milk_oat    += qty; itemMilk[name].oat    += qty; }
+        if (n === 'almond') { mods.milk_almond += qty; itemMilk[name].almond += qty; }
+      }
+    }
+  }
+  return {
+    orders: Object.entries(itemCounts).map(([name, qty]) => ({
+      name, qty,
+      milk: itemMilk[name] || { whole: 0, oat: 0, almond: 0 },
+    })),
+    modifiers: mods,
+  };
+}
+
+// Opening stock for a cycle, in grams. The deliveries passed in must belong to
+// the cycle ONLY — the closing delivery (the one that ends the cycle) must NOT
+// be included, since its received bags belong to the next cycle and its
+// on-hand count is the previous cycle's closing truth.
+//   stock = (on_hand + received) at first delivery, + received at later ones
+function calcCoffeeStock(dels, receivedField, onhandField) {
+  if (dels.length === 0) return 0;
+  const first = dels[0];
+  let stock = (first[onhandField] + first[receivedField]) * LBS_TO_GRAMS;
+  for (let i = 1; i < dels.length; i++) stock += dels[i][receivedField] * LBS_TO_GRAMS;
+  return stock;
+}
+
+// Efficiency for one pool.
+// Closed cycle (actualRemaining from the closing delivery's on-hand count):
+//   waste = theoretical remaining - actual remaining, flagged when > 5% of stock
+// Open cycle: theoretical use vs stock only, no waste verdict.
+function calcEfficiency({ stocked, used: usedRaw, actualRemaining = null, cycleOpen }) {
+  const used = Math.round(usedRaw * 10) / 10;
+  if (!stocked) {
+    return {
+      stocked: 0, used, efficiency_pct: null,
+      theoretical_remaining: null, actual_remaining: null, waste: null,
+      flag: used > 0 ? 'NO_STOCK_LOGGED' : null, cycle_open: cycleOpen,
+    };
+  }
+  const theoreticalRem = stocked - used;
+  const pct = Math.round((used / stocked) * 1000) / 10;
+  let flag = null;
+  let waste = null;
+  if (used > stocked) {
+    flag = 'OVER_EXPECTED';
+  } else if (!cycleOpen && actualRemaining !== null) {
+    waste = theoreticalRem - actualRemaining;
+    if (waste > stocked * 0.05) flag = 'WASTE';
+  }
+  return {
+    stocked: Math.round(stocked * 10) / 10,
+    used,
+    efficiency_pct: pct,
+    theoretical_remaining: Math.round(theoreticalRem * 10) / 10,
+    actual_remaining: actualRemaining !== null ? Math.round(actualRemaining * 10) / 10 : null,
+    waste: waste !== null ? Math.round(waste * 10) / 10 : null,
+    flag,
+    cycle_open: cycleOpen,
+  };
+}
+
+// Suggested order for one pool, in whole lbs: enough for `horizonDays` at the
+// current burn rate, minus what should still be on the shelf.
+function suggestOrderLbs({ usedGrams, days, expectedRemainingGrams, horizonDays = 7 }) {
+  const burnPerDay = days > 0 ? usedGrams / days : 0;
+  const remaining = Math.max(0, expectedRemainingGrams || 0);
+  const needGrams = burnPerDay * horizonDays - remaining;
+  return Math.max(0, Math.ceil(needGrams / LBS_TO_GRAMS));
+}
+
+module.exports = { LBS_TO_GRAMS, GALLONS_TO_ML, aggregateOrders, calcCoffeeStock, calcEfficiency, suggestOrderLbs };
