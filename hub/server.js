@@ -139,6 +139,19 @@ function genLoginUsername(name) {
   return candidate;
 }
 
+// Boot + live diagnostics: which optional config the running process actually
+// has (booleans only — never values).
+const configReport = () => ({
+  ok: true,
+  email_configured: !!process.env.RESEND_API_KEY,
+  email_from_set: !!process.env.HUB_EMAIL_FROM,
+  notify_email_set: !!process.env.HUB_NOTIFY_EMAIL,
+  password_set: !!process.env.HUB_PASSWORD,
+  currency: CURRENCY,
+});
+console.log('Hub config:', JSON.stringify(configReport()));
+app.get('/api/health', (req, res) => res.json(configReport()));
+
 // ─── Roastery auth (shared password from HUB_PASSWORD) ───────────────────────
 const HUB_PASSWORD = process.env.HUB_PASSWORD || '';
 if (!HUB_PASSWORD) console.warn('WARNING: HUB_PASSWORD is not set — the hub dashboard cannot be logged into until it is.');
