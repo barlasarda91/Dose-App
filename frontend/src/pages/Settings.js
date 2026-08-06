@@ -138,6 +138,7 @@ export default function Settings({ me }) {
       resendSource: s.resend_source,
       hubConfigured: !!s.hub_configured,
       authMode: s.auth_mode || 'local',
+      storagePersistent: s.storage_persistent,
     });
   }
   useEffect(() => { load().catch(() => {}); }, []);
@@ -188,6 +189,17 @@ export default function Settings({ me }) {
         {isAdmin ? 'Square API, ordering, users, security, and dose reference.' : 'Shop info, your password, and dose reference.'}
       </p>
       <hr className="page-rule" />
+
+      {status.storagePersistent === false && (
+        <div className="error-banner">
+          <span>⚠</span>
+          <div>
+            <strong>No persistent volume — all data on this shop is erased on every deploy.</strong><br />
+            In Railway: right-click this service → Attach Volume → mount path <code>/app/data</code>, then redeploy
+            and re-enter your credentials once. Until then, every build wipes settings, orders, and stock history.
+          </div>
+        </div>
+      )}
 
       {isAdmin && (
         <div className="settings-section">
