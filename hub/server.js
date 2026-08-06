@@ -139,13 +139,23 @@ function genLoginUsername(name) {
   return candidate;
 }
 
+// Env values pasted into dashboards often pick up stray whitespace or
+// wrapping quotes — normalize before use.
+function cleanEnv(v) {
+  let s = String(v || '').trim();
+  if ((s.startsWith('"') && s.endsWith('"')) || (s.startsWith("'") && s.endsWith("'"))) s = s.slice(1, -1).trim();
+  return s;
+}
+const RESEND_KEY = cleanEnv(process.env.RESEND_API_KEY);
+
 // Boot + live diagnostics: which optional config the running process actually
-// has (booleans only — never values).
+// has (booleans and lengths only — never values).
 const configReport = () => ({
   ok: true,
-  email_configured: !!process.env.RESEND_API_KEY,
-  email_from_set: !!process.env.HUB_EMAIL_FROM,
-  notify_email_set: !!process.env.HUB_NOTIFY_EMAIL,
+  email_configured: !!RESEND_KEY,
+  email_key_length: RESEND_KEY.length, // Resend keys are ~36 chars — a short value means a truncated paste
+  email_from_set: !!cleanEnv(process.env.HUB_EMAIL_FROM),
+  notify_email_set: !!cleanEnv(process.env.HUB_NOTIFY_EMAIL),
   password_set: !!process.env.HUB_PASSWORD,
   currency: CURRENCY,
 });
@@ -205,10 +215,10 @@ app.post('/api/login', (req, res) => {
 
 // ─── Email (Resend) ───────────────────────────────────────────────────────────
 async function sendEmail(to, subject, html) {
-  const apiKey = process.env.RESEND_API_KEY;
+  const apiKey = RESEND_KEY;
   if (!apiKey) return { sent: false, reason: 'RESEND_API_KEY not set on the hub' };
   if (!to) return { sent: false, reason: 'No recipient email registered for this shop' };
-  const from = process.env.HUB_EMAIL_FROM || 'Dose Hub <onboarding@resend.dev>';
+  const from = cleanEnv(process.env.HUB_EMAIL_FROM) || 'Dose Hub <onboarding@resend.dev>';
   try {
     const res = await fetch('https://api.resend.com/emails', {
       method: 'POST',
