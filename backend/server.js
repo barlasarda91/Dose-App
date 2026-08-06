@@ -9,7 +9,9 @@ const { generateReport } = require('./report');
 const { LBS_TO_GRAMS, GALLONS_TO_ML, aggregateOrders, calcCoffeeStock, calcEfficiency, suggestOrderLbs } = require('./calc');
 
 const app = express();
-app.use(cors());
+// Same-origin in production (frontend is served by this server) — CORS headers
+// are only needed for the dev server proxy setup.
+if (process.env.NODE_ENV !== 'production') app.use(cors());
 app.use(express.json());
 
 const dbPath = process.env.DB_PATH || '/app/data/dose.db';
@@ -40,6 +42,7 @@ db.exec(`
     pourover_lbs_received REAL DEFAULT 0,
     pourover_lbs_onhand  REAL DEFAULT 0,
     notes TEXT,
+    created_by TEXT,
     created_at TEXT DEFAULT (datetime('now'))
   );
 
@@ -49,6 +52,7 @@ db.exec(`
     whole_bottles_received REAL DEFAULT 0,
     whole_bottles_onhand   REAL DEFAULT 0,
     notes TEXT,
+    created_by TEXT,
     created_at TEXT DEFAULT (datetime('now'))
   );
 
@@ -63,6 +67,7 @@ db.exec(`
     status TEXT DEFAULT 'saved',
     sent_to TEXT,
     sent_at TEXT,
+    created_by TEXT,
     created_at TEXT DEFAULT (datetime('now'))
   );
 
@@ -82,6 +87,8 @@ db.exec(`
 
   CREATE TABLE IF NOT EXISTS sessions (
     token TEXT PRIMARY KEY,
+    user_id INTEGER,
+    expires_at TEXT,
     created_at TEXT DEFAULT (datetime('now'))
   );
 
@@ -106,23 +113,66 @@ function setSetting(key, value) {
 
 // Secrets live in the shop's own database (entered via Settings after login);
 // environment variables remain as a fallback so older deployments keep working.
+// If DOSE_SECRET_KEY is set, stored secrets are AES-256-GCM encrypted so a
+// leaked database file alone reveals nothing.
+const SECRET_KEY = process.env.DOSE_SECRET_KEY
+  ? crypto.createHash('sha256').update(process.env.DOSE_SECRET_KEY).digest()
+  : null;
+
+function encryptSecret(plain) {
+  if (!SECRET_KEY || !plain) return plain;
+  const iv = crypto.randomBytes(12);
+  const cipher = crypto.createCipheriv('aes-256-gcm', SECRET_KEY, iv);
+  const enc = Buffer.concat([cipher.update(String(plain), 'utf8'), cipher.final()]);
+  return `enc:v1:${iv.toString('base64')}:${cipher.getAuthTag().toString('base64')}:${enc.toString('base64')}`;
+}
+
+function decryptSecret(stored) {
+  if (!stored || !stored.startsWith('enc:v1:')) return stored;
+  if (!SECRET_KEY) throw new Error('Stored credential is encrypted but DOSE_SECRET_KEY is not set');
+  const [, , ivB64, tagB64, dataB64] = stored.split(':');
+  const decipher = crypto.createDecipheriv('aes-256-gcm', SECRET_KEY, Buffer.from(ivB64, 'base64'));
+  decipher.setAuthTag(Buffer.from(tagB64, 'base64'));
+  return Buffer.concat([decipher.update(Buffer.from(dataB64, 'base64')), decipher.final()]).toString('utf8');
+}
+
 function getSecret(settingKey, envName) {
   const v = (getSettings()[settingKey] || '').trim();
-  return v || process.env[envName] || '';
+  if (v) return decryptSecret(v);
+  return process.env[envName] || '';
 }
 
 // ─── Auth ─────────────────────────────────────────────────────────────────────
 // Real user accounts with roles ('admin' | 'user'). There is no
-// self-registration: the one-time setup screen creates the ADMIN account
-// (done by whoever provisions the deployment, before clients get the URL),
-// and only admins can create further accounts. Passwords are stored as
-// salted scrypt hashes; login exchanges credentials for a random session
-// token tied to the user.
+// self-registration: the one-time setup screen creates the ADMIN account and
+// requires a setup code printed to the server logs, so only whoever operates
+// the deployment can claim it. Passwords are salted scrypt hashes (async so
+// hashing never blocks the event loop). Login is rate-limited and exchanges
+// credentials for a random session token; the DB stores only the SHA-256 of
+// the token, and sessions expire.
 
-// Older databases have a sessions table without user_id — add it in place.
+// Older databases predate some columns — add them in place.
 try { db.exec('ALTER TABLE sessions ADD COLUMN user_id INTEGER'); } catch { /* already present */ }
+try { db.exec('ALTER TABLE sessions ADD COLUMN expires_at TEXT'); } catch { /* already present */ }
+for (const t of ['coffee_deliveries', 'milk_deliveries', 'coffee_orders', 'drink_recipes']) {
+  try { db.exec(`ALTER TABLE ${t} ADD COLUMN created_by TEXT`); } catch { /* already present */ }
+}
 
-function hashPassword(password, saltHex) {
+const { promisify } = require('util');
+const scryptAsync = promisify(crypto.scrypt);
+
+const SESSION_DAYS = 30;
+const SESSION_RENEW_BELOW_DAYS = 15;
+const PASSWORD_MIN = { admin: 10, user: 6 };
+
+async function hashPassword(password, saltHex) {
+  const salt = saltHex ? Buffer.from(saltHex, 'hex') : crypto.randomBytes(16);
+  const hash = await scryptAsync(String(password), salt, 64);
+  return { salt: salt.toString('hex'), hash: hash.toString('hex') };
+}
+
+// Boot-time only (seeding/migration) — blocking is fine before listen().
+function hashPasswordSync(password, saltHex) {
   const salt = saltHex ? Buffer.from(saltHex, 'hex') : crypto.randomBytes(16);
   const hash = crypto.scryptSync(String(password), salt, 64);
   return { salt: salt.toString('hex'), hash: hash.toString('hex') };
@@ -131,19 +181,27 @@ function hashPassword(password, saltHex) {
 const USERNAME_RE = /^[a-z0-9][a-z0-9._-]{2,31}$/;
 const normUsername = u => String(u || '').toLowerCase().trim();
 const publicUser = u => ({ id: u.id, username: u.username, role: u.role, created_at: u.created_at });
+const sha256 = s => crypto.createHash('sha256').update(s).digest('hex');
+const passwordPolicyError = role =>
+  `Password must be at least ${PASSWORD_MIN[role] || 6} characters${role === 'admin' ? ' for admin accounts' : ''}`;
 
-function createUser(username, password, role) {
-  const { salt, hash } = hashPassword(password);
+// Constant-cost dummy so login timing doesn't reveal whether a username exists.
+const DUMMY = hashPasswordSync('dummy-password');
+
+async function createUser(username, password, role) {
+  const { salt, hash } = await hashPassword(password);
   const r = db.prepare('INSERT INTO users (username, password_hash, salt, role) VALUES (?,?,?,?)')
     .run(normUsername(username), hash, salt, role);
   return db.prepare('SELECT * FROM users WHERE id=?').get(r.lastInsertRowid);
 }
 
-function verifyUser(username, password) {
+async function verifyUser(username, password) {
   const u = db.prepare('SELECT * FROM users WHERE username=?').get(normUsername(username));
-  if (!u) return null;
-  const { hash } = hashPassword(password, u.salt);
-  return crypto.timingSafeEqual(Buffer.from(hash, 'hex'), Buffer.from(u.password_hash, 'hex')) ? u : null;
+  const salt = u ? u.salt : DUMMY.salt;
+  const expected = u ? u.password_hash : DUMMY.hash;
+  const { hash } = await hashPassword(password, salt);
+  const ok = crypto.timingSafeEqual(Buffer.from(hash, 'hex'), Buffer.from(expected, 'hex'));
+  return (u && ok) ? u : null;
 }
 
 function usersExist() {
@@ -152,9 +210,16 @@ function usersExist() {
 
 function issueToken(userId) {
   const token = crypto.randomBytes(32).toString('hex');
-  db.prepare('INSERT INTO sessions (token, user_id) VALUES (?,?)').run(token, userId);
+  db.prepare(`INSERT INTO sessions (token, user_id, expires_at) VALUES (?,?, datetime('now', '+${SESSION_DAYS} days'))`)
+    .run(sha256(token), userId);
   return token;
 }
+
+function purgeExpiredSessions() {
+  db.prepare("DELETE FROM sessions WHERE expires_at IS NULL OR expires_at <= datetime('now')").run();
+}
+purgeExpiredSessions();
+setInterval(purgeExpiredSessions, 6 * 60 * 60 * 1000).unref();
 
 // One-time migrations into the users table:
 //  - a legacy shared password (settings) becomes the 'admin' account
@@ -167,20 +232,74 @@ if (!usersExist()) {
     db.prepare("DELETE FROM settings WHERE key IN ('auth_password_hash','auth_salt')").run();
     console.log("Migrated shared password to user 'admin' — log in as admin with the same password");
   } else if (process.env.DOSE_PASSWORD) {
-    createUser(process.env.ADMIN_USERNAME || 'admin', process.env.DOSE_PASSWORD, 'admin');
+    const { salt, hash } = hashPasswordSync(process.env.DOSE_PASSWORD);
+    db.prepare('INSERT INTO users (username, password_hash, salt, role) VALUES (?,?,?,?)')
+      .run(normUsername(process.env.ADMIN_USERNAME || 'admin'), hash, salt, 'admin');
     console.log(`Seeded admin account '${process.env.ADMIN_USERNAME || 'admin'}' from env`);
   }
 }
+
+// Setup code: while no admin exists, claiming the deployment requires a code
+// that is only visible in the server logs — closes the window where a fresh
+// deployment could be claimed by whoever finds the URL first.
+let setupCode = null;
+if (!usersExist()) {
+  setupCode = process.env.SETUP_SECRET || crypto.randomBytes(4).toString('hex');
+  console.log('');
+  console.log('══════════════════════════════════════════════════════════');
+  console.log(`  DOSE SETUP CODE: ${setupCode}`);
+  console.log('  Enter this code on the first-run setup screen to create');
+  console.log('  the admin account. Only visible in these server logs.');
+  console.log('══════════════════════════════════════════════════════════');
+  console.log('');
+}
+
+// Login rate limiting: escalating lockout per IP and per username.
+const loginFailures = new Map(); // key → { count, until }
+const LOCK_AFTER = 5;
+function lockedFor(key) {
+  const e = loginFailures.get(key);
+  if (!e || e.count < LOCK_AFTER) return 0;
+  return Math.max(0, Math.ceil((e.until - Date.now()) / 1000));
+}
+function recordFailure(key) {
+  const e = loginFailures.get(key) || { count: 0, until: 0 };
+  e.count += 1;
+  if (e.count >= LOCK_AFTER) {
+    const lockMs = Math.min(15 * 60_000, 30_000 * 2 ** (e.count - LOCK_AFTER));
+    e.until = Date.now() + lockMs;
+  }
+  loginFailures.set(key, e);
+}
+function clearFailures(...keys) { for (const k of keys) loginFailures.delete(k); }
+setInterval(() => {
+  const cutoff = Date.now() - 60 * 60_000;
+  for (const [k, e] of loginFailures) if (e.until < cutoff) loginFailures.delete(k);
+}, 10 * 60_000).unref();
+
+const asyncRoute = fn => (req, res) => fn(req, res).catch(err => {
+  console.error(err);
+  res.status(500).json({ error: err.message });
+});
 
 const OPEN_PATHS = new Set(['/login', '/setup', '/auth-status']);
 
 app.use('/api', (req, res, next) => {
   if (OPEN_PATHS.has(req.path)) return next();
   const token = req.get('x-dose-key') || '';
-  const user = token && db.prepare(
-    'SELECT u.id, u.username, u.role FROM sessions s JOIN users u ON u.id = s.user_id WHERE s.token=?'
-  ).get(token);
-  if (user) { req.user = user; return next(); }
+  const row = token && db.prepare(
+    `SELECT s.token AS thash, s.expires_at, u.id, u.username, u.role
+     FROM sessions s JOIN users u ON u.id = s.user_id
+     WHERE s.token=? AND s.expires_at > datetime('now')`
+  ).get(sha256(token));
+  if (row) {
+    // Sliding renewal: extend active sessions nearing expiry
+    if (new Date(row.expires_at + 'Z') - Date.now() < SESSION_RENEW_BELOW_DAYS * 86400_000) {
+      db.prepare(`UPDATE sessions SET expires_at = datetime('now', '+${SESSION_DAYS} days') WHERE token=?`).run(row.thash);
+    }
+    req.user = { id: row.id, username: row.username, role: row.role };
+    return next();
+  }
   res.status(401).json({ error: 'Unauthorized' });
 });
 
@@ -190,71 +309,86 @@ function requireAdmin(req, res, next) {
 }
 
 app.get('/api/auth-status', (req, res) => {
-  res.json({ setup_required: !usersExist() });
+  const setup = !usersExist();
+  res.json({ setup_required: setup, setup_code_required: setup });
 });
 
-// First run only: create the admin account.
-app.post('/api/setup', (req, res) => {
+// First run only: create the admin account. Requires the setup code from the
+// server logs.
+app.post('/api/setup', asyncRoute(async (req, res) => {
   if (usersExist()) return res.status(400).json({ error: 'Already set up — use login' });
-  const { username, password } = req.body || {};
+  const { username, password, setup_code } = req.body || {};
+  if (!setupCode || !crypto.timingSafeEqual(
+    crypto.createHash('sha256').update(String(setup_code || '')).digest(),
+    crypto.createHash('sha256').update(setupCode).digest()
+  )) return res.status(403).json({ error: 'Wrong setup code — find it in the server logs (Railway → Deployments → View Logs)' });
   const uname = normUsername(username);
   if (!USERNAME_RE.test(uname)) return res.status(400).json({ error: 'Username: 3–32 chars, letters/numbers/._- only' });
-  if (String(password || '').length < 6) return res.status(400).json({ error: 'Password must be at least 6 characters' });
-  const u = createUser(uname, password, 'admin');
+  if (String(password || '').length < PASSWORD_MIN.admin) return res.status(400).json({ error: passwordPolicyError('admin') });
+  const u = await createUser(uname, password, 'admin');
+  setupCode = null;
   res.json({ ok: true, token: issueToken(u.id), user: publicUser(u) });
-});
+}));
 
-app.post('/api/login', (req, res) => {
+app.post('/api/login', asyncRoute(async (req, res) => {
   if (!usersExist()) return res.status(409).json({ error: 'Setup required' });
   const { username, password } = req.body || {};
-  const u = verifyUser(username, password || '');
-  if (!u) return res.status(401).json({ error: 'Wrong username or password' });
+  const ipKey = `ip:${req.ip}`;
+  const userKey = `u:${normUsername(username)}`;
+  const wait = Math.max(lockedFor(ipKey), lockedFor(userKey));
+  if (wait > 0) return res.status(429).json({ error: `Too many attempts — try again in ${wait}s` });
+  const u = await verifyUser(username, password || '');
+  if (!u) {
+    recordFailure(ipKey); recordFailure(userKey);
+    return res.status(401).json({ error: 'Wrong username or password' });
+  }
+  clearFailures(ipKey, userKey);
   res.json({ ok: true, token: issueToken(u.id), user: publicUser(u) });
-});
+}));
 
 app.get('/api/me', (req, res) => res.json(req.user));
 
 // Change your own password; signs out your other sessions.
-app.post('/api/change-password', (req, res) => {
+app.post('/api/change-password', asyncRoute(async (req, res) => {
   const { current_password, new_password } = req.body || {};
   const u = db.prepare('SELECT * FROM users WHERE id=?').get(req.user.id);
-  if (!verifyUser(u.username, current_password || '')) return res.status(401).json({ error: 'Current password is wrong' });
-  if (String(new_password || '').length < 6) return res.status(400).json({ error: 'New password must be at least 6 characters' });
-  const { salt, hash } = hashPassword(new_password);
+  if (!(await verifyUser(u.username, current_password || ''))) return res.status(401).json({ error: 'Current password is wrong' });
+  if (String(new_password || '').length < (PASSWORD_MIN[u.role] || 6)) return res.status(400).json({ error: passwordPolicyError(u.role) });
+  const { salt, hash } = await hashPassword(new_password);
   db.prepare('UPDATE users SET password_hash=?, salt=? WHERE id=?').run(hash, salt, u.id);
   db.prepare('DELETE FROM sessions WHERE user_id=?').run(u.id);
   res.json({ ok: true, token: issueToken(u.id) });
-});
+}));
 
 // ─── User management (admin only) ────────────────────────────────────────────
 app.get('/api/users', requireAdmin, (req, res) => {
   res.json(db.prepare('SELECT id, username, role, created_at FROM users ORDER BY username').all());
 });
 
-app.post('/api/users', requireAdmin, (req, res) => {
+app.post('/api/users', requireAdmin, asyncRoute(async (req, res) => {
   const { username, password, role } = req.body || {};
   const uname = normUsername(username);
-  if (!USERNAME_RE.test(uname)) return res.status(400).json({ error: 'Username: 3–32 chars, letters/numbers/._- only' });
-  if (String(password || '').length < 6) return res.status(400).json({ error: 'Password must be at least 6 characters' });
   const r = role === 'admin' ? 'admin' : 'user';
+  if (!USERNAME_RE.test(uname)) return res.status(400).json({ error: 'Username: 3–32 chars, letters/numbers/._- only' });
+  if (String(password || '').length < PASSWORD_MIN[r]) return res.status(400).json({ error: passwordPolicyError(r) });
   try {
-    res.json(publicUser(createUser(uname, password, r)));
+    res.json(publicUser(await createUser(uname, password, r)));
   } catch (err) {
     if (String(err.message).includes('UNIQUE')) return res.status(400).json({ error: 'Username already exists' });
     throw err;
   }
-});
+}));
 
-app.post('/api/users/:id/reset-password', requireAdmin, (req, res) => {
+app.post('/api/users/:id/reset-password', requireAdmin, asyncRoute(async (req, res) => {
   const target = db.prepare('SELECT * FROM users WHERE id=?').get(req.params.id);
   if (!target) return res.status(404).json({ error: 'User not found' });
   const { new_password } = req.body || {};
-  if (String(new_password || '').length < 6) return res.status(400).json({ error: 'Password must be at least 6 characters' });
-  const { salt, hash } = hashPassword(new_password);
+  if (String(new_password || '').length < (PASSWORD_MIN[target.role] || 6)) return res.status(400).json({ error: passwordPolicyError(target.role) });
+  const { salt, hash } = await hashPassword(new_password);
   db.prepare('UPDATE users SET password_hash=?, salt=? WHERE id=?').run(hash, salt, target.id);
   db.prepare('DELETE FROM sessions WHERE user_id=?').run(target.id); // sign them out everywhere
   res.json({ ok: true });
-});
+}));
 
 app.delete('/api/users/:id', requireAdmin, (req, res) => {
   const target = db.prepare('SELECT * FROM users WHERE id=?').get(req.params.id);
@@ -297,7 +431,9 @@ app.post('/api/settings', (req, res) => {
     'shop_name', ...ADMIN_ONLY,
   ];
   for (const key of allowed) {
-    if (req.body[key] !== undefined) setSetting(key, String(req.body[key]).trim());
+    if (req.body[key] === undefined) continue;
+    const value = String(req.body[key]).trim();
+    setSetting(key, SECRET_SETTINGS.includes(key) ? encryptSecret(value) : value);
   }
   if (req.body.square_access_token !== undefined) cachedLocations = null; // token changed → re-resolve locations
   res.json({ success: true });
@@ -538,8 +674,8 @@ app.get('/api/recipes', (req, res) => res.json(db.prepare('SELECT * FROM drink_r
 
 app.post('/api/recipes', (req, res) => {
   const { square_item_name, category, coffee_grams, milk_whole_ml, notes } = req.body;
-  const r = db.prepare('INSERT INTO drink_recipes (square_item_name,category,coffee_grams,milk_whole_ml,notes) VALUES (?,?,?,?,?)')
-    .run(square_item_name, category, coffee_grams, milk_whole_ml || 0, notes || null);
+  const r = db.prepare('INSERT INTO drink_recipes (square_item_name,category,coffee_grams,milk_whole_ml,notes,created_by) VALUES (?,?,?,?,?,?)')
+    .run(square_item_name, category, coffee_grams, milk_whole_ml || 0, notes || null, req.user.username);
   res.json(db.prepare('SELECT * FROM drink_recipes WHERE id=?').get(r.lastInsertRowid));
 });
 
@@ -564,14 +700,14 @@ app.post('/api/coffee-deliveries', (req, res) => {
     notes } = req.body;
   const r = db.prepare(`INSERT INTO coffee_deliveries
     (delivery_date, espresso_lbs_received, espresso_lbs_onhand, drip_lbs_received, drip_lbs_onhand,
-     coldbrew_lbs_received, coldbrew_lbs_onhand, pourover_lbs_received, pourover_lbs_onhand, notes)
-    VALUES (?,?,?,?,?,?,?,?,?,?)`)
+     coldbrew_lbs_received, coldbrew_lbs_onhand, pourover_lbs_received, pourover_lbs_onhand, notes, created_by)
+    VALUES (?,?,?,?,?,?,?,?,?,?,?)`)
     .run(delivery_date,
       espresso_lbs_received||0, espresso_lbs_onhand||0,
       drip_lbs_received||0,     drip_lbs_onhand||0,
       coldbrew_lbs_received||0, coldbrew_lbs_onhand||0,
       pourover_lbs_received||0, pourover_lbs_onhand||0,
-      notes||null);
+      notes||null, req.user.username);
   res.json(db.prepare('SELECT * FROM coffee_deliveries WHERE id=?').get(r.lastInsertRowid));
 });
 
@@ -582,8 +718,8 @@ app.get('/api/milk-deliveries', (req, res) => res.json(db.prepare('SELECT * FROM
 
 app.post('/api/milk-deliveries', (req, res) => {
   const { delivery_date, whole_bottles_received, whole_bottles_onhand, notes } = req.body;
-  const r = db.prepare('INSERT INTO milk_deliveries (delivery_date,whole_bottles_received,whole_bottles_onhand,notes) VALUES (?,?,?,?)')
-    .run(delivery_date, whole_bottles_received||0, whole_bottles_onhand||0, notes||null);
+  const r = db.prepare('INSERT INTO milk_deliveries (delivery_date,whole_bottles_received,whole_bottles_onhand,notes,created_by) VALUES (?,?,?,?,?)')
+    .run(delivery_date, whole_bottles_received||0, whole_bottles_onhand||0, notes||null, req.user.username);
   res.json(db.prepare('SELECT * FROM milk_deliveries WHERE id=?').get(r.lastInsertRowid));
 });
 
@@ -671,9 +807,9 @@ app.post('/api/orders', async (req, res) => {
       return res.status(400).json({ error: 'Order must include at least one pool quantity' });
 
     const cfg = getSettings();
-    const r = db.prepare(`INSERT INTO coffee_orders (order_date, espresso_lbs, drip_lbs, coldbrew_lbs, pourover_lbs, notes)
-      VALUES (?,?,?,?,?,?)`)
-      .run(order_date, qty.espresso_lbs, qty.drip_lbs, qty.coldbrew_lbs, qty.pourover_lbs, notes || null);
+    const r = db.prepare(`INSERT INTO coffee_orders (order_date, espresso_lbs, drip_lbs, coldbrew_lbs, pourover_lbs, notes, created_by)
+      VALUES (?,?,?,?,?,?,?)`)
+      .run(order_date, qty.espresso_lbs, qty.drip_lbs, qty.coldbrew_lbs, qty.pourover_lbs, notes || null, req.user.username);
     const order = db.prepare('SELECT * FROM coffee_orders WHERE id=?').get(r.lastInsertRowid);
 
     const email = await sendOrderEmail(order, cfg);

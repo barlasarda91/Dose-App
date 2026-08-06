@@ -15,6 +15,7 @@ function Gate({ mode }) {
   const [username, setUsername] = useState('');
   const [pw, setPw]           = useState('');
   const [confirm, setConfirm] = useState('');
+  const [code, setCode]       = useState('');
   const [err, setErr]         = useState(null);
   const [busy, setBusy]       = useState(false);
   const isSetup = mode === 'setup';
@@ -28,7 +29,7 @@ function Gate({ mode }) {
       const res = await fetch(isSetup ? '/api/setup' : '/api/login', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ username, password: pw }),
+        body: JSON.stringify({ username, password: pw, ...(isSetup ? { setup_code: code } : {}) }),
       });
       const data = await res.json().catch(() => ({}));
       if (res.ok && data.token) {
@@ -51,13 +52,21 @@ function Gate({ mode }) {
         <div className="login-sub">Boxx Coffee Roasters Co.</div>
         {isSetup && (
           <p style={{ fontFamily: 'var(--font-mono)', fontSize: 11, color: 'var(--graphite)', lineHeight: 1.7, marginBottom: 14 }}>
-            First-time setup — create the <strong>admin</strong> account for this shop. The admin creates all other user accounts from Settings.
+            First-time setup — create the <strong>admin</strong> account for this shop. You'll need the setup code
+            from the server logs (Railway → Deployments → View Logs). The admin creates all other user accounts from Settings.
           </p>
         )}
-        <label className="form-lbl" htmlFor="dose-user">{isSetup ? 'Admin Username' : 'Username'}</label>
+        {isSetup && (
+          <>
+            <label className="form-lbl" htmlFor="dose-code">Setup Code</label>
+            <input id="dose-code" type="text" className="form-input" autoCapitalize="none" autoCorrect="off"
+              value={code} onChange={e => setCode(e.target.value)} />
+          </>
+        )}
+        <label className="form-lbl" htmlFor="dose-user" style={isSetup ? { marginTop: 8 } : undefined}>{isSetup ? 'Admin Username' : 'Username'}</label>
         <input id="dose-user" type="text" className="form-input" autoFocus autoCapitalize="none" autoCorrect="off"
           value={username} onChange={e => setUsername(e.target.value)} />
-        <label className="form-lbl" htmlFor="dose-pw" style={{ marginTop: 8 }}>{isSetup ? 'Create Password' : 'Password'}</label>
+        <label className="form-lbl" htmlFor="dose-pw" style={{ marginTop: 8 }}>{isSetup ? 'Create Password (min 10 chars)' : 'Password'}</label>
         <input id="dose-pw" type="password" className="form-input"
           value={pw} onChange={e => setPw(e.target.value)} />
         {isSetup && (
@@ -68,7 +77,7 @@ function Gate({ mode }) {
           </>
         )}
         {err && <div className="login-err">{err}</div>}
-        <button className="btn btn-primary" type="submit" disabled={busy || !pw || !username} style={{ marginTop: 14, width: '100%' }}>
+        <button className="btn btn-primary" type="submit" disabled={busy || !pw || !username || (isSetup && !code)} style={{ marginTop: 14, width: '100%' }}>
           {busy ? '…' : isSetup ? 'Create Admin & Enter' : 'Enter'}
         </button>
       </form>

@@ -88,7 +88,7 @@ function UsersSection() {
           </div>
           <div className="form-group">
             <label className="form-lbl">Password</label>
-            <input type="password" className="form-input" placeholder="min 6 characters" autoComplete="new-password"
+            <input type="password" className="form-input" placeholder={form.role === 'admin' ? 'min 10 characters' : 'min 6 characters'} autoComplete="new-password"
               value={form.password} onChange={e => setForm(p => ({ ...p, password: e.target.value }))} />
           </div>
           <div className="form-group">
