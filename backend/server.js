@@ -23,6 +23,27 @@ const dbPath = process.env.DB_PATH || '/app/data/dose.db';
 require('fs').mkdirSync(require('path').dirname(dbPath), { recursive: true });
 const db = new Database(dbPath);
 
+// Detect whether the database directory sits on a mounted volume. Without
+// one, every deploy wipes all data (settings, users, orders) — surfaced as a
+// loud warning in logs and in Settings.
+function storageIsPersistent() {
+  try {
+    const mounts = require('fs').readFileSync('/proc/self/mounts', 'utf8')
+      .split('\n').map(l => l.split(' ')[1]).filter(Boolean);
+    const dir = require('path').dirname(dbPath);
+    return mounts.some(m => m !== '/' && (dir === m || dir.startsWith(m + '/')));
+  } catch {
+    return null; // can't tell (non-Linux dev machine)
+  }
+}
+if (process.env.NODE_ENV === 'production' && storageIsPersistent() === false) {
+  console.warn('╔══════════════════════════════════════════════════════════════╗');
+  console.warn(`║ WARNING: ${dbPath} is NOT on a persistent volume.`);
+  console.warn('║ ALL DATA WILL BE LOST ON EVERY DEPLOY.');
+  console.warn('║ Railway: attach a volume to this service, mount path /app/data');
+  console.warn('╚══════════════════════════════════════════════════════════════╝');
+}
+
 db.exec(`
   CREATE TABLE IF NOT EXISTS drink_recipes (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -604,6 +625,7 @@ app.get('/api/settings', (req, res) => {
   s.hub_configured = !!getSecret('hub_api_key', 'HUB_API_KEY');
   s.auth_mode = s.hub_configured ? 'hub' : 'local';
   s.password_protected = true; // login is always required
+  s.storage_persistent = process.env.NODE_ENV === 'production' ? storageIsPersistent() : true;
   res.json(s);
 });
 

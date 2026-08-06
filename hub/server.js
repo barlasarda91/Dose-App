@@ -202,8 +202,18 @@ const RESEND_KEY = cleanEnv(process.env.RESEND_API_KEY);
 
 // Boot + live diagnostics: which optional config the running process actually
 // has (booleans and lengths only — never values).
+function storageIsPersistent() {
+  try {
+    const mounts = require('fs').readFileSync('/proc/self/mounts', 'utf8')
+      .split('\n').map(l => l.split(' ')[1]).filter(Boolean);
+    const dir = path.dirname(dbPath);
+    return mounts.some(m => m !== '/' && (dir === m || dir.startsWith(m + '/')));
+  } catch { return null; }
+}
+
 const configReport = () => ({
   ok: true,
+  storage_persistent: process.env.NODE_ENV === 'production' ? storageIsPersistent() : true,
   email_configured: !!RESEND_KEY,
   email_key_length: RESEND_KEY.length, // Resend keys are ~36 chars — a short value means a truncated paste
   email_from_set: !!cleanEnv(process.env.HUB_EMAIL_FROM),
