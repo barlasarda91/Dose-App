@@ -157,6 +157,7 @@ try { db.exec('ALTER TABLE sessions ADD COLUMN expires_at TEXT'); } catch { /* a
 for (const t of ['coffee_deliveries', 'milk_deliveries', 'coffee_orders', 'drink_recipes']) {
   try { db.exec(`ALTER TABLE ${t} ADD COLUMN created_by TEXT`); } catch { /* already present */ }
 }
+try { db.exec('ALTER TABLE coffee_orders ADD COLUMN hub_status TEXT'); } catch { /* already present */ }
 
 const { promisify } = require('util');
 const scryptAsync = promisify(crypto.scrypt);
@@ -402,7 +403,7 @@ app.delete('/api/users/:id', requireAdmin, (req, res) => {
 });
 
 // ─── Settings ─────────────────────────────────────────────────────────────────
-const SECRET_SETTINGS = ['square_access_token', 'resend_api_key'];
+const SECRET_SETTINGS = ['square_access_token', 'resend_api_key', 'hub_api_key'];
 const HIDDEN_SETTINGS = new Set([...SECRET_SETTINGS, 'auth_password_hash', 'auth_salt']);
 
 app.get('/api/settings', (req, res) => {
@@ -416,13 +417,14 @@ app.get('/api/settings', (req, res) => {
   s.resend_configured = !!getSecret('resend_api_key', 'RESEND_API_KEY');
   s.resend_source = (cfg.resend_api_key || '').trim() ? 'settings'
     : (process.env.RESEND_API_KEY ? 'env' : null);
+  s.hub_configured = !!((cfg.hub_url || '').trim() && getSecret('hub_api_key', 'HUB_API_KEY'));
   s.password_protected = true; // login is always required
   res.json(s);
 });
 
 app.post('/api/settings', (req, res) => {
   // Day-to-day settings are open to any user; credentials are admin-only.
-  const ADMIN_ONLY = [...SECRET_SETTINGS, 'order_email_to', 'order_email_from', 'square_location_id'];
+  const ADMIN_ONLY = [...SECRET_SETTINGS, 'order_email_to', 'order_email_from', 'square_location_id', 'hub_url'];
   if (ADMIN_ONLY.some(k => req.body[k] !== undefined) && req.user.role !== 'admin')
     return res.status(403).json({ error: 'Admin access required to change credentials' });
   const allowed = [
@@ -790,6 +792,32 @@ async function sendOrderEmail(order, cfg) {
   }
 }
 
+// Push a sent order to the roastery hub, when one is configured in Settings.
+// Email and hub are independent transports — failure of one doesn't block the
+// other, and the order is always saved locally first.
+async function pushOrderToHub(order, cfg) {
+  const url = (cfg.hub_url || '').trim().replace(/\/+$/, '');
+  const apiKey = getSecret('hub_api_key', 'HUB_API_KEY');
+  if (!url || !apiKey) return { pushed: false, reason: 'Hub not configured' };
+  try {
+    const res = await fetch(`${url}/api/ingest/orders`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${apiKey}` },
+      body: JSON.stringify({
+        order_date: order.order_date,
+        espresso_lbs: order.espresso_lbs, drip_lbs: order.drip_lbs,
+        coldbrew_lbs: order.coldbrew_lbs, pourover_lbs: order.pourover_lbs,
+        notes: order.notes, placed_by: order.created_by, source_order_id: order.id,
+      }),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) return { pushed: false, reason: data.error || `Hub error (${res.status})` };
+    return { pushed: true };
+  } catch (err) {
+    return { pushed: false, reason: err.message };
+  }
+}
+
 app.get('/api/orders', (req, res) =>
   res.json(db.prepare('SELECT * FROM coffee_orders ORDER BY order_date DESC, id DESC').all()));
 
@@ -812,12 +840,17 @@ app.post('/api/orders', async (req, res) => {
       .run(order_date, qty.espresso_lbs, qty.drip_lbs, qty.coldbrew_lbs, qty.pourover_lbs, notes || null, req.user.username);
     const order = db.prepare('SELECT * FROM coffee_orders WHERE id=?').get(r.lastInsertRowid);
 
-    const email = await sendOrderEmail(order, cfg);
-    db.prepare('UPDATE coffee_orders SET status=?, sent_to=?, sent_at=? WHERE id=?')
-      .run(email.sent ? 'sent' : 'email_failed', email.sent ? email.to : null,
-           email.sent ? new Date().toISOString() : null, order.id);
+    const [email, hub] = await Promise.all([sendOrderEmail(order, cfg), pushOrderToHub(order, cfg)]);
+    // 'sent' if the roastery got it by either transport; 'email_failed' only
+    // when nothing reached them.
+    db.prepare('UPDATE coffee_orders SET status=?, sent_to=?, sent_at=?, hub_status=? WHERE id=?')
+      .run((email.sent || hub.pushed) ? 'sent' : 'email_failed',
+           email.sent ? email.to : null,
+           (email.sent || hub.pushed) ? new Date().toISOString() : null,
+           hub.pushed ? 'sent' : (hub.reason === 'Hub not configured' ? null : 'failed'),
+           order.id);
 
-    res.json({ order: db.prepare('SELECT * FROM coffee_orders WHERE id=?').get(order.id), email });
+    res.json({ order: db.prepare('SELECT * FROM coffee_orders WHERE id=?').get(order.id), email, hub });
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: err.message });

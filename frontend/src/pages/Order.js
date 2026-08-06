@@ -104,10 +104,17 @@ export default function Order() {
       )}
 
       {result && (
-        <div className={result.email?.sent ? 'success-banner' : 'warn-box'}>
-          {result.email?.sent
-            ? <>✓ Order sent to {result.email.to}. It's logged below — use Duplicate next time to reorder in one click.</>
-            : <>⚠ Order saved to the log, but the email didn't go out: {result.email?.reason}</>}
+        <div className={(result.email?.sent || result.hub?.pushed) ? 'success-banner' : 'warn-box'}>
+          {(result.email?.sent || result.hub?.pushed) ? '✓ ' : '⚠ '}
+          {result.email?.sent && <>Order emailed to {result.email.to}. </>}
+          {result.hub?.pushed && <>Order delivered to the roastery hub. </>}
+          {!result.email?.sent && (
+            <>Email: {result.email?.reason} </>
+          )}
+          {!result.hub?.pushed && result.hub?.reason !== 'Hub not configured' && (
+            <>Hub: {result.hub?.reason} </>
+          )}
+          {(result.email?.sent || result.hub?.pushed) && <>It's logged below — use Duplicate next time to reorder in one click.</>}
         </div>
       )}
       {error && <div className="error-banner"><span>⚠</span><div>{error}</div></div>}
