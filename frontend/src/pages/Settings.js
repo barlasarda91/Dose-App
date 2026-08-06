@@ -119,7 +119,7 @@ export default function Settings({ me }) {
   const [squareToken, setSquareToken] = useState('');
   const [resendKey, setResendKey]     = useState('');
   const [hubApiKey, setHubApiKey]     = useState('');
-  const [status, setStatus] = useState({ tokenSet: false, tokenSource: null, resendConfigured: false, resendSource: null, hubConfigured: false });
+  const [status, setStatus] = useState({ tokenSet: false, tokenSource: null, resendConfigured: false, resendSource: null, hubConfigured: false, authMode: 'local' });
   const [saved, setSaved]   = useState(false);
   const [pwForm, setPwForm] = useState({ current: '', next: '', confirm: '' });
   const [pwMsg, setPwMsg]   = useState(null);
@@ -137,6 +137,7 @@ export default function Settings({ me }) {
       resendConfigured: !!s.resend_configured,
       resendSource: s.resend_source,
       hubConfigured: !!s.hub_configured,
+      authMode: s.auth_mode || 'local',
     });
   }
   useEffect(() => { load().catch(() => {}); }, []);
@@ -210,65 +211,32 @@ export default function Settings({ me }) {
               </div>
             </div>
 
-            <div className="settings-field">
-              <label className="settings-field-lbl">Location ID <span style={{ fontWeight: 300, textTransform: 'none', letterSpacing: 0 }}>(optional)</span></label>
-              <input type="text" placeholder="L1234ABCD…" value={locationId} onChange={e => setLocationId(e.target.value)} style={{ maxWidth: 320 }} />
-              <div className="settings-field-hint">Leave blank to query all locations.</div>
+            <div style={{ display: 'flex', gap: 20, flexWrap: 'wrap' }}>
+              <div className="settings-field">
+                <label className="settings-field-lbl">Location ID <span style={{ fontWeight: 300, textTransform: 'none', letterSpacing: 0 }}>(optional)</span></label>
+                <input type="text" placeholder="L1234ABCD…" value={locationId} onChange={e => setLocationId(e.target.value)} style={{ width: 240 }} />
+                <div className="settings-field-hint">Leave blank to query all locations.</div>
+              </div>
+              <div className="settings-field">
+                <label className="settings-field-lbl">Shop Name</label>
+                <input type="text" placeholder="e.g. Boxx Coffee — Kadıköy" value={shopName} onChange={e => setShopName(e.target.value)} style={{ width: 240 }} />
+                <div className="settings-field-hint">Identifies this location on orders and reports.</div>
+              </div>
             </div>
           </div>
         </div>
       )}
-
-      <div className="settings-section">
-        <div className="section-title">Shop</div>
-        <div className="settings-card">
-          <div className="settings-field">
-            <label className="settings-field-lbl">Shop Name</label>
-            <input type="text" placeholder="e.g. Boxx Coffee — Kadıköy" value={shopName} onChange={e => setShopName(e.target.value)} style={{ maxWidth: 320 }} />
-            <div className="settings-field-hint">Shown in the order email so the roastery knows which shop is ordering.</div>
-          </div>
-        </div>
-      </div>
 
       {isAdmin && (
         <div className="settings-section">
           <div className="section-title">Ordering</div>
           <div className="settings-card">
             <div className="settings-field">
-              <label className="settings-field-lbl">Order Email</label>
-              <input type="text" placeholder="hello@boxxcoffee.com" value={orderEmail} onChange={e => setOrderEmail(e.target.value)} style={{ maxWidth: 320 }} />
-              <div className="settings-field-hint">Where Place Order sends the order.</div>
-            </div>
-
-            <div className="settings-field">
-              <label className="settings-field-lbl">Resend API Key</label>
-              <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginTop: 4, marginBottom: 8 }}>
-                <span className={`conn-status ${status.resendConfigured ? 'ok' : 'fail'}`} style={{ marginTop: 0 }}>
-                  {status.resendConfigured
-                    ? `● Email sending configured${sourceNote(status.resendSource)}`
-                    : '✕ Not set — orders are saved to the log but not emailed'}
-                </span>
-              </div>
-              <input type="password" placeholder={status.resendConfigured ? '•••••••• (leave blank to keep current)' : 're_…'}
-                value={resendKey} onChange={e => setResendKey(e.target.value)} style={{ maxWidth: 420 }}
-                autoComplete="new-password" />
-              <div className="settings-field-hint">From resend.com → API Keys. Free tier covers ordering comfortably.</div>
-            </div>
-
-            <div className="settings-field">
-              <label className="settings-field-lbl">From Address <span style={{ fontWeight: 300, textTransform: 'none', letterSpacing: 0 }}>(optional)</span></label>
-              <input type="text" placeholder="Dose Orders <orders@yourdomain.com>" value={orderFrom} onChange={e => setOrderFrom(e.target.value)} style={{ maxWidth: 420 }} />
-              <div className="settings-field-hint">
-                Must be a Resend-verified sender. Leave blank to use the default (onboarding@resend.dev — can only deliver to your own Resend account email).
-              </div>
-            </div>
-
-            <div className="settings-field">
               <label className="settings-field-lbl">Roastery Hub</label>
               <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginTop: 4, marginBottom: 8 }}>
                 <span className={`conn-status ${status.hubConfigured ? 'ok' : 'fail'}`} style={{ marginTop: 0 }}>
                   {status.hubConfigured
-                    ? '● Connected — orders are pushed to the roastery hub'
+                    ? '● Connected — you order from the roastery price list, and sign-ins are verified by the hub'
                     : '✕ Not connected — orders go by email only'}
                 </span>
               </div>
@@ -278,9 +246,40 @@ export default function Settings({ me }) {
                   value={hubApiKey} onChange={e => setHubApiKey(e.target.value)} autoComplete="new-password" />
               </div>
               <div className="settings-field-hint">
-                The roastery creates this shop in their Dose Hub (Shops tab) and gives you the API key. Once set, every sent order also appears in their inbox.
+                The roastery creates this shop in their Dose Hub and gives you the API key. Receipts and confirmations are emailed by the hub to your registered address.
               </div>
             </div>
+
+            {!status.hubConfigured && (
+              <>
+                <div className="settings-field">
+                  <label className="settings-field-lbl">Order Email</label>
+                  <input type="text" placeholder="hello@boxxcoffee.com" value={orderEmail} onChange={e => setOrderEmail(e.target.value)} style={{ maxWidth: 320 }} />
+                  <div className="settings-field-hint">Where Place Order sends the order when no hub is connected.</div>
+                </div>
+
+                <div className="settings-field">
+                  <label className="settings-field-lbl">Resend API Key</label>
+                  <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginTop: 4, marginBottom: 8 }}>
+                    <span className={`conn-status ${status.resendConfigured ? 'ok' : 'fail'}`} style={{ marginTop: 0 }}>
+                      {status.resendConfigured
+                        ? `● Email sending configured${sourceNote(status.resendSource)}`
+                        : '✕ Not set — orders are saved to the log but not emailed'}
+                    </span>
+                  </div>
+                  <input type="password" placeholder={status.resendConfigured ? '•••••••• (leave blank to keep current)' : 're_…'}
+                    value={resendKey} onChange={e => setResendKey(e.target.value)} style={{ maxWidth: 420 }}
+                    autoComplete="new-password" />
+                  <div className="settings-field-hint">From resend.com → API Keys. Only needed when no hub is connected.</div>
+                </div>
+
+                <div className="settings-field">
+                  <label className="settings-field-lbl">From Address <span style={{ fontWeight: 300, textTransform: 'none', letterSpacing: 0 }}>(optional)</span></label>
+                  <input type="text" placeholder="Dose Orders <orders@yourdomain.com>" value={orderFrom} onChange={e => setOrderFrom(e.target.value)} style={{ maxWidth: 420 }} />
+                  <div className="settings-field-hint">Must be a Resend-verified sender.</div>
+                </div>
+              </>
+            )}
           </div>
         </div>
       )}
@@ -290,7 +289,18 @@ export default function Settings({ me }) {
         {saved && <span className="conn-status ok" style={{ marginTop: 0 }}>✓ Saved</span>}
       </div>
 
-      {isAdmin && <UsersSection />}
+      {isAdmin && status.authMode !== 'hub' && <UsersSection />}
+      {isAdmin && status.authMode === 'hub' && (
+        <div className="settings-section">
+          <div className="section-title">Users</div>
+          <div className="settings-card">
+            <div className="settings-field-hint">
+              Sign-ins for this shop are managed by the roastery hub — everyone uses the shop credentials the roastery
+              issued. To change the login or reset the password, contact the roastery (or use Change My Password below).
+            </div>
+          </div>
+        </div>
+      )}
 
       <div className="settings-section">
         <div className="section-title">Security</div>
@@ -299,7 +309,9 @@ export default function Settings({ me }) {
             <label className="settings-field-lbl">Change My Password{me ? ` (${me.username})` : ''}</label>
             <div className="settings-field-hint" style={{ marginBottom: 10 }}>
               Changing your password signs you out on every other device.
-              {!isAdmin && ' Forgot it? Ask your admin to reset it.'}
+              {status.authMode === 'hub'
+                ? ' Your login is managed by the roastery hub — changing it here updates it at the hub for everyone using this shop account.'
+                : (!isAdmin ? ' Forgot it? Ask your admin to reset it.' : '')}
             </div>
             <div style={{ display: 'flex', flexDirection: 'column', gap: 10, maxWidth: 320 }}>
               <input type="password" placeholder="Current password" value={pwForm.current}

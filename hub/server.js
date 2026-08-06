@@ -95,6 +95,9 @@ db.exec(`
 
 // Databases created before this version predate some columns.
 try { db.exec('ALTER TABLE shops ADD COLUMN email TEXT'); } catch { /* present */ }
+for (const col of ['login_username TEXT', 'password_hash TEXT', 'salt TEXT']) {
+  try { db.exec(`ALTER TABLE shops ADD COLUMN ${col}`); } catch { /* present */ }
+}
 for (const col of ['requested_date TEXT', 'total_lbs REAL DEFAULT 0', 'total_cost REAL']) {
   try { db.exec(`ALTER TABLE orders ADD COLUMN ${col}`); } catch { /* present */ }
 }
@@ -102,6 +105,38 @@ for (const col of ['requested_date TEXT', 'total_lbs REAL DEFAULT 0', 'total_cos
 const sha256 = s => crypto.createHash('sha256').update(String(s)).digest('hex');
 const SESSION_DAYS = 30;
 const money = v => `${CURRENCY}${(Math.round(v * 100) / 100).toFixed(2)}`;
+
+// ─── Shop login credentials ──────────────────────────────────────────────────
+// The hub is the identity provider for shop apps: each shop has a login
+// username (derived from its name), an email, and a password. Shop
+// deployments verify logins against /api/ingest/auth using their API key.
+const { promisify } = require('util');
+const scryptAsync = promisify(crypto.scrypt);
+const SHOP_PASSWORD_MIN = 8;
+
+async function hashPassword(password, saltHex) {
+  const salt = saltHex ? Buffer.from(saltHex, 'hex') : crypto.randomBytes(16);
+  const hash = await scryptAsync(String(password), salt, 64);
+  return { salt: salt.toString('hex'), hash: hash.toString('hex') };
+}
+
+async function verifyShopPassword(shop, password) {
+  if (!shop.password_hash || !shop.salt) return false;
+  const { hash } = await hashPassword(password, shop.salt);
+  return crypto.timingSafeEqual(Buffer.from(hash, 'hex'), Buffer.from(shop.password_hash, 'hex'));
+}
+
+// "Boxx Kadıköy" → "boxx-kadikoy", made unique.
+function genLoginUsername(name) {
+  let base = String(name).toLowerCase()
+    .replace(/ı/g, 'i').replace(/ğ/g, 'g').replace(/ş/g, 's').replace(/ç/g, 'c').replace(/ö/g, 'o').replace(/ü/g, 'u')
+    .normalize('NFD').replace(/[̀-ͯ]/g, '')
+    .replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '');
+  if (base.length < 3) base = ('shop-' + base).replace(/-$/, '');
+  let candidate = base, n = 2;
+  while (db.prepare('SELECT 1 FROM shops WHERE login_username=?').get(candidate)) candidate = `${base}-${n++}`;
+  return candidate;
+}
 
 // ─── Roastery auth (shared password from HUB_PASSWORD) ───────────────────────
 const HUB_PASSWORD = process.env.HUB_PASSWORD || '';
@@ -300,6 +335,52 @@ app.post('/api/ingest/orders', async (req, res) => {
   }
 });
 
+// Shop deployments verify user logins here. Rate-limited per shop+username.
+// 409 no_login_password lets pre-upgrade deployments fall back to their
+// local accounts until a password is set in the hub.
+app.post('/api/ingest/auth', async (req, res) => {
+  try {
+    const shop = shopFromBearer(req);
+    if (!shop) return res.status(401).json({ error: 'Invalid shop API key' });
+    const username = String((req.body && req.body.username) || '').toLowerCase().trim();
+    const password = (req.body && req.body.password) || '';
+    const lockKey = `shopauth:${shop.id}:${username}`;
+    const wait = lockedFor(lockKey);
+    if (wait > 0) return res.status(429).json({ error: `Too many attempts — try again in ${wait}s` });
+    if (!shop.password_hash) return res.status(409).json({ error: 'no_login_password' });
+    if (username !== (shop.login_username || '') || !(await verifyShopPassword(shop, password))) {
+      recordFailure(lockKey);
+      return res.status(401).json({ error: 'Wrong username or password' });
+    }
+    loginFailures.delete(lockKey);
+    res.json({ ok: true, username: shop.login_username, role: 'admin', shop_name: shop.name });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Shop users change their hub-managed password from inside the shop app.
+app.post('/api/ingest/change-password', async (req, res) => {
+  try {
+    const shop = shopFromBearer(req);
+    if (!shop) return res.status(401).json({ error: 'Invalid shop API key' });
+    const { username, current_password, new_password } = req.body || {};
+    if (String(username || '').toLowerCase().trim() !== (shop.login_username || '') ||
+        !(await verifyShopPassword(shop, current_password || ''))) {
+      return res.status(401).json({ error: 'Current password is wrong' });
+    }
+    if (String(new_password || '').length < SHOP_PASSWORD_MIN)
+      return res.status(400).json({ error: `Password must be at least ${SHOP_PASSWORD_MIN} characters` });
+    const { salt, hash } = await hashPassword(new_password);
+    db.prepare('UPDATE shops SET password_hash=?, salt=? WHERE id=?').run(hash, salt, shop.id);
+    res.json({ ok: true });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // Shops poll this to reflect roastery confirmations in their order history.
 app.get('/api/ingest/order-status', (req, res) => {
   const shop = shopFromBearer(req);
@@ -373,7 +454,8 @@ app.put('/api/catalog/:id', (req, res) => {
 
 // ─── Shops management ─────────────────────────────────────────────────────────
 const shopWithStats = s => ({
-  id: s.id, name: s.name, email: s.email, created_at: s.created_at,
+  id: s.id, name: s.name, email: s.email, login_username: s.login_username,
+  has_password: !!s.password_hash, created_at: s.created_at,
   orders_count: db.prepare('SELECT COUNT(*) n FROM orders WHERE shop_id=?').get(s.id).n,
   last_order_date: db.prepare('SELECT MAX(order_date) d FROM orders WHERE shop_id=?').get(s.id).d,
 });
@@ -382,17 +464,45 @@ app.get('/api/shops', (req, res) => {
   res.json(db.prepare('SELECT * FROM shops ORDER BY name').all().map(shopWithStats));
 });
 
-app.post('/api/shops', (req, res) => {
-  const name = String((req.body && req.body.name) || '').trim();
-  const email = String((req.body && req.body.email) || '').trim() || null;
-  if (name.length < 2) return res.status(400).json({ error: 'Shop name required (2+ characters)' });
-  const apiKey = 'dose_' + crypto.randomBytes(24).toString('hex');
+// Creating a shop creates its ACCOUNT: login username (from the name),
+// registered email, password, and API key (returned once).
+app.post('/api/shops', async (req, res) => {
   try {
-    const r = db.prepare('INSERT INTO shops (name, email, api_key_hash) VALUES (?,?,?)').run(name, email, sha256(apiKey));
+    const name = String((req.body && req.body.name) || '').trim();
+    const email = String((req.body && req.body.email) || '').trim() || null;
+    const password = (req.body && req.body.password) || '';
+    if (name.length < 2) return res.status(400).json({ error: 'Shop name required (2+ characters)' });
+    if (String(password).length < SHOP_PASSWORD_MIN)
+      return res.status(400).json({ error: `Login password required (min ${SHOP_PASSWORD_MIN} characters)` });
+    const apiKey = 'dose_' + crypto.randomBytes(24).toString('hex');
+    const loginUsername = genLoginUsername(name);
+    const { salt, hash } = await hashPassword(password);
+    const r = db.prepare('INSERT INTO shops (name, email, api_key_hash, login_username, password_hash, salt) VALUES (?,?,?,?,?,?)')
+      .run(name, email, sha256(apiKey), loginUsername, hash, salt);
     res.json({ shop: shopWithStats(db.prepare('SELECT * FROM shops WHERE id=?').get(r.lastInsertRowid)), api_key: apiKey });
   } catch (err) {
     if (String(err.message).includes('UNIQUE')) return res.status(400).json({ error: 'A shop with that name already exists' });
-    throw err;
+    console.error(err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Set or reset a shop's login password (also backfills the login username
+// for shops created before accounts existed).
+app.post('/api/shops/:id/reset-login', async (req, res) => {
+  try {
+    const shop = db.prepare('SELECT * FROM shops WHERE id=?').get(req.params.id);
+    if (!shop) return res.status(404).json({ error: 'Shop not found' });
+    const password = (req.body && req.body.new_password) || '';
+    if (String(password).length < SHOP_PASSWORD_MIN)
+      return res.status(400).json({ error: `Password must be at least ${SHOP_PASSWORD_MIN} characters` });
+    const loginUsername = shop.login_username || genLoginUsername(shop.name);
+    const { salt, hash } = await hashPassword(password);
+    db.prepare('UPDATE shops SET login_username=?, password_hash=?, salt=? WHERE id=?').run(loginUsername, hash, salt, shop.id);
+    res.json({ ok: true, login_username: loginUsername });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: err.message });
   }
 });
 

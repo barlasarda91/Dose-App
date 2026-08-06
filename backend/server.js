@@ -71,6 +71,14 @@ db.exec(`
     created_at TEXT DEFAULT (datetime('now'))
   );
 
+  CREATE TABLE IF NOT EXISTS hub_login_cache (
+    username TEXT PRIMARY KEY,
+    password_hash TEXT NOT NULL,
+    salt TEXT NOT NULL,
+    role TEXT NOT NULL,
+    verified_at TEXT
+  );
+
   CREATE TABLE IF NOT EXISTS order_items (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     order_id INTEGER NOT NULL REFERENCES coffee_orders(id),
@@ -172,6 +180,7 @@ try { db.exec('ALTER TABLE coffee_orders ADD COLUMN hub_status TEXT'); } catch {
 for (const col of ['requested_date TEXT', 'total_lbs REAL', 'total_cost REAL']) {
   try { db.exec(`ALTER TABLE coffee_orders ADD COLUMN ${col}`); } catch { /* already present */ }
 }
+try { db.exec("ALTER TABLE users ADD COLUMN source TEXT DEFAULT 'local'"); } catch { /* already present */ }
 
 const { promisify } = require('util');
 const scryptAsync = promisify(crypto.scrypt);
@@ -211,12 +220,52 @@ async function createUser(username, password, role) {
 }
 
 async function verifyUser(username, password) {
-  const u = db.prepare('SELECT * FROM users WHERE username=?').get(normUsername(username));
+  let u = db.prepare('SELECT * FROM users WHERE username=?').get(normUsername(username));
+  if (u && u.source === 'hub') u = null; // hub-managed identities never have a local password
   const salt = u ? u.salt : DUMMY.salt;
   const expected = u ? u.password_hash : DUMMY.hash;
   const { hash } = await hashPassword(password, salt);
   const ok = crypto.timingSafeEqual(Buffer.from(hash, 'hex'), Buffer.from(expected, 'hex'));
   return (u && ok) ? u : null;
+}
+
+// ─── Hub-delegated login ─────────────────────────────────────────────────────
+// When a roastery hub is connected, credentials are verified against the hub
+// (the hub is the identity provider). A successful login is cached (hashed)
+// for 24h so a hub outage doesn't lock out people who logged in recently.
+function isHubConfigured(cfg) {
+  const { url, key } = hubConn(cfg);
+  return !!(url && key);
+}
+
+// Hub identities get a local user row so sessions, created_by stamps, and
+// role checks keep working unchanged.
+function upsertHubUser(username, role) {
+  const uname = normUsername(username);
+  const existing = db.prepare('SELECT * FROM users WHERE username=?').get(uname);
+  if (existing) {
+    if (existing.role !== role || existing.source !== 'hub')
+      db.prepare("UPDATE users SET role=?, source='hub' WHERE id=?").run(role, existing.id);
+    return db.prepare('SELECT * FROM users WHERE id=?').get(existing.id);
+  }
+  const r = db.prepare("INSERT INTO users (username, password_hash, salt, role, source) VALUES (?,?,?,?, 'hub')")
+    .run(uname, 'hub-managed', '00', role);
+  return db.prepare('SELECT * FROM users WHERE id=?').get(r.lastInsertRowid);
+}
+
+async function cacheHubLogin(username, password, role) {
+  const { salt, hash } = await hashPassword(password);
+  db.prepare(`INSERT OR REPLACE INTO hub_login_cache (username, password_hash, salt, role, verified_at)
+    VALUES (?,?,?,?, datetime('now'))`).run(normUsername(username), hash, salt, role);
+}
+
+async function verifyCachedHubLogin(username, password) {
+  const row = db.prepare(
+    "SELECT * FROM hub_login_cache WHERE username=? AND verified_at > datetime('now','-24 hours')"
+  ).get(normUsername(username));
+  if (!row) return null;
+  const { hash } = await hashPassword(password, row.salt);
+  return crypto.timingSafeEqual(Buffer.from(hash, 'hex'), Buffer.from(row.password_hash, 'hex')) ? row : null;
 }
 
 function usersExist() {
@@ -258,7 +307,7 @@ if (!usersExist()) {
 // that is only visible in the server logs — closes the window where a fresh
 // deployment could be claimed by whoever finds the URL first.
 let setupCode = null;
-if (!usersExist()) {
+if (!usersExist() && !isHubConfigured(getSettings())) {
   setupCode = process.env.SETUP_SECRET || crypto.randomBytes(4).toString('hex');
   console.log('');
   console.log('══════════════════════════════════════════════════════════');
@@ -324,19 +373,45 @@ function requireAdmin(req, res, next) {
 }
 
 app.get('/api/auth-status', (req, res) => {
-  const setup = !usersExist();
-  res.json({ setup_required: setup, setup_code_required: setup });
+  const hubMode = isHubConfigured(getSettings());
+  const setup = !usersExist() && !hubMode;
+  res.json({
+    setup_required: setup,
+    setup_code_required: setup,
+    mode: hubMode ? 'hub' : (usersExist() ? 'local' : 'unconfigured'),
+  });
 });
 
-// First run only: create the admin account. Requires the setup code from the
-// server logs.
+// First run only, gated by the setup code from the server logs. Two modes:
+//  - mode 'hub': connect this deployment to a roastery hub (validated against
+//    the hub before saving); logins are then hub credentials.
+//  - default: create a standalone local admin account.
 app.post('/api/setup', asyncRoute(async (req, res) => {
-  if (usersExist()) return res.status(400).json({ error: 'Already set up — use login' });
-  const { username, password, setup_code } = req.body || {};
+  if (usersExist() || isHubConfigured(getSettings())) return res.status(400).json({ error: 'Already set up — use login' });
+  const { username, password, setup_code, mode } = req.body || {};
   if (!setupCode || !crypto.timingSafeEqual(
     crypto.createHash('sha256').update(String(setup_code || '')).digest(),
     crypto.createHash('sha256').update(setupCode).digest()
   )) return res.status(403).json({ error: 'Wrong setup code — find it in the server logs (Railway → Deployments → View Logs)' });
+
+  if (mode === 'hub') {
+    const hubUrl = String(req.body.hub_url || '').trim().replace(/\/+$/, '');
+    const hubApiKey = String(req.body.hub_api_key || '').trim();
+    if (!/^https?:\/\//.test(hubUrl)) return res.status(400).json({ error: 'A valid hub URL is required (https://…)' });
+    if (!hubApiKey) return res.status(400).json({ error: 'Hub API key is required' });
+    try {
+      const test = await fetch(`${hubUrl}/api/ingest/catalog`, { headers: { 'Authorization': `Bearer ${hubApiKey}` } });
+      if (test.status === 401) return res.status(400).json({ error: 'The hub rejected this API key' });
+      if (!test.ok) return res.status(400).json({ error: `The hub responded with an error (${test.status})` });
+    } catch (err) {
+      return res.status(400).json({ error: `Could not reach the hub: ${err.message}` });
+    }
+    setSetting('hub_url', hubUrl);
+    setSetting('hub_api_key', encryptSecret(hubApiKey));
+    setupCode = null;
+    return res.json({ ok: true, connected: true }); // no session — log in with hub credentials
+  }
+
   const uname = normUsername(username);
   if (!USERNAME_RE.test(uname)) return res.status(400).json({ error: 'Username: 3–32 chars, letters/numbers/._- only' });
   if (String(password || '').length < PASSWORD_MIN.admin) return res.status(400).json({ error: passwordPolicyError('admin') });
@@ -346,13 +421,52 @@ app.post('/api/setup', asyncRoute(async (req, res) => {
 }));
 
 app.post('/api/login', asyncRoute(async (req, res) => {
-  if (!usersExist()) return res.status(409).json({ error: 'Setup required' });
   const { username, password } = req.body || {};
+  const uname = normUsername(username);
+  const cfg = getSettings();
+  const hubMode = isHubConfigured(cfg);
+  if (!usersExist() && !hubMode) return res.status(409).json({ error: 'Setup required' });
   const ipKey = `ip:${req.ip}`;
-  const userKey = `u:${normUsername(username)}`;
+  const userKey = `u:${uname}`;
   const wait = Math.max(lockedFor(ipKey), lockedFor(userKey));
   if (wait > 0) return res.status(429).json({ error: `Too many attempts — try again in ${wait}s` });
-  const u = await verifyUser(username, password || '');
+
+  if (hubMode) {
+    let hubUser = null;
+    let fallThroughToLocal = false;
+    try {
+      hubUser = await hubFetch(cfg, '/api/ingest/auth', {
+        method: 'POST', body: JSON.stringify({ username: uname, password: password || '' }),
+      });
+    } catch (err) {
+      if (err.hubStatus === 401) {
+        recordFailure(ipKey); recordFailure(userKey);
+        return res.status(401).json({ error: 'Wrong username or password' });
+      }
+      if (err.hubStatus === 429) return res.status(429).json({ error: err.message });
+      if (err.hubStatus === 409) {
+        fallThroughToLocal = true; // hub shop has no login password yet — legacy local accounts still apply
+      } else {
+        // Hub unreachable: accept recently verified credentials from the cache.
+        const cached = await verifyCachedHubLogin(uname, password || '');
+        if (cached) {
+          const u = upsertHubUser(cached.username, cached.role);
+          clearFailures(ipKey, userKey);
+          return res.json({ ok: true, token: issueToken(u.id), user: publicUser(u), cached: true });
+        }
+        return res.status(502).json({ error: 'Cannot reach the roastery hub to verify your login — try again shortly.' });
+      }
+    }
+    if (hubUser) {
+      const u = upsertHubUser(hubUser.username, hubUser.role || 'admin');
+      await cacheHubLogin(hubUser.username, password || '', hubUser.role || 'admin');
+      clearFailures(ipKey, userKey);
+      return res.json({ ok: true, token: issueToken(u.id), user: publicUser(u) });
+    }
+    if (!fallThroughToLocal) return res.status(500).json({ error: 'Login failed' });
+  }
+
+  const u = await verifyUser(uname, password || '');
   if (!u) {
     recordFailure(ipKey); recordFailure(userKey);
     return res.status(401).json({ error: 'Wrong username or password' });
@@ -363,10 +477,27 @@ app.post('/api/login', asyncRoute(async (req, res) => {
 
 app.get('/api/me', (req, res) => res.json(req.user));
 
-// Change your own password; signs out your other sessions.
+// Change your own password; signs out your other sessions. Hub-managed
+// identities change their password AT the hub (proxied with the API key).
 app.post('/api/change-password', asyncRoute(async (req, res) => {
   const { current_password, new_password } = req.body || {};
   const u = db.prepare('SELECT * FROM users WHERE id=?').get(req.user.id);
+
+  if (u.source === 'hub') {
+    const cfg = getSettings();
+    try {
+      await hubFetch(cfg, '/api/ingest/change-password', {
+        method: 'POST',
+        body: JSON.stringify({ username: u.username, current_password: current_password || '', new_password: new_password || '' }),
+      });
+    } catch (err) {
+      return res.status(err.hubStatus === 401 ? 401 : err.hubStatus === 400 ? 400 : 502).json({ error: err.message });
+    }
+    await cacheHubLogin(u.username, new_password, u.role);
+    db.prepare('DELETE FROM sessions WHERE user_id=?').run(u.id);
+    return res.json({ ok: true, token: issueToken(u.id) });
+  }
+
   if (!(await verifyUser(u.username, current_password || ''))) return res.status(401).json({ error: 'Current password is wrong' });
   if (String(new_password || '').length < (PASSWORD_MIN[u.role] || 6)) return res.status(400).json({ error: passwordPolicyError(u.role) });
   const { salt, hash } = await hashPassword(new_password);
@@ -432,6 +563,7 @@ app.get('/api/settings', (req, res) => {
   s.resend_source = (cfg.resend_api_key || '').trim() ? 'settings'
     : (process.env.RESEND_API_KEY ? 'env' : null);
   s.hub_configured = !!((cfg.hub_url || '').trim() && getSecret('hub_api_key', 'HUB_API_KEY'));
+  s.auth_mode = s.hub_configured ? 'hub' : 'local';
   s.password_protected = true; // login is always required
   res.json(s);
 });
@@ -833,7 +965,11 @@ async function hubFetch(cfg, path, opts = {}, timeoutMs = 6000) {
       signal: controller.signal,
     });
     const data = await res.json().catch(() => ({}));
-    if (!res.ok) throw new Error(data.error || `Hub error (${res.status})`);
+    if (!res.ok) {
+      const err = new Error(data.error || `Hub error (${res.status})`);
+      err.hubStatus = res.status; // present = the hub answered; absent = unreachable
+      throw err;
+    }
     return data;
   } finally {
     clearTimeout(t);

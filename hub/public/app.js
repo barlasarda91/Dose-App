@@ -240,10 +240,14 @@
     page.innerHTML += `
       <div class="card">
         <label class="lbl">Add Shop</label>
+        <div style="font-size:10px;color:var(--drift);margin-bottom:10px">
+          Creating a shop creates its account: a login username (from the name), the password its staff sign in with, and the API key its deployment uses.
+        </div>
         <div style="display:flex;gap:10px;flex-wrap:wrap">
-          <input id="new-shop" placeholder="Shop name, e.g. Boxx Kadıköy" style="min-width:200px">
-          <input id="new-email" placeholder="Registered email (receipts go here)" style="min-width:240px">
-          <button class="btn" id="add-shop">Create Shop & API Key</button>
+          <input id="new-shop" placeholder="Shop name, e.g. Boxx Kadıköy" style="min-width:190px">
+          <input id="new-email" placeholder="Registered email (receipts go here)" style="min-width:230px">
+          <input id="new-pass" type="password" placeholder="Login password (min 8)" style="min-width:170px" autocomplete="new-password">
+          <button class="btn" id="add-shop">Create Shop</button>
         </div>
         <div id="add-result"></div>
       </div>
@@ -252,15 +256,17 @@
 
     function drawList() {
       document.getElementById('shop-list').innerHTML = shops.length ? `<div class="table-wrap"><table>
-        <thead><tr><th>Shop</th><th>Email</th><th>Orders</th><th>Last order</th><th></th></tr></thead>
+        <thead><tr><th>Shop</th><th>Login</th><th>Email</th><th>Orders</th><th>Last order</th><th></th></tr></thead>
         <tbody>${shops.map(s => `<tr>
           <td style="font-weight:500">${esc(s.name)}</td>
+          <td style="color:var(--drift)">${esc(s.login_username || '—')}${s.has_password ? '' : ' <span class="badge low">No login password</span>'}</td>
           <td style="color:var(--drift)">${esc(s.email || '— none —')}</td>
           <td>${s.orders_count}</td>
           <td>${esc(s.last_order_date || '—')}</td>
           <td><div style="display:flex;gap:6px;flex-wrap:wrap">
             <button class="btn-sm btn" data-pricing="${s.id}">Pricing</button>
             <button class="btn-sm btn" data-editshop="${s.id}">Edit</button>
+            <button class="btn-sm btn" data-resetlogin="${s.id}">Reset Login</button>
             <button class="btn-sm btn" data-rotate="${s.id}">Rotate Key</button>
           </div></td>
         </tr>`).join('')}</tbody></table></div>` : '<div class="empty">No shops yet.</div>';
@@ -282,12 +288,15 @@
     document.getElementById('add-shop').onclick = async () => {
       const name = document.getElementById('new-shop').value.trim();
       const email = document.getElementById('new-email').value.trim();
+      const password = document.getElementById('new-pass').value;
       if (!name) return;
       try {
-        const data = await api('/api/shops', { method: 'POST', body: JSON.stringify({ name, email }) });
+        const data = await api('/api/shops', { method: 'POST', body: JSON.stringify({ name, email, password }) });
         shops = [...shops, data.shop].sort((a, b) => a.name.localeCompare(b.name));
         showKey(data.shop.name, data.api_key);
-        document.getElementById('new-shop').value = ''; document.getElementById('new-email').value = '';
+        document.getElementById('add-result').insertAdjacentHTML('beforeend',
+          `<div class="ok">Login for staff: username <strong>${esc(data.shop.login_username)}</strong> + the password you just set.</div>`);
+        document.getElementById('new-shop').value = ''; document.getElementById('new-email').value = ''; document.getElementById('new-pass').value = '';
         drawList();
       } catch (e) { document.getElementById('add-result').innerHTML = `<div class="err">${esc(e.message)}</div>`; }
     };
@@ -312,6 +321,18 @@
           const updated = await api(`/api/shops/${shop.id}`, { method: 'PUT', body: JSON.stringify({ name, email }) });
           shops = shops.map(s => s.id === updated.id ? updated : s);
           drawList();
+        } catch (e) { alert(e.message); }
+      });
+      document.querySelectorAll('[data-resetlogin]').forEach(btn => btn.onclick = async () => {
+        const shop = shops.find(s => String(s.id) === btn.dataset.resetlogin);
+        const pw = window.prompt(`New login password for '${shop.name}' (min 8 characters):`);
+        if (pw === null) return;
+        try {
+          const data = await api(`/api/shops/${shop.id}/reset-login`, { method: 'POST', body: JSON.stringify({ new_password: pw }) });
+          shops = shops.map(s => s.id === shop.id ? { ...s, login_username: data.login_username, has_password: true } : s);
+          drawList();
+          document.getElementById('add-result').innerHTML =
+            `<div class="ok">✓ ${esc(shop.name)} login updated — username <strong>${esc(data.login_username)}</strong>, the password you just set.</div>`;
         } catch (e) { alert(e.message); }
       });
       document.querySelectorAll('[data-pricing]').forEach(btn => btn.onclick = () => openPricing(btn.dataset.pricing));
