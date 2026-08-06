@@ -160,7 +160,23 @@ const configReport = () => ({
   currency: CURRENCY,
 });
 console.log('Hub config:', JSON.stringify(configReport()));
-app.get('/api/health', (req, res) => res.json(configReport()));
+app.get('/api/health', async (req, res) => {
+  const report = configReport();
+  // /api/health?probe=email — ask Resend directly whether the configured key
+  // is accepted (no email is sent).
+  if (req.query.probe === 'email' && RESEND_KEY) {
+    try {
+      const r = await fetch('https://api.resend.com/domains', { headers: { 'Authorization': `Bearer ${RESEND_KEY}` } });
+      const body = await r.json().catch(() => ({}));
+      report.email_probe = r.ok
+        ? { status: r.status, message: 'ok — Resend accepts this key', domains: (body.data || []).map(d => `${d.name}: ${d.status}`) }
+        : { status: r.status, message: body.message || 'error' };
+    } catch (e) {
+      report.email_probe = { status: 0, message: `Could not reach Resend: ${e.message}` };
+    }
+  }
+  res.json(report);
+});
 
 // ─── Roastery auth (shared password from HUB_PASSWORD) ───────────────────────
 const HUB_PASSWORD = process.env.HUB_PASSWORD || '';
