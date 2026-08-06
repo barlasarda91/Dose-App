@@ -114,10 +114,12 @@ export default function Settings({ me }) {
   const [shopName, setShopName]     = useState('');
   const [orderEmail, setOrderEmail] = useState('');
   const [orderFrom, setOrderFrom]   = useState('');
+  const [hubUrl, setHubUrl]         = useState('');
   // Secret inputs are write-only: blank = keep current value
   const [squareToken, setSquareToken] = useState('');
   const [resendKey, setResendKey]     = useState('');
-  const [status, setStatus] = useState({ tokenSet: false, tokenSource: null, resendConfigured: false, resendSource: null });
+  const [hubApiKey, setHubApiKey]     = useState('');
+  const [status, setStatus] = useState({ tokenSet: false, tokenSource: null, resendConfigured: false, resendSource: null, hubConfigured: false });
   const [saved, setSaved]   = useState(false);
   const [pwForm, setPwForm] = useState({ current: '', next: '', confirm: '' });
   const [pwMsg, setPwMsg]   = useState(null);
@@ -128,11 +130,13 @@ export default function Settings({ me }) {
     setShopName(s.shop_name || '');
     setOrderEmail(s.order_email_to || '');
     setOrderFrom(s.order_email_from || '');
+    setHubUrl(s.hub_url || '');
     setStatus({
       tokenSet: !!s.square_token_set,
       tokenSource: s.square_token_source,
       resendConfigured: !!s.resend_configured,
       resendSource: s.resend_source,
+      hubConfigured: !!s.hub_configured,
     });
   }
   useEffect(() => { load().catch(() => {}); }, []);
@@ -143,12 +147,14 @@ export default function Settings({ me }) {
       body.square_location_id = locationId;
       body.order_email_to = orderEmail;
       body.order_email_from = orderFrom;
+      body.hub_url = hubUrl;
       // Only send secrets the user actually typed — blank means "keep as is"
       if (squareToken.trim() !== '') body.square_access_token = squareToken.trim();
       if (resendKey.trim()   !== '') body.resend_api_key = resendKey.trim();
+      if (hubApiKey.trim()   !== '') body.hub_api_key = hubApiKey.trim();
     }
     await apiJson('/api/settings', { method: 'POST', body: JSON.stringify(body) });
-    setSquareToken(''); setResendKey('');
+    setSquareToken(''); setResendKey(''); setHubApiKey('');
     await load().catch(() => {});
     setSaved(true);
     setTimeout(() => setSaved(false), 2500);
@@ -254,6 +260,25 @@ export default function Settings({ me }) {
               <input type="text" placeholder="Dose Orders <orders@yourdomain.com>" value={orderFrom} onChange={e => setOrderFrom(e.target.value)} style={{ maxWidth: 420 }} />
               <div className="settings-field-hint">
                 Must be a Resend-verified sender. Leave blank to use the default (onboarding@resend.dev — can only deliver to your own Resend account email).
+              </div>
+            </div>
+
+            <div className="settings-field">
+              <label className="settings-field-lbl">Roastery Hub</label>
+              <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginTop: 4, marginBottom: 8 }}>
+                <span className={`conn-status ${status.hubConfigured ? 'ok' : 'fail'}`} style={{ marginTop: 0 }}>
+                  {status.hubConfigured
+                    ? '● Connected — orders are pushed to the roastery hub'
+                    : '✕ Not connected — orders go by email only'}
+                </span>
+              </div>
+              <div style={{ display: 'flex', flexDirection: 'column', gap: 10, maxWidth: 420 }}>
+                <input type="text" placeholder="Hub URL, e.g. https://dose-hub.up.railway.app" value={hubUrl} onChange={e => setHubUrl(e.target.value)} />
+                <input type="password" placeholder={status.hubConfigured ? '•••••••• (leave blank to keep current)' : 'dose_… (from Hub → Shops)'}
+                  value={hubApiKey} onChange={e => setHubApiKey(e.target.value)} autoComplete="new-password" />
+              </div>
+              <div className="settings-field-hint">
+                The roastery creates this shop in their Dose Hub (Shops tab) and gives you the API key. Once set, every sent order also appears in their inbox.
               </div>
             </div>
           </div>

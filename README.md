@@ -77,6 +77,22 @@ Milk consumption is calculated from Square modifier counts (Whole / Oat / Almond
 - **Pour-Over**: 19g per single brew
 - **Turkish**: 7.5g, deducted from pour-over pool
 
+## Dose Hub (roastery side)
+
+The `hub/` directory contains a separate, lightweight service for the roastery: an **orders inbox** (new → confirmed → delivered), **per-shop order history**, and **ordering patterns** (volume, pool mix, cadence, 12-week trend per shop). Client shops push orders to it automatically when they hit Send Order — email keeps working independently as a fallback.
+
+**Deploy** (own Railway service, same repo):
+1. New Railway service → same GitHub repo → set **Root Directory** to `/hub`
+2. Variables: `HUB_PASSWORD` (roastery login), optionally `HUB_DB_PATH=/app/data/hub.db`
+3. Volume mounted at `/app/data`
+
+**Connect a shop:**
+1. In the hub: Shops tab → Add Shop → copy the API key (shown once; stored only as a hash)
+2. In that shop's Dose app: Settings → Ordering → Roastery Hub → paste the hub URL + API key
+3. From then on, every sent order appears in the hub inbox with who placed it; work it through Confirm → Delivered
+
+Shop pushes are authenticated per shop (`Bearer dose_…`), deduplicated (a retried push never duplicates an order), and the hub login is rate-limited with expiring hashed session tokens — same security model as the shop app.
+
 ## Development
 
 ```bash
