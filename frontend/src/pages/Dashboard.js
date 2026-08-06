@@ -1,5 +1,6 @@
 import React, { useState, useEffect, useMemo, useCallback, useRef } from 'react';
 import { api, apiJson } from '../api';
+import DateField from '../DateField';
 
 const TODAY = new Date().toISOString().slice(0, 10);
 
@@ -213,10 +214,10 @@ export default function Dashboard() {
 
       <div className="date-row">
         <span className="date-lbl">From</span>
-        <input type="date" value={startDate} onChange={e => { setStartDate(e.target.value); setActiveCycle('custom'); }} />
+        <DateField value={startDate} onChange={v => { setStartDate(v); setActiveCycle('custom'); }} />
         <span style={{ color: 'var(--drift)', fontSize: 16 }}>→</span>
         <span className="date-lbl">To</span>
-        <input type="date" value={endDate} onChange={e => { setEndDate(e.target.value); setActiveCycle('custom'); }} />
+        <DateField value={endDate} onChange={v => { setEndDate(v); setActiveCycle('custom'); }} />
         <button className="btn btn-primary" onClick={() => { setActiveCycle('custom'); runReport(startDate, endDate); }} disabled={loading}>
           {loading ? '…Fetching' : 'Run Report'}
         </button>
@@ -259,7 +260,7 @@ export default function Dashboard() {
             {[
               { lbl: 'Total Drinks', val: totalTracked.toLocaleString(), unit: 'tracked coffee drinks' },
               { lbl: 'Espresso Used', val: ((a.eff?.espresso?.used || 0) / 1000).toFixed(2), unit: 'kg theoretical' },
-              { lbl: 'Milk Modifiers', val: ((a.modifier_counts?.milk_whole || 0) + (a.modifier_counts?.milk_oat || 0) + (a.modifier_counts?.milk_almond || 0)).toLocaleString(), unit: 'total uses' },
+              { lbl: 'Coffee Used', val: (POOLS.reduce((s, [, k]) => s + (a.eff?.[k]?.used || 0), 0) / 1000).toFixed(2), unit: 'kg all pools' },
               { lbl: 'Period', val: a.period?.days, unit: 'days' },
             ].map(s => (
               <div key={s.lbl} className="stat-pill">
@@ -292,53 +293,7 @@ export default function Dashboard() {
             </div>
           </div>
 
-          <div className="section">
-            <div className="section-title">Milk Efficiency</div>
-            <div className="modifier-box">
-              <div className="modifier-box-title">Square Modifier Counts (consumption)</div>
-              <div className="modifier-row">
-                {[
-                  { lbl: 'Whole', count: a.modifier_counts?.milk_whole || 0, ml: a.milk_used?.whole || 0 },
-                  { lbl: 'Oat',   count: a.modifier_counts?.milk_oat   || 0, ml: a.milk_used?.oat   || 0 },
-                  { lbl: 'Almond',count: a.modifier_counts?.milk_almond|| 0, ml: a.milk_used?.almond|| 0 },
-                ].map(m => (
-                  <div key={m.lbl}>
-                    <div className="modifier-stat-lbl">{m.lbl}</div>
-                    <div className="modifier-stat-val">{m.count.toLocaleString()}</div>
-                    <div className="modifier-stat-sub">{(m.ml / 1000).toFixed(1)}L used</div>
-                  </div>
-                ))}
-              </div>
-            </div>
-            {a.numilk_produced && (a.numilk_produced.oat_liters_per_day > 0 || a.numilk_produced.almond_liters_per_day > 0) && (
-              <div className="modifier-box" style={{marginBottom:16, background:'rgba(107,110,74,0.05)', borderColor:'rgba(107,110,74,0.15)'}}>
-                <div className="modifier-box-title">Numilk Production ({a.numilk_produced.days} days × daily rate)</div>
-                <div className="modifier-row">
-                  {a.numilk_produced.oat_liters_per_day > 0 && (
-                    <div>
-                      <div className="modifier-stat-lbl">🌾 Oat</div>
-                      <div className="modifier-stat-val">{(a.numilk_produced.oat_ml/1000).toFixed(1)}L</div>
-                      <div className="modifier-stat-sub">{a.numilk_produced.oat_liters_per_day}L/day</div>
-                    </div>
-                  )}
-                  {a.numilk_produced.almond_liters_per_day > 0 && (
-                    <div>
-                      <div className="modifier-stat-lbl">🌰 Almond</div>
-                      <div className="modifier-stat-val">{(a.numilk_produced.almond_ml/1000).toFixed(1)}L</div>
-                      <div className="modifier-stat-sub">{a.numilk_produced.almond_liters_per_day}L/day</div>
-                    </div>
-                  )}
-                </div>
-              </div>
-            )}
-            <div className="eff-grid-3">
-              <EffCard label="Milk"        e={a.eff?.milk_whole}  unit="ml" displayUnit="L" scale={0.001} />
-              <EffCard label="Oat Milk"    e={a.eff?.milk_oat}    unit="ml" displayUnit="L" scale={0.001} />
-              <EffCard label="Almond Milk" e={a.eff?.milk_almond} unit="ml" displayUnit="L" scale={0.001} />
-            </div>
-          </div>
-
-          {/* Total Drinks with milk modifier breakdown */}
+          {/* Total Drinks */}
           <div className="section">
             <div className="section-title">Total Drinks</div>
             <div className="table-wrap">
@@ -347,55 +302,22 @@ export default function Dashboard() {
                   <tr>
                     <th>Drink</th>
                     <th>Total</th>
-                    <th>Whole</th>
-                    <th>Oat</th>
-                    <th>Almond</th>
-                    <th>No Modifier</th>
                   </tr>
                 </thead>
                 <tbody>
                   {Object.entries(a.matched || {})
                     .sort((x, y) => (y[1].qty || 0) - (x[1].qty || 0))
-                    .map(([name, val]) => {
-                      const qty   = val.qty || 0;
-                      const milk  = val.milk || {};
-                      const withMod = (milk.whole || 0) + (milk.oat || 0) + (milk.almond || 0);
-                      const noMod = Math.max(0, qty - withMod);
-                      const hasMilk = withMod > 0;
-                      return (
-                        <tr key={name}>
-                          <td className="name-cell">{name}</td>
-                          <td className="num-cell">{qty}</td>
-                          <td style={{ fontFamily: 'var(--font-mono)', color: milk.whole > 0 ? 'var(--graphite)' : 'var(--linen)' }}>
-                            {milk.whole > 0 ? milk.whole : '—'}
-                          </td>
-                          <td style={{ fontFamily: 'var(--font-mono)', color: milk.oat > 0 ? 'var(--olive)' : 'var(--linen)' }}>
-                            {milk.oat > 0 ? milk.oat : '—'}
-                          </td>
-                          <td style={{ fontFamily: 'var(--font-mono)', color: milk.almond > 0 ? 'var(--warn)' : 'var(--linen)' }}>
-                            {milk.almond > 0 ? milk.almond : '—'}
-                          </td>
-                          <td style={{ fontFamily: 'var(--font-mono)', color: noMod > 0 ? 'var(--drift)' : 'var(--linen)' }}>
-                            {hasMilk ? (noMod > 0 ? noMod : '—') : '—'}
-                          </td>
-                        </tr>
-                      );
-                    })}
+                    .map(([name, val]) => (
+                      <tr key={name}>
+                        <td className="name-cell">{name}</td>
+                        <td className="num-cell">{val.qty || 0}</td>
+                      </tr>
+                    ))}
                 </tbody>
                 <tfoot>
                   <tr style={{ borderTop: '2px solid var(--linen)' }}>
                     <td style={{ fontWeight: 600, fontFamily: 'var(--font-mono)', fontSize: 12 }}>Total</td>
                     <td style={{ fontWeight: 700, fontFamily: 'var(--font-mono)' }}>{totalTracked}</td>
-                    <td style={{ fontFamily: 'var(--font-mono)', color: 'var(--drift)', fontWeight: 600 }}>
-                      {Object.values(a.matched||{}).reduce((s,v) => s + (v.milk?.whole||0), 0) || '—'}
-                    </td>
-                    <td style={{ fontFamily: 'var(--font-mono)', color: 'var(--olive)', fontWeight: 600 }}>
-                      {Object.values(a.matched||{}).reduce((s,v) => s + (v.milk?.oat||0), 0) || '—'}
-                    </td>
-                    <td style={{ fontFamily: 'var(--font-mono)', color: 'var(--warn)', fontWeight: 600 }}>
-                      {Object.values(a.matched||{}).reduce((s,v) => s + (v.milk?.almond||0), 0) || '—'}
-                    </td>
-                    <td></td>
                   </tr>
                 </tfoot>
               </table>

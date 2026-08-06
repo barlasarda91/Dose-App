@@ -209,3 +209,24 @@ tr.selected td { background: rgba(107,110,74,0.08); }
 .login-title { font-family: var(--font-serif); font-size: 28px; color: var(--ink); line-height: 1.1; }
 .login-sub { font-family: var(--font-mono); font-size: 9px; letter-spacing: 0.22em; text-transform: uppercase; color: var(--drift); margin-bottom: 22px; }
 .login-err { font-family: var(--font-mono); font-size: 10px; color: var(--red); margin-top: 6px; }
+
+/* Brand date picker */
+.datefield { position: relative; display: inline-block; }
+.datefield-input { font-family: var(--font-mono); font-size: 11px; font-weight: 300; color: var(--ink); background: var(--parch); border: 1px solid var(--linen); padding: 8px 14px; cursor: pointer; border-radius: 0; min-width: 130px; text-align: left; letter-spacing: 0.04em; }
+.datefield-input.empty { color: var(--drift); }
+.datefield-input:focus { border-color: var(--drift); outline: 2px solid var(--olive); outline-offset: 2px; }
+.df-pop { position: absolute; top: calc(100% + 4px); left: 0; z-index: 50; background: var(--parch); border: 1px solid var(--linen); box-shadow: 0 8px 24px rgba(26,25,22,0.12); padding: 14px; width: 252px; }
+.df-head { display: flex; align-items: center; justify-content: space-between; margin-bottom: 10px; }
+.df-title { font-family: var(--font-serif); font-size: 13px; color: var(--ink); }
+.df-nav { font-family: var(--font-mono); font-size: 14px; background: transparent; border: 1px solid var(--linen); color: var(--drift); width: 26px; height: 26px; cursor: pointer; line-height: 1; }
+.df-nav:hover { color: var(--ink); border-color: var(--drift); }
+.df-grid { display: grid; grid-template-columns: repeat(7, 1fr); gap: 2px; }
+.df-dow { font-family: var(--font-mono); font-size: 8px; letter-spacing: 0.1em; text-transform: uppercase; color: var(--linen); text-align: center; padding: 4px 0; }
+.df-day { font-family: var(--font-mono); font-size: 10px; font-weight: 300; color: var(--graphite); background: transparent; border: none; padding: 6px 0; cursor: pointer; text-align: center; }
+.df-day:hover:not(:disabled) { background: var(--stone); color: var(--ink); }
+.df-day.today { color: var(--olive); }
+.df-day.sel { background: var(--ink); color: var(--parch); }
+.df-day:disabled { color: var(--stone); cursor: not-allowed; }
+.df-foot { display: flex; justify-content: space-between; margin-top: 10px; border-top: 1px solid var(--linen); padding-top: 8px; }
+.df-link { font-family: var(--font-mono); font-size: 9px; letter-spacing: 0.14em; text-transform: uppercase; background: none; border: none; color: var(--olive); cursor: pointer; padding: 2px 0; }
+.df-link:hover { color: var(--ink); }

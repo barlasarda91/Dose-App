@@ -148,7 +148,6 @@ export default function Settings({ me }) {
       body.square_location_id = locationId;
       body.order_email_to = orderEmail;
       body.order_email_from = orderFrom;
-      body.hub_url = hubUrl;
       // Only send secrets the user actually typed — blank means "keep as is"
       if (squareToken.trim() !== '') body.square_access_token = squareToken.trim();
       if (resendKey.trim()   !== '') body.resend_api_key = resendKey.trim();
@@ -241,12 +240,11 @@ export default function Settings({ me }) {
                 </span>
               </div>
               <div style={{ display: 'flex', flexDirection: 'column', gap: 10, maxWidth: 420 }}>
-                <input type="text" placeholder="Hub URL, e.g. https://dose-hub.up.railway.app" value={hubUrl} onChange={e => setHubUrl(e.target.value)} />
-                <input type="password" placeholder={status.hubConfigured ? '•••••••• (leave blank to keep current)' : 'dose_… (from Hub → Shops)'}
+                <input type="password" placeholder={status.hubConfigured ? '•••••••• (leave blank to keep current)' : 'dose_… (API key from the roastery)'}
                   value={hubApiKey} onChange={e => setHubApiKey(e.target.value)} autoComplete="new-password" />
               </div>
               <div className="settings-field-hint">
-                The roastery creates this shop in their Dose Hub and gives you the API key. Receipts and confirmations are emailed by the hub to your registered address.
+                The roastery creates this shop in their Dose Hub and gives you this key — it's all you need. Receipts and confirmations are emailed by the hub to your registered address.
               </div>
             </div>
 
@@ -290,17 +288,6 @@ export default function Settings({ me }) {
       </div>
 
       {isAdmin && status.authMode !== 'hub' && <UsersSection />}
-      {isAdmin && status.authMode === 'hub' && (
-        <div className="settings-section">
-          <div className="section-title">Users</div>
-          <div className="settings-card">
-            <div className="settings-field-hint">
-              Sign-ins for this shop are managed by the roastery hub — everyone uses the shop credentials the roastery
-              issued. To change the login or reset the password, contact the roastery (or use Change My Password below).
-            </div>
-          </div>
-        </div>
-      )}
 
       <div className="settings-section">
         <div className="section-title">Security</div>
@@ -330,26 +317,6 @@ export default function Settings({ me }) {
         </div>
       </div>
 
-      <div className="settings-section">
-        <div className="section-title">Dose Reference</div>
-        <div className="settings-card">
-          <p style={{ fontSize: 12, color: 'var(--drift)', marginBottom: 16, lineHeight: 1.7 }}>
-            Fixed dose calculations baked into your drink recipes. Edit on the Drink Recipes page to adjust.
-          </p>
-          <div className="table-wrap">
-            <table>
-              <thead><tr><th>Pool</th><th>Drink</th><th>Dose</th><th>Calculation</th></tr></thead>
-              <tbody>
-                <tr><td>Espresso</td><td>All espresso drinks</td><td style={{ fontFamily: 'var(--font-mono)' }}>18g</td><td style={{ color: 'var(--drift)' }}>Single shot</td></tr>
-                <tr><td>Drip</td><td>Batch Brew, Cafe Au Lait</td><td style={{ fontFamily: 'var(--font-mono)' }}>24.4g</td><td style={{ color: 'var(--drift)' }}>110g ÷ 4.5 cups per batch</td></tr>
-                <tr><td>Cold Brew</td><td>Cold Brew</td><td style={{ fontFamily: 'var(--font-mono)' }}>26.2g</td><td style={{ color: 'var(--drift)' }}>4kg ÷ (20×1.8L ÷ 236ml per 8oz serve)</td></tr>
-                <tr><td>Pour-Over</td><td>Pour Over (all beans)</td><td style={{ fontFamily: 'var(--font-mono)' }}>19g</td><td style={{ color: 'var(--drift)' }}>Single brew</td></tr>
-                <tr><td>Pour-Over</td><td>Turkish Coffee</td><td style={{ fontFamily: 'var(--font-mono)' }}>7.5g</td><td style={{ color: 'var(--drift)' }}>Shares pour-over pool</td></tr>
-              </tbody>
-            </table>
-          </div>
-        </div>
-      </div>
     </div>
   );
 }

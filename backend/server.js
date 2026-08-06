@@ -14,6 +14,11 @@ const app = express();
 if (process.env.NODE_ENV !== 'production') app.use(cors());
 app.use(express.json());
 
+// The hub URL is the same for every shop — only the API key is per shop.
+// A saved hub_url setting (or DEFAULT_HUB_URL env) can override for
+// self-hosted setups, but the UI only asks for the key.
+const DEFAULT_HUB_URL = (process.env.DEFAULT_HUB_URL || 'https://dosehub.up.railway.app').replace(/\/+$/, '');
+
 const dbPath = process.env.DB_PATH || '/app/data/dose.db';
 require('fs').mkdirSync(require('path').dirname(dbPath), { recursive: true });
 const db = new Database(dbPath);
@@ -84,10 +89,22 @@ db.exec(`
     order_id INTEGER NOT NULL REFERENCES coffee_orders(id),
     coffee_id INTEGER,
     coffee_name TEXT NOT NULL,
-    roast TEXT NOT NULL CHECK(roast IN ('espresso','filter')),
+    roast TEXT NOT NULL CHECK(roast IN ('espresso','filter','retail')),
     lbs REAL NOT NULL,
+    bags INTEGER,
     price_per_lb REAL NOT NULL,
     line_total REAL NOT NULL
+  );
+
+  CREATE TABLE IF NOT EXISTS standing_orders (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    frequency TEXT NOT NULL CHECK(frequency IN ('weekly','biweekly','monthly')),
+    items_json TEXT NOT NULL,
+    notes TEXT,
+    next_date TEXT NOT NULL,
+    active INTEGER NOT NULL DEFAULT 1,
+    created_by TEXT,
+    created_at TEXT DEFAULT (datetime('now'))
   );
 
   CREATE TABLE IF NOT EXISTS settings (
@@ -181,6 +198,29 @@ for (const col of ['requested_date TEXT', 'total_lbs REAL', 'total_cost REAL']) 
   try { db.exec(`ALTER TABLE coffee_orders ADD COLUMN ${col}`); } catch { /* already present */ }
 }
 try { db.exec("ALTER TABLE users ADD COLUMN source TEXT DEFAULT 'local'"); } catch { /* already present */ }
+try { db.exec('ALTER TABLE order_items ADD COLUMN bags INTEGER'); } catch { /* already present */ }
+
+// Widen the roast CHECK from earlier versions (SQLite requires a rebuild).
+{
+  const row = db.prepare("SELECT sql FROM sqlite_master WHERE type='table' AND name='order_items'").get();
+  if (row && !row.sql.includes("'retail'")) {
+    db.exec('ALTER TABLE order_items RENAME TO order_items_migr');
+    db.exec(`CREATE TABLE order_items (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      order_id INTEGER NOT NULL REFERENCES coffee_orders(id),
+      coffee_id INTEGER,
+      coffee_name TEXT NOT NULL,
+      roast TEXT NOT NULL CHECK(roast IN ('espresso','filter','retail')),
+      lbs REAL NOT NULL,
+      bags INTEGER,
+      price_per_lb REAL NOT NULL,
+      line_total REAL NOT NULL
+    )`);
+    db.exec('INSERT INTO order_items (id, order_id, coffee_id, coffee_name, roast, lbs, bags, price_per_lb, line_total) SELECT id, order_id, coffee_id, coffee_name, roast, lbs, bags, price_per_lb, line_total FROM order_items_migr');
+    db.exec('DROP TABLE order_items_migr');
+    console.log('Migrated order_items schema');
+  }
+}
 
 const { promisify } = require('util');
 const scryptAsync = promisify(crypto.scrypt);
@@ -234,8 +274,7 @@ async function verifyUser(username, password) {
 // (the hub is the identity provider). A successful login is cached (hashed)
 // for 24h so a hub outage doesn't lock out people who logged in recently.
 function isHubConfigured(cfg) {
-  const { url, key } = hubConn(cfg);
-  return !!(url && key);
+  return !!hubConn(cfg).key; // the URL always resolves (default hub)
 }
 
 // Hub identities get a local user row so sessions, created_by stamps, and
@@ -395,7 +434,7 @@ app.post('/api/setup', asyncRoute(async (req, res) => {
   )) return res.status(403).json({ error: 'Wrong setup code — find it in the server logs (Railway → Deployments → View Logs)' });
 
   if (mode === 'hub') {
-    const hubUrl = String(req.body.hub_url || '').trim().replace(/\/+$/, '');
+    const hubUrl = String(req.body.hub_url || '').trim().replace(/\/+$/, '') || DEFAULT_HUB_URL;
     const hubApiKey = String(req.body.hub_api_key || '').trim();
     if (!/^https?:\/\//.test(hubUrl)) return res.status(400).json({ error: 'A valid hub URL is required (https://…)' });
     if (!hubApiKey) return res.status(400).json({ error: 'Hub API key is required' });
@@ -406,7 +445,7 @@ app.post('/api/setup', asyncRoute(async (req, res) => {
     } catch (err) {
       return res.status(400).json({ error: `Could not reach the hub: ${err.message}` });
     }
-    setSetting('hub_url', hubUrl);
+    if (hubUrl !== DEFAULT_HUB_URL) setSetting('hub_url', hubUrl);
     setSetting('hub_api_key', encryptSecret(hubApiKey));
     setupCode = null;
     return res.json({ ok: true, connected: true }); // no session — log in with hub credentials
@@ -562,7 +601,7 @@ app.get('/api/settings', (req, res) => {
   s.resend_configured = !!getSecret('resend_api_key', 'RESEND_API_KEY');
   s.resend_source = (cfg.resend_api_key || '').trim() ? 'settings'
     : (process.env.RESEND_API_KEY ? 'env' : null);
-  s.hub_configured = !!((cfg.hub_url || '').trim() && getSecret('hub_api_key', 'HUB_API_KEY'));
+  s.hub_configured = !!getSecret('hub_api_key', 'HUB_API_KEY');
   s.auth_mode = s.hub_configured ? 'hub' : 'local';
   s.password_protected = true; // login is always required
   res.json(s);
@@ -948,7 +987,7 @@ async function sendOrderEmail(order, cfg, items = []) {
 // ─── Hub connection ──────────────────────────────────────────────────────────
 function hubConn(cfg) {
   return {
-    url: (cfg.hub_url || '').trim().replace(/\/+$/, ''),
+    url: (cfg.hub_url || '').trim().replace(/\/+$/, '') || DEFAULT_HUB_URL,
     key: getSecret('hub_api_key', 'HUB_API_KEY'),
   };
 }
@@ -1007,7 +1046,7 @@ async function pushOrderToHub(order, cfg, items = []) {
       requested_date: order.requested_date || null,
       notes: order.notes, placed_by: order.created_by, source_order_id: order.id,
     };
-    if (items.length) body.items = items.map(i => ({ coffee_id: i.coffee_id, roast: i.roast, lbs: i.lbs }));
+    if (items.length) body.items = items.map(i => ({ coffee_id: i.coffee_id, roast: i.roast, lbs: i.lbs, bags: i.bags ?? undefined }));
     else {
       body.espresso_lbs = order.espresso_lbs; body.drip_lbs = order.drip_lbs;
       body.coldbrew_lbs = order.coldbrew_lbs; body.pourover_lbs = order.pourover_lbs;
@@ -1042,6 +1081,37 @@ app.get('/api/orders', async (req, res) => {
   res.json(db.prepare('SELECT * FROM coffee_orders ORDER BY order_date DESC, id DESC').all().map(orderWithItems));
 });
 
+// Place a catalog (line-item) order: price from the hub's list, store
+// locally, push to the hub. Used by the order form and the standing-order
+// scheduler.
+async function placeCatalogOrder({ order_date, requested_date, notes, rawItems, username }) {
+  const cfg = getSettings();
+  const catalog = await getHubCatalog(cfg, true);
+  const priced = priceItemsFromCatalog(rawItems, catalog.items || []);
+
+  const r = db.prepare(`INSERT INTO coffee_orders (order_date, requested_date, total_lbs, total_cost, notes, created_by)
+    VALUES (?,?,?,?,?,?)`)
+    .run(order_date, requested_date || null, priced.total_lbs, priced.total_cost, notes || null, username);
+  const ins = db.prepare('INSERT INTO order_items (order_id, coffee_id, coffee_name, roast, lbs, bags, price_per_lb, line_total) VALUES (?,?,?,?,?,?,?,?)');
+  for (const i of priced.items) ins.run(r.lastInsertRowid, i.coffee_id, i.coffee_name, i.roast, i.lbs, i.bags ?? null, i.price_per_lb, i.line_total);
+  const order = db.prepare('SELECT * FROM coffee_orders WHERE id=?').get(r.lastInsertRowid);
+
+  // The hub emails the receipt itself; shop-side email is only the fallback
+  // when the push fails.
+  const hub = await pushOrderToHub(order, cfg, priced.items);
+  let email = null;
+  if (!hub.pushed) email = await sendOrderEmail(order, cfg, priced.items);
+
+  db.prepare('UPDATE coffee_orders SET status=?, sent_to=?, sent_at=?, hub_status=? WHERE id=?')
+    .run((hub.pushed || email?.sent) ? 'sent' : 'email_failed',
+         email?.sent ? email.to : null,
+         (hub.pushed || email?.sent) ? new Date().toISOString() : null,
+         hub.pushed ? 'sent' : 'failed',
+         order.id);
+
+  return { order: orderWithItems(db.prepare('SELECT * FROM coffee_orders WHERE id=?').get(order.id)), hub, email };
+}
+
 app.post('/api/orders', async (req, res) => {
   try {
     const { order_date, requested_date, notes, items: rawItems } = req.body;
@@ -1050,34 +1120,12 @@ app.post('/api/orders', async (req, res) => {
 
     // ── Catalog order: line items priced from the hub's price list ──
     if (Array.isArray(rawItems) && rawItems.length) {
-      let catalog;
-      try { catalog = await getHubCatalog(cfg, true); }
-      catch (err) { return res.status(502).json({ error: `Could not load the price list from the hub: ${err.message}` }); }
-      let priced;
-      try { priced = priceItemsFromCatalog(rawItems, catalog.items || []); }
-      catch (err) { return res.status(400).json({ error: err.message }); }
-
-      const r = db.prepare(`INSERT INTO coffee_orders (order_date, requested_date, total_lbs, total_cost, notes, created_by)
-        VALUES (?,?,?,?,?,?)`)
-        .run(order_date, requested_date || null, priced.total_lbs, priced.total_cost, notes || null, req.user.username);
-      const ins = db.prepare('INSERT INTO order_items (order_id, coffee_id, coffee_name, roast, lbs, price_per_lb, line_total) VALUES (?,?,?,?,?,?,?)');
-      for (const i of priced.items) ins.run(r.lastInsertRowid, i.coffee_id, i.coffee_name, i.roast, i.lbs, i.price_per_lb, i.line_total);
-      const order = db.prepare('SELECT * FROM coffee_orders WHERE id=?').get(r.lastInsertRowid);
-
-      // The hub emails the receipt itself; shop-side email is only the fallback
-      // when the push fails.
-      const hub = await pushOrderToHub(order, cfg, priced.items);
-      let email = null;
-      if (!hub.pushed) email = await sendOrderEmail(order, cfg, priced.items);
-
-      db.prepare('UPDATE coffee_orders SET status=?, sent_to=?, sent_at=?, hub_status=? WHERE id=?')
-        .run((hub.pushed || email?.sent) ? 'sent' : 'email_failed',
-             email?.sent ? email.to : null,
-             (hub.pushed || email?.sent) ? new Date().toISOString() : null,
-             hub.pushed ? 'sent' : 'failed',
-             order.id);
-
-      return res.json({ order: orderWithItems(db.prepare('SELECT * FROM coffee_orders WHERE id=?').get(order.id)), hub, email });
+      try {
+        return res.json(await placeCatalogOrder({ order_date, requested_date, notes, rawItems, username: req.user.username }));
+      } catch (err) {
+        const gateway = /Could not|Hub error|abort|network|fetch failed|Hub not configured/i.test(err.message);
+        return res.status(gateway ? 502 : 400).json({ error: err.message });
+      }
     }
 
     // ── Legacy pool-based order (no hub catalog connected) ──
@@ -1116,6 +1164,74 @@ app.delete('/api/orders/:id', (req, res) => {
   db.prepare('DELETE FROM coffee_orders WHERE id=?').run(req.params.id);
   res.json({ success: true });
 });
+
+// ─── Standing orders ─────────────────────────────────────────────────────────
+// A saved order that places itself on a schedule. Dates are calendar-based:
+// weekly +7d, biweekly +14d, monthly +1 month.
+function advanceDate(dateStr, frequency) {
+  const d = new Date(dateStr + 'T12:00:00Z');
+  if (frequency === 'weekly') d.setUTCDate(d.getUTCDate() + 7);
+  else if (frequency === 'biweekly') d.setUTCDate(d.getUTCDate() + 14);
+  else d.setUTCMonth(d.getUTCMonth() + 1);
+  return d.toISOString().slice(0, 10);
+}
+
+const standingOrderPublic = s => ({
+  id: s.id, frequency: s.frequency, items: JSON.parse(s.items_json), notes: s.notes,
+  next_date: s.next_date, active: !!s.active, created_by: s.created_by, created_at: s.created_at,
+});
+
+app.get('/api/standing-orders', (req, res) =>
+  res.json(db.prepare('SELECT * FROM standing_orders WHERE active=1 ORDER BY next_date').all().map(standingOrderPublic)));
+
+app.post('/api/standing-orders', async (req, res) => {
+  try {
+    const { frequency, items, notes, start_date } = req.body || {};
+    if (!['weekly', 'biweekly', 'monthly'].includes(frequency)) return res.status(400).json({ error: 'Frequency must be weekly, biweekly, or monthly' });
+    if (!Array.isArray(items) || !items.length) return res.status(400).json({ error: 'Standing order needs at least one item' });
+    // Validate items against the current catalog so broken standing orders
+    // can't be created.
+    const catalog = await getHubCatalog(getSettings(), true);
+    priceItemsFromCatalog(items, catalog.items || []);
+    const today = new Date().toISOString().slice(0, 10);
+    const nextDate = (start_date && start_date > today) ? start_date : advanceDate(today, frequency);
+    const r = db.prepare('INSERT INTO standing_orders (frequency, items_json, notes, next_date, created_by) VALUES (?,?,?,?,?)')
+      .run(frequency, JSON.stringify(items), notes || null, nextDate, req.user.username);
+    res.json(standingOrderPublic(db.prepare('SELECT * FROM standing_orders WHERE id=?').get(r.lastInsertRowid)));
+  } catch (err) {
+    res.status(400).json({ error: err.message });
+  }
+});
+
+app.delete('/api/standing-orders/:id', (req, res) => {
+  db.prepare('UPDATE standing_orders SET active=0 WHERE id=?').run(req.params.id);
+  res.json({ success: true });
+});
+
+// Scheduler: hourly, place any standing order that has come due. The order is
+// stamped with who set the schedule up; failures still advance the date (the
+// saved order shows a failed status rather than retry-storming the hub).
+async function runStandingOrders() {
+  const today = new Date().toISOString().slice(0, 10);
+  const due = db.prepare('SELECT * FROM standing_orders WHERE active=1 AND next_date <= ?').all(today);
+  for (const so of due) {
+    try {
+      await placeCatalogOrder({
+        order_date: today,
+        requested_date: null,
+        notes: so.notes ? `${so.notes} (standing order)` : 'standing order',
+        rawItems: JSON.parse(so.items_json),
+        username: `${so.created_by || 'standing'} ⟳`,
+      });
+      console.log(`Standing order #${so.id} placed`);
+    } catch (err) {
+      console.error(`Standing order #${so.id} failed: ${err.message}`);
+    }
+    db.prepare('UPDATE standing_orders SET next_date=? WHERE id=?').run(advanceDate(so.next_date, so.frequency), so.id);
+  }
+}
+setTimeout(runStandingOrders, 15_000);
+setInterval(runStandingOrders, 60 * 60 * 1000).unref();
 
 // Suggested order quantities from the current open cycle's burn rate.
 app.get('/api/order-suggestion', async (req, res) => {

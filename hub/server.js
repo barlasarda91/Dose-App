@@ -7,7 +7,7 @@ const express = require('express');
 const crypto = require('crypto');
 const Database = require('better-sqlite3');
 const path = require('path');
-const { catalogForShop, priceOrderItems } = require('./pricing');
+const { BAG_LBS, catalogForShop, priceOrderItems } = require('./pricing');
 
 const app = express();
 app.set('trust proxy', 1); // Railway proxy — needed for req.protocol/req.ip
@@ -33,11 +33,26 @@ db.exec(`
     name TEXT NOT NULL,
     notes TEXT,
     price_per_lb REAL NOT NULL DEFAULT 0,
+    retail_price REAL,
     badge TEXT DEFAULT '',
     low_stock INTEGER DEFAULT 0,
     visibility TEXT NOT NULL DEFAULT 'standard' CHECK(visibility IN ('standard','exclusive')),
     active INTEGER NOT NULL DEFAULT 1,
     created_at TEXT DEFAULT (datetime('now'))
+  );
+
+  CREATE TABLE IF NOT EXISTS roast_reports (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    period_type TEXT NOT NULL CHECK(period_type IN ('week','month')),
+    period TEXT NOT NULL,
+    shop_id INTEGER NOT NULL,
+    shop_name TEXT NOT NULL,
+    coffee_name TEXT NOT NULL,
+    roast TEXT NOT NULL,
+    lbs REAL NOT NULL,
+    cost REAL,
+    created_at TEXT DEFAULT (datetime('now')),
+    UNIQUE(period_type, period, shop_id, coffee_name, roast)
   );
 
   CREATE TABLE IF NOT EXISTS catalog_visibility (
@@ -70,7 +85,7 @@ db.exec(`
     notes TEXT,
     placed_by TEXT,
     source_order_id INTEGER,
-    status TEXT NOT NULL DEFAULT 'new' CHECK(status IN ('new','confirmed','delivered')),
+    status TEXT NOT NULL DEFAULT 'new' CHECK(status IN ('new','confirmed','shipped','delivered')),
     received_at TEXT DEFAULT (datetime('now'))
   );
 
@@ -81,8 +96,9 @@ db.exec(`
     order_id INTEGER NOT NULL REFERENCES orders(id),
     coffee_id INTEGER,
     coffee_name TEXT NOT NULL,
-    roast TEXT NOT NULL CHECK(roast IN ('espresso','filter')),
+    roast TEXT NOT NULL CHECK(roast IN ('espresso','filter','retail')),
     lbs REAL NOT NULL,
+    bags INTEGER,
     price_per_lb REAL NOT NULL,
     line_total REAL NOT NULL
   );
@@ -102,6 +118,42 @@ for (const col of ['login_username TEXT', 'password_hash TEXT', 'salt TEXT', 'in
 for (const col of ['requested_date TEXT', 'total_lbs REAL DEFAULT 0', 'total_cost REAL']) {
   try { db.exec(`ALTER TABLE orders ADD COLUMN ${col}`); } catch { /* present */ }
 }
+try { db.exec('ALTER TABLE catalog ADD COLUMN retail_price REAL'); } catch { /* present */ }
+try { db.exec('ALTER TABLE order_items ADD COLUMN bags INTEGER'); } catch { /* present */ }
+
+// Widen CHECK constraints from earlier versions (SQLite requires a rebuild).
+function rebuildTable(table, needle, createSql, columns) {
+  const row = db.prepare("SELECT sql FROM sqlite_master WHERE type='table' AND name=?").get(table);
+  if (!row || row.sql.includes(needle)) return;
+  db.exec(`ALTER TABLE ${table} RENAME TO ${table}_migr`);
+  db.exec(createSql);
+  db.exec(`INSERT INTO ${table} (${columns}) SELECT ${columns} FROM ${table}_migr`);
+  db.exec(`DROP TABLE ${table}_migr`);
+  console.log(`Migrated ${table} schema`);
+}
+rebuildTable('orders', "'shipped'", `CREATE TABLE orders (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  shop_id INTEGER NOT NULL REFERENCES shops(id),
+  order_date TEXT NOT NULL,
+  requested_date TEXT,
+  espresso_lbs REAL DEFAULT 0, drip_lbs REAL DEFAULT 0, coldbrew_lbs REAL DEFAULT 0, pourover_lbs REAL DEFAULT 0,
+  total_lbs REAL DEFAULT 0, total_cost REAL,
+  notes TEXT, placed_by TEXT, source_order_id INTEGER,
+  status TEXT NOT NULL DEFAULT 'new' CHECK(status IN ('new','confirmed','shipped','delivered')),
+  received_at TEXT DEFAULT (datetime('now'))
+)`, 'id, shop_id, order_date, requested_date, espresso_lbs, drip_lbs, coldbrew_lbs, pourover_lbs, total_lbs, total_cost, notes, placed_by, source_order_id, status, received_at');
+db.exec('CREATE UNIQUE INDEX IF NOT EXISTS idx_orders_dedupe ON orders(shop_id, source_order_id)');
+rebuildTable('order_items', "'retail'", `CREATE TABLE order_items (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  order_id INTEGER NOT NULL REFERENCES orders(id),
+  coffee_id INTEGER,
+  coffee_name TEXT NOT NULL,
+  roast TEXT NOT NULL CHECK(roast IN ('espresso','filter','retail')),
+  lbs REAL NOT NULL,
+  bags INTEGER,
+  price_per_lb REAL NOT NULL,
+  line_total REAL NOT NULL
+)`, 'id, order_id, coffee_id, coffee_name, roast, lbs, bags, price_per_lb, line_total');
 
 const sha256 = s => crypto.createHash('sha256').update(String(s)).digest('hex');
 const SESSION_DAYS = 30;
@@ -168,9 +220,14 @@ app.get('/api/health', async (req, res) => {
     try {
       const r = await fetch('https://api.resend.com/domains', { headers: { 'Authorization': `Bearer ${RESEND_KEY}` } });
       const body = await r.json().catch(() => ({}));
-      report.email_probe = r.ok
-        ? { status: r.status, message: 'ok — Resend accepts this key', domains: (body.data || []).map(d => `${d.name}: ${d.status}`) }
-        : { status: r.status, message: body.message || 'error' };
+      if (r.ok) {
+        report.email_probe = { status: r.status, message: 'ok — Resend accepts this key (full access)', domains: (body.data || []).map(d => `${d.name}: ${d.status}`) };
+      } else if (/restricted to only send/i.test(body.message || '')) {
+        // Sending-only keys can't list domains but CAN send — that's a pass.
+        report.email_probe = { status: 200, message: 'ok — Resend accepts this key (sending-only; domain list not visible to it)' };
+      } else {
+        report.email_probe = { status: r.status, message: body.message || 'error' };
+      }
     } catch (e) {
       report.email_probe = { status: 0, message: `Could not reach Resend: ${e.message}` };
     }
@@ -252,13 +309,15 @@ async function sendEmail(to, subject, html) {
 const esc = s => String(s ?? '').replace(/[<>&"]/g, c => ({ '<': '&lt;', '>': '&gt;', '&': '&amp;', '"': '&quot;' }[c]));
 
 function orderEmailHtml(order, items, shop, headline, sub) {
-  const roastLabel = r => r === 'espresso' ? 'Espresso Roast' : 'Filter Roast';
+  const roastLabel = r => r === 'espresso' ? 'Espresso Roast' : r === 'retail' ? '12oz Retail Bags' : 'Filter Roast';
+  const qtyLabel = i => i.roast === 'retail' ? `${i.bags} bags` : `${i.lbs} lbs`;
+  const unitLabel = i => i.roast === 'retail' ? `${money(i.price_per_lb)}/bag` : `${money(i.price_per_lb)}/lb`;
   const rows = items.length
     ? items.map(i =>
       `<tr>
         <td style="padding:9px 14px;border-bottom:1px solid #DDD6CC;font-family:monospace;font-size:12px;color:#3D3A34;">${esc(i.coffee_name)}<br><span style="font-size:10px;color:#7A7268;">${roastLabel(i.roast)}</span></td>
-        <td style="padding:9px 14px;border-bottom:1px solid #DDD6CC;font-family:monospace;font-size:12px;color:#1A1916;text-align:right;">${i.lbs} lbs</td>
-        <td style="padding:9px 14px;border-bottom:1px solid #DDD6CC;font-family:monospace;font-size:12px;color:#7A7268;text-align:right;">${money(i.price_per_lb)}/lb</td>
+        <td style="padding:9px 14px;border-bottom:1px solid #DDD6CC;font-family:monospace;font-size:12px;color:#1A1916;text-align:right;">${qtyLabel(i)}</td>
+        <td style="padding:9px 14px;border-bottom:1px solid #DDD6CC;font-family:monospace;font-size:12px;color:#7A7268;text-align:right;">${unitLabel(i)}</td>
         <td style="padding:9px 14px;border-bottom:1px solid #DDD6CC;font-family:monospace;font-size:12px;color:#1A1916;text-align:right;">${money(i.line_total)}</td>
       </tr>`).join('')
     : `<tr><td colspan="4" style="padding:9px 14px;font-family:monospace;font-size:12px;color:#3D3A34;">
@@ -354,8 +413,8 @@ app.post('/api/ingest/orders', async (req, res) => {
     }
 
     if (priced) {
-      const ins = db.prepare('INSERT INTO order_items (order_id, coffee_id, coffee_name, roast, lbs, price_per_lb, line_total) VALUES (?,?,?,?,?,?,?)');
-      for (const i of priced.items) ins.run(orderId, i.coffee_id, i.coffee_name, i.roast, i.lbs, i.price_per_lb, i.line_total);
+      const ins = db.prepare('INSERT INTO order_items (order_id, coffee_id, coffee_name, roast, lbs, bags, price_per_lb, line_total) VALUES (?,?,?,?,?,?,?,?)');
+      for (const i of priced.items) ins.run(orderId, i.coffee_id, i.coffee_name, i.roast, i.lbs, i.bags ?? null, i.price_per_lb, i.line_total);
     }
 
     // Receipt email to the shop's registered address; copy to the roastery.
@@ -491,6 +550,7 @@ function saveCatalogBody(b) {
     name: String(b.name || '').trim(),
     notes: b.notes ? String(b.notes).slice(0, 300) : null,
     price: Math.max(0, parseFloat(b.price_per_lb) || 0),
+    retail: parseFloat(b.retail_price) > 0 ? Math.round(parseFloat(b.retail_price) * 100) / 100 : null,
     badge: BADGES.includes(b.badge) ? b.badge : '',
     low_stock: b.low_stock ? 1 : 0,
     visibility: b.visibility === 'exclusive' ? 'exclusive' : 'standard',
@@ -502,8 +562,8 @@ function saveCatalogBody(b) {
 app.post('/api/catalog', (req, res) => {
   const v = saveCatalogBody(req.body || {});
   if (v.name.length < 2) return res.status(400).json({ error: 'Coffee name required' });
-  const r = db.prepare('INSERT INTO catalog (name, notes, price_per_lb, badge, low_stock, visibility, active) VALUES (?,?,?,?,?,?,?)')
-    .run(v.name, v.notes, v.price, v.badge, v.low_stock, v.visibility, v.active);
+  const r = db.prepare('INSERT INTO catalog (name, notes, price_per_lb, retail_price, badge, low_stock, visibility, active) VALUES (?,?,?,?,?,?,?,?)')
+    .run(v.name, v.notes, v.price, v.retail, v.badge, v.low_stock, v.visibility, v.active);
   const setGrants = db.prepare('INSERT INTO catalog_visibility (coffee_id, shop_id) VALUES (?,?)');
   if (v.visibility === 'exclusive') for (const sid of v.shopIds) setGrants.run(r.lastInsertRowid, sid);
   res.json(catalogItemFull(r.lastInsertRowid));
@@ -513,8 +573,8 @@ app.put('/api/catalog/:id', (req, res) => {
   if (!db.prepare('SELECT id FROM catalog WHERE id=?').get(req.params.id)) return res.status(404).json({ error: 'Not found' });
   const v = saveCatalogBody(req.body || {});
   if (v.name.length < 2) return res.status(400).json({ error: 'Coffee name required' });
-  db.prepare('UPDATE catalog SET name=?, notes=?, price_per_lb=?, badge=?, low_stock=?, visibility=?, active=? WHERE id=?')
-    .run(v.name, v.notes, v.price, v.badge, v.low_stock, v.visibility, v.active, req.params.id);
+  db.prepare('UPDATE catalog SET name=?, notes=?, price_per_lb=?, retail_price=?, badge=?, low_stock=?, visibility=?, active=? WHERE id=?')
+    .run(v.name, v.notes, v.price, v.retail, v.badge, v.low_stock, v.visibility, v.active, req.params.id);
   db.prepare('DELETE FROM catalog_visibility WHERE coffee_id=?').run(req.params.id);
   if (v.visibility === 'exclusive') {
     const ins = db.prepare('INSERT INTO catalog_visibility (coffee_id, shop_id) VALUES (?,?)');
@@ -700,7 +760,7 @@ app.get('/api/orders', (req, res) => {
 
 app.patch('/api/orders/:id', async (req, res) => {
   const status = (req.body && req.body.status) || '';
-  if (!['new', 'confirmed', 'delivered'].includes(status)) return res.status(400).json({ error: 'Invalid status' });
+  if (!['new', 'confirmed', 'shipped', 'delivered'].includes(status)) return res.status(400).json({ error: 'Invalid status' });
   const before = db.prepare('SELECT * FROM orders WHERE id=?').get(req.params.id);
   if (!before) return res.status(404).json({ error: 'Order not found' });
   db.prepare('UPDATE orders SET status=? WHERE id=?').run(status, req.params.id);
@@ -717,6 +777,110 @@ app.patch('/api/orders/:id', async (req, res) => {
 
   const updated = orderFull(db.prepare('SELECT o.*, s.name AS shop_name FROM orders o JOIN shops s ON s.id=o.shop_id WHERE o.id=?').get(req.params.id));
   res.json({ ...updated, email });
+});
+
+// Roaster edits an order's quantities; the shop is notified by email.
+app.put('/api/orders/:id/items', async (req, res) => {
+  try {
+    const order = db.prepare('SELECT * FROM orders WHERE id=?').get(req.params.id);
+    if (!order) return res.status(404).json({ error: 'Order not found' });
+    if (['shipped', 'delivered'].includes(order.status)) return res.status(400).json({ error: 'Order already shipped — cannot edit' });
+    const edits = new Map((Array.isArray(req.body.items) ? req.body.items : []).map(e => [parseInt(e.id, 10), e]));
+    const items = db.prepare('SELECT * FROM order_items WHERE order_id=?').all(order.id);
+    if (!items.length) return res.status(400).json({ error: 'Legacy order has no editable line items' });
+
+    const upd = db.prepare('UPDATE order_items SET lbs=?, bags=?, line_total=? WHERE id=?');
+    const del = db.prepare('DELETE FROM order_items WHERE id=?');
+    for (const item of items) {
+      const e = edits.get(item.id);
+      if (!e) continue;
+      if (item.roast === 'retail') {
+        const bags = Math.max(0, Math.round(parseFloat(e.bags ?? e.qty) || 0));
+        if (bags === 0) { del.run(item.id); continue; }
+        upd.run(Math.round(bags * BAG_LBS * 100) / 100, bags, Math.round(bags * item.price_per_lb * 100) / 100, item.id);
+      } else {
+        const lbs = Math.max(0, Math.round((parseFloat(e.lbs ?? e.qty) || 0) * 10) / 10);
+        if (lbs === 0) { del.run(item.id); continue; }
+        upd.run(lbs, null, Math.round(lbs * item.price_per_lb * 100) / 100, item.id);
+      }
+    }
+    const remaining = db.prepare('SELECT * FROM order_items WHERE order_id=?').all(order.id);
+    if (!remaining.length) return res.status(400).json({ error: 'An order cannot be edited down to nothing — delete-level changes need a new order' });
+    const totalLbs = Math.round(remaining.reduce((s, i) => s + i.lbs, 0) * 100) / 100;
+    const totalCost = Math.round(remaining.reduce((s, i) => s + i.line_total, 0) * 100) / 100;
+    db.prepare('UPDATE orders SET total_lbs=?, total_cost=? WHERE id=?').run(totalLbs, totalCost, order.id);
+
+    const shop = db.prepare('SELECT * FROM shops WHERE id=?').get(order.shop_id);
+    const updated = db.prepare('SELECT * FROM orders WHERE id=?').get(order.id);
+    const email = await sendEmail(shop.email, `Order updated — ${shop.name} — ${order.order_date}`,
+      orderEmailHtml(updated, remaining, shop, 'Order Updated', 'The roastery adjusted your order — here is the updated summary. Questions? Just reply to this email.'));
+
+    res.json({ ...orderFull(db.prepare('SELECT o.*, s.name AS shop_name FROM orders o JOIN shops s ON s.id=o.shop_id WHERE o.id=?').get(order.id)), email });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ─── Roast Program ────────────────────────────────────────────────────────────
+// Confirmed (not yet shipped) orders, aggregated by coffee × roast profile:
+// what the roaster needs to roast today.
+app.get('/api/roast-program', (req, res) => {
+  const rows = db.prepare(
+    `SELECT oi.coffee_name, oi.roast, SUM(oi.lbs) lbs, SUM(COALESCE(oi.bags,0)) bags,
+            COUNT(DISTINCT o.id) orders_count,
+            GROUP_CONCAT(DISTINCT s.name) shop_names
+     FROM order_items oi
+     JOIN orders o ON o.id = oi.order_id
+     JOIN shops s ON s.id = o.shop_id
+     WHERE o.status = 'confirmed'
+     GROUP BY oi.coffee_name, oi.roast
+     ORDER BY oi.coffee_name, oi.roast`
+  ).all();
+  const legacy = db.prepare("SELECT COUNT(*) n FROM orders WHERE status='confirmed' AND id NOT IN (SELECT DISTINCT order_id FROM order_items)").get().n;
+  res.json({
+    batches: rows.map(r => ({
+      coffee_name: r.coffee_name,
+      roast: r.roast,
+      lbs: Math.round(r.lbs * 100) / 100,
+      bags: r.roast === 'retail' ? r.bags : null,
+      orders_count: r.orders_count,
+      shops: String(r.shop_names || '').split(','),
+    })),
+    total_lbs: Math.round(rows.reduce((s, r) => s + r.lbs, 0) * 100) / 100,
+    legacy_orders_excluded: legacy,
+  });
+});
+
+// ─── Weekly / monthly roast reports ──────────────────────────────────────────
+// At the close of each week/month, roll up roasted coffee per client into
+// roast_reports. Orders are kept forever — storage is tiny and history feeds
+// Patterns and audits.
+function generateRoastReports() {
+  for (const [type, fmt] of [['week', '%Y-W%W'], ['month', '%Y-%m']]) {
+    const current = db.prepare(`SELECT strftime('${fmt}', 'now') p`).get().p;
+    const rows = db.prepare(
+      `SELECT strftime('${fmt}', o.order_date) period, o.shop_id, s.name shop_name,
+              oi.coffee_name, oi.roast, SUM(oi.lbs) lbs, SUM(oi.line_total) cost
+       FROM order_items oi JOIN orders o ON o.id=oi.order_id JOIN shops s ON s.id=o.shop_id
+       WHERE o.status IN ('confirmed','shipped','delivered') AND strftime('${fmt}', o.order_date) < ?
+       GROUP BY period, o.shop_id, oi.coffee_name, oi.roast`
+    ).all(current);
+    const ins = db.prepare(
+      `INSERT OR REPLACE INTO roast_reports (period_type, period, shop_id, shop_name, coffee_name, roast, lbs, cost)
+       VALUES (?,?,?,?,?,?,?,?)`);
+    for (const r of rows) ins.run(type, r.period, r.shop_id, r.shop_name, r.coffee_name, r.roast, Math.round(r.lbs * 100) / 100, Math.round(r.cost * 100) / 100);
+  }
+}
+generateRoastReports();
+setInterval(generateRoastReports, 12 * 60 * 60 * 1000).unref();
+
+app.get('/api/reports', (req, res) => {
+  const type = req.query.period_type === 'month' ? 'month' : 'week';
+  const rows = db.prepare(
+    'SELECT * FROM roast_reports WHERE period_type=? ORDER BY period DESC, shop_name, coffee_name LIMIT 1000'
+  ).all(type);
+  res.json({ currency: CURRENCY, rows });
 });
 
 // ─── Patterns ─────────────────────────────────────────────────────────────────
