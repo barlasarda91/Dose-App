@@ -241,13 +241,13 @@
       <div class="card">
         <label class="lbl">Add Shop</label>
         <div style="font-size:10px;color:var(--drift);margin-bottom:10px">
-          Creating a shop creates its account: a login username (from the name), the password its staff sign in with, and the API key its deployment uses.
+          Creating a shop creates its account and API key, and emails the shop an invite to set its own password
+          (username is generated from the name). No passwords pass through you.
         </div>
         <div style="display:flex;gap:10px;flex-wrap:wrap">
           <input id="new-shop" placeholder="Shop name, e.g. Boxx Kadıköy" style="min-width:190px">
-          <input id="new-email" placeholder="Registered email (receipts go here)" style="min-width:230px">
-          <input id="new-pass" type="password" placeholder="Login password (min 8)" style="min-width:170px" autocomplete="new-password">
-          <button class="btn" id="add-shop">Create Shop</button>
+          <input id="new-email" placeholder="Registered email (invite + receipts)" style="min-width:240px">
+          <button class="btn" id="add-shop">Create Shop & Send Invite</button>
         </div>
         <div id="add-result"></div>
       </div>
@@ -259,14 +259,14 @@
         <thead><tr><th>Shop</th><th>Login</th><th>Email</th><th>Orders</th><th>Last order</th><th></th></tr></thead>
         <tbody>${shops.map(s => `<tr>
           <td style="font-weight:500">${esc(s.name)}</td>
-          <td style="color:var(--drift)">${esc(s.login_username || '—')}${s.has_password ? '' : ' <span class="badge low">No login password</span>'}</td>
+          <td style="color:var(--drift)">${esc(s.login_username || '—')}${s.has_password ? '' : (s.invite_pending ? ' <span class="badge seasonal">Invite pending</span>' : ' <span class="badge low">No login yet</span>')}</td>
           <td style="color:var(--drift)">${esc(s.email || '— none —')}</td>
           <td>${s.orders_count}</td>
           <td>${esc(s.last_order_date || '—')}</td>
           <td><div style="display:flex;gap:6px;flex-wrap:wrap">
             <button class="btn-sm btn" data-pricing="${s.id}">Pricing</button>
             <button class="btn-sm btn" data-editshop="${s.id}">Edit</button>
-            <button class="btn-sm btn" data-resetlogin="${s.id}">Reset Login</button>
+            <button class="btn-sm btn" data-invite="${s.id}">${s.has_password ? 'Send Password Reset' : 'Send Invite'}</button>
             <button class="btn-sm btn" data-rotate="${s.id}">Rotate Key</button>
           </div></td>
         </tr>`).join('')}</tbody></table></div>` : '<div class="empty">No shops yet.</div>';
@@ -285,18 +285,26 @@
         navigator.clipboard.writeText(key).then(() => { document.getElementById('copy-key').textContent = 'Copied ✓'; });
     };
 
+    const inviteHtml = (shop, invite) => invite.sent
+      ? `<div class="ok">✉ Invite emailed to ${esc(invite.to)} — ${esc(shop.name)} signs in as <strong>${esc(shop.login_username)}</strong> once they set their password.</div>`
+      : `<div class="keybox">✉ Invite email not sent (${esc(invite.reason)}). Send this link to the shop yourself — it lets them set their password (valid 7 days):<br>
+          <code>${esc(invite.link)}</code>
+          <button class="btn-sm btn" data-copylink="${esc(invite.link)}" style="margin-left:8px">Copy</button></div>`;
+
+    const wireCopy = () => document.querySelectorAll('[data-copylink]').forEach(b => b.onclick = () =>
+      navigator.clipboard.writeText(b.dataset.copylink).then(() => { b.textContent = 'Copied ✓'; }));
+
     document.getElementById('add-shop').onclick = async () => {
       const name = document.getElementById('new-shop').value.trim();
       const email = document.getElementById('new-email').value.trim();
-      const password = document.getElementById('new-pass').value;
       if (!name) return;
       try {
-        const data = await api('/api/shops', { method: 'POST', body: JSON.stringify({ name, email, password }) });
+        const data = await api('/api/shops', { method: 'POST', body: JSON.stringify({ name, email }) });
         shops = [...shops, data.shop].sort((a, b) => a.name.localeCompare(b.name));
         showKey(data.shop.name, data.api_key);
-        document.getElementById('add-result').insertAdjacentHTML('beforeend',
-          `<div class="ok">Login for staff: username <strong>${esc(data.shop.login_username)}</strong> + the password you just set.</div>`);
-        document.getElementById('new-shop').value = ''; document.getElementById('new-email').value = ''; document.getElementById('new-pass').value = '';
+        document.getElementById('add-result').insertAdjacentHTML('beforeend', inviteHtml(data.shop, data.invite));
+        wireCopy();
+        document.getElementById('new-shop').value = ''; document.getElementById('new-email').value = '';
         drawList();
       } catch (e) { document.getElementById('add-result').innerHTML = `<div class="err">${esc(e.message)}</div>`; }
     };
@@ -323,16 +331,14 @@
           drawList();
         } catch (e) { alert(e.message); }
       });
-      document.querySelectorAll('[data-resetlogin]').forEach(btn => btn.onclick = async () => {
-        const shop = shops.find(s => String(s.id) === btn.dataset.resetlogin);
-        const pw = window.prompt(`New login password for '${shop.name}' (min 8 characters):`);
-        if (pw === null) return;
+      document.querySelectorAll('[data-invite]').forEach(btn => btn.onclick = async () => {
+        const shop = shops.find(s => String(s.id) === btn.dataset.invite);
         try {
-          const data = await api(`/api/shops/${shop.id}/reset-login`, { method: 'POST', body: JSON.stringify({ new_password: pw }) });
-          shops = shops.map(s => s.id === shop.id ? { ...s, login_username: data.login_username, has_password: true } : s);
-          drawList();
-          document.getElementById('add-result').innerHTML =
-            `<div class="ok">✓ ${esc(shop.name)} login updated — username <strong>${esc(data.login_username)}</strong>, the password you just set.</div>`;
+          const data = await api(`/api/shops/${shop.id}/invite`, { method: 'POST' });
+          document.getElementById('add-result').innerHTML = inviteHtml(shop, data.invite);
+          wireCopy();
+          if (!shop.has_password) { shops = shops.map(s => s.id === shop.id ? { ...s, invite_pending: true } : s); drawList(); }
+          window.scrollTo({ top: 0, behavior: 'smooth' });
         } catch (e) { alert(e.message); }
       });
       document.querySelectorAll('[data-pricing]').forEach(btn => btn.onclick = () => openPricing(btn.dataset.pricing));
@@ -441,8 +447,57 @@
     }).join('')}</div>`;
   }
 
+  // ─── Public set-password page (invite links land here) ─────────────────────
+  async function renderSetPassword(token) {
+    const shell = (inner) => {
+      app.innerHTML = `<div class="login-wrap"><div class="login-card">
+        <div class="login-title">Dose</div>
+        <div class="login-sub">Boxx Coffee Roasters Co.</div>
+        ${inner}
+      </div></div>`;
+    };
+    let info;
+    try {
+      info = await api('/api/public/invite-info', { method: 'POST', body: JSON.stringify({ token }) });
+    } catch (e) {
+      shell(`<div class="err" style="margin:0">${esc(e.message)}</div>`);
+      return;
+    }
+    shell(`
+      <p style="font-size:11px;color:var(--graphite);line-height:1.7;margin-bottom:14px">
+        Welcome, <strong>${esc(info.shop_name)}</strong> — choose the password your shop will sign in with.
+        Your username is <strong>${esc(info.login_username)}</strong>.
+      </p>
+      <form id="sp-form">
+        <label class="lbl" for="sp-pw">Password (min 8 characters)</label>
+        <input type="password" id="sp-pw" style="width:100%" autocomplete="new-password" autofocus>
+        <label class="lbl" for="sp-pw2" style="margin-top:10px">Repeat Password</label>
+        <input type="password" id="sp-pw2" style="width:100%" autocomplete="new-password">
+        <div class="err" id="sp-err"></div>
+        <button class="btn" type="submit" style="margin-top:14px;width:100%">Set Password</button>
+      </form>`);
+    document.getElementById('sp-form').onsubmit = async e => {
+      e.preventDefault();
+      const pw = document.getElementById('sp-pw').value;
+      if (pw !== document.getElementById('sp-pw2').value) {
+        document.getElementById('sp-err').textContent = 'Passwords do not match';
+        return;
+      }
+      try {
+        const done = await api('/api/public/set-password', { method: 'POST', body: JSON.stringify({ token, password: pw }) });
+        shell(`<div class="ok" style="margin:0;line-height:1.8">
+          ✓ Password set. Sign in to your shop's Dose app as <strong>${esc(done.login_username)}</strong> with your new password.
+          You can close this page.</div>`);
+      } catch (err) {
+        document.getElementById('sp-err').textContent = err.message;
+      }
+    };
+  }
+
   // ─── Boot ───────────────────────────────────────────────────────────────────
-  if (getToken()) {
+  if (window.location.pathname === '/set-password') {
+    renderSetPassword(new URLSearchParams(window.location.search).get('token') || '');
+  } else if (getToken()) {
     api('/api/shops').then(() => renderShell('orders')).catch(() => {});
   } else {
     renderLogin();

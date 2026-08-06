@@ -10,6 +10,7 @@ const path = require('path');
 const { catalogForShop, priceOrderItems } = require('./pricing');
 
 const app = express();
+app.set('trust proxy', 1); // Railway proxy — needed for req.protocol/req.ip
 app.use(express.json());
 
 const dbPath = process.env.HUB_DB_PATH || '/app/data/hub.db';
@@ -95,7 +96,7 @@ db.exec(`
 
 // Databases created before this version predate some columns.
 try { db.exec('ALTER TABLE shops ADD COLUMN email TEXT'); } catch { /* present */ }
-for (const col of ['login_username TEXT', 'password_hash TEXT', 'salt TEXT']) {
+for (const col of ['login_username TEXT', 'password_hash TEXT', 'salt TEXT', 'invite_token_hash TEXT', 'invite_expires_at TEXT']) {
   try { db.exec(`ALTER TABLE shops ADD COLUMN ${col}`); } catch { /* present */ }
 }
 for (const col of ['requested_date TEXT', 'total_lbs REAL DEFAULT 0', 'total_cost REAL']) {
@@ -393,9 +394,40 @@ app.get('/api/ingest/order-status', (req, res) => {
   res.json(rows);
 });
 
+// ─── Public invite endpoints (token-authenticated, no session) ───────────────
+function shopFromInviteToken(token) {
+  if (!token) return null;
+  return db.prepare(
+    "SELECT * FROM shops WHERE invite_token_hash=? AND invite_expires_at > datetime('now')"
+  ).get(sha256(String(token)));
+}
+
+app.post('/api/public/invite-info', (req, res) => {
+  const shop = shopFromInviteToken(req.body && req.body.token);
+  if (!shop) return res.status(404).json({ error: 'This link is invalid or has expired — ask the roastery to send a new one.' });
+  res.json({ shop_name: shop.name, login_username: shop.login_username });
+});
+
+app.post('/api/public/set-password', async (req, res) => {
+  try {
+    const shop = shopFromInviteToken(req.body && req.body.token);
+    if (!shop) return res.status(404).json({ error: 'This link is invalid or has expired — ask the roastery to send a new one.' });
+    const password = (req.body && req.body.password) || '';
+    if (String(password).length < SHOP_PASSWORD_MIN)
+      return res.status(400).json({ error: `Password must be at least ${SHOP_PASSWORD_MIN} characters` });
+    const { salt, hash } = await hashPassword(password);
+    db.prepare('UPDATE shops SET password_hash=?, salt=?, invite_token_hash=NULL, invite_expires_at=NULL WHERE id=?')
+      .run(hash, salt, shop.id);
+    res.json({ ok: true, login_username: shop.login_username, shop_name: shop.name });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // ─── Dashboard auth gate ──────────────────────────────────────────────────────
 app.use('/api', (req, res, next) => {
-  if (req.path === '/login' || req.path.startsWith('/ingest/')) return next();
+  if (req.path === '/login' || req.path.startsWith('/ingest/') || req.path.startsWith('/public/')) return next();
   const token = req.get('x-hub-key') || '';
   if (token && db.prepare("SELECT token FROM sessions WHERE token=? AND expires_at > datetime('now')").get(sha256(token))) return next();
   res.status(401).json({ error: 'Unauthorized' });
@@ -455,7 +487,9 @@ app.put('/api/catalog/:id', (req, res) => {
 // ─── Shops management ─────────────────────────────────────────────────────────
 const shopWithStats = s => ({
   id: s.id, name: s.name, email: s.email, login_username: s.login_username,
-  has_password: !!s.password_hash, created_at: s.created_at,
+  has_password: !!s.password_hash,
+  invite_pending: !!(s.invite_token_hash && !s.password_hash),
+  created_at: s.created_at,
   orders_count: db.prepare('SELECT COUNT(*) n FROM orders WHERE shop_id=?').get(s.id).n,
   last_order_date: db.prepare('SELECT MAX(order_date) d FROM orders WHERE shop_id=?').get(s.id).d,
 });
@@ -464,24 +498,72 @@ app.get('/api/shops', (req, res) => {
   res.json(db.prepare('SELECT * FROM shops ORDER BY name').all().map(shopWithStats));
 });
 
+// ─── Invites ─────────────────────────────────────────────────────────────────
+// The shop sets its OWN password via a single-use, 7-day invite link emailed
+// to the registered address. If hub email isn't configured, the link is
+// returned to the roastery dashboard to pass on manually.
+function inviteEmailHtml(shop, link) {
+  return `
+  <div style="max-width:520px;margin:0 auto;background:#F5EFE3;border:1px solid #DDD6CC;">
+    <div style="background:#1A1916;padding:22px 26px;">
+      <div style="font-family:Georgia,serif;font-size:18px;color:#F5EFE3;">Welcome to Dose</div>
+      <div style="font-family:monospace;font-size:11px;color:#B8AFA3;letter-spacing:0.14em;text-transform:uppercase;margin-top:6px;">${esc(shop.name)}</div>
+    </div>
+    <div style="padding:20px 26px;font-family:monospace;font-size:12px;color:#3D3A34;line-height:1.8;">
+      Your roastery set up Dose for your shop. Your sign-in username is
+      <strong>${esc(shop.login_username)}</strong> — click below to choose your password.
+      The link works once and expires in 7 days.
+    </div>
+    <div style="padding:0 26px 24px;">
+      <a href="${esc(link)}" style="display:inline-block;background:#1A1916;color:#F5EFE3;font-family:monospace;font-size:11px;letter-spacing:0.16em;text-transform:uppercase;padding:12px 22px;text-decoration:none;">Set My Password</a>
+    </div>
+    <div style="padding:14px 26px;font-family:monospace;font-size:10px;color:#7A7268;border-top:1px solid #DDD6CC;">
+      Dose Hub · Boxx Coffee Roasters Co.
+    </div>
+  </div>`;
+}
+
+async function createInvite(shopId, req) {
+  const token = crypto.randomBytes(32).toString('hex');
+  db.prepare("UPDATE shops SET invite_token_hash=?, invite_expires_at=datetime('now','+7 days') WHERE id=?")
+    .run(sha256(token), shopId);
+  const shop = db.prepare('SELECT * FROM shops WHERE id=?').get(shopId);
+  const link = `${req.protocol}://${req.get('host')}/set-password?token=${token}`;
+  const email = await sendEmail(shop.email, `Set your Dose password — ${shop.name}`, inviteEmailHtml(shop, link));
+  return { ...email, link };
+}
+
 // Creating a shop creates its ACCOUNT: login username (from the name),
-// registered email, password, and API key (returned once).
+// registered email, and API key (returned once). The password is set by the
+// shop itself through the invite link.
 app.post('/api/shops', async (req, res) => {
   try {
     const name = String((req.body && req.body.name) || '').trim();
     const email = String((req.body && req.body.email) || '').trim() || null;
-    const password = (req.body && req.body.password) || '';
     if (name.length < 2) return res.status(400).json({ error: 'Shop name required (2+ characters)' });
-    if (String(password).length < SHOP_PASSWORD_MIN)
-      return res.status(400).json({ error: `Login password required (min ${SHOP_PASSWORD_MIN} characters)` });
+    if (!email) return res.status(400).json({ error: 'Registered email required — the password invite is sent there' });
     const apiKey = 'dose_' + crypto.randomBytes(24).toString('hex');
     const loginUsername = genLoginUsername(name);
-    const { salt, hash } = await hashPassword(password);
-    const r = db.prepare('INSERT INTO shops (name, email, api_key_hash, login_username, password_hash, salt) VALUES (?,?,?,?,?,?)')
-      .run(name, email, sha256(apiKey), loginUsername, hash, salt);
-    res.json({ shop: shopWithStats(db.prepare('SELECT * FROM shops WHERE id=?').get(r.lastInsertRowid)), api_key: apiKey });
+    const r = db.prepare('INSERT INTO shops (name, email, api_key_hash, login_username) VALUES (?,?,?,?)')
+      .run(name, email, sha256(apiKey), loginUsername);
+    const invite = await createInvite(r.lastInsertRowid, req);
+    res.json({ shop: shopWithStats(db.prepare('SELECT * FROM shops WHERE id=?').get(r.lastInsertRowid)), api_key: apiKey, invite });
   } catch (err) {
     if (String(err.message).includes('UNIQUE')) return res.status(400).json({ error: 'A shop with that name already exists' });
+    console.error(err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Re-send (or hand out) a fresh invite — also how a lost password gets reset
+// by the shop itself.
+app.post('/api/shops/:id/invite', async (req, res) => {
+  try {
+    const shop = db.prepare('SELECT * FROM shops WHERE id=?').get(req.params.id);
+    if (!shop) return res.status(404).json({ error: 'Shop not found' });
+    if (!shop.email) return res.status(400).json({ error: 'Set a registered email for this shop first (Edit)' });
+    res.json({ ok: true, invite: await createInvite(shop.id, req) });
+  } catch (err) {
     console.error(err);
     res.status(500).json({ error: err.message });
   }
