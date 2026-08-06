@@ -39,7 +39,6 @@ export default function Order() {
   const [catalog, setCatalog]   = useState(null); // { configured, currency, items, error }
   const [orders, setOrders]     = useState([]);
   const [standing, setStanding] = useState([]);
-  const [settings, setSettings] = useState({});
   // quantities keyed by `${coffeeId}:${roast}` — roast: espresso | filter | retail (bags)
   const [qty, setQty]           = useState({});
   const [reqDate, setReqDate]   = useState('');
@@ -55,7 +54,6 @@ export default function Order() {
     apiJson('/api/hub-catalog').then(setCatalog).catch(() => setCatalog({ configured: false, items: [] }));
     apiJson('/api/orders').then(setOrders).catch(() => {});
     apiJson('/api/standing-orders').then(setStanding).catch(() => {});
-    apiJson('/api/settings').then(setSettings).catch(() => {});
   }, []);
 
   const currency = catalog?.currency || '$';
@@ -324,7 +322,19 @@ export default function Order() {
           </div>
         </div>
       ) : (
-        <LegacyPoolOrder settings={settings} orders={orders} setOrders={setOrders} setError={setError} setResult={setResult} />
+        <div className="section">
+          <div className="section-title">New Order</div>
+          <div className="card" style={{ textAlign: 'center', padding: '48px 24px' }}>
+            <div style={{ fontFamily: 'var(--font-serif)', fontSize: 20, color: 'var(--ink)', marginBottom: 10 }}>
+              Ordering is locked
+            </div>
+            <p style={{ fontSize: 12, color: 'var(--drift)', lineHeight: 1.8, maxWidth: 440, margin: '0 auto' }}>
+              {catalog?.configured
+                ? 'Connected to the roastery, but their price list is empty — coffees will appear here as soon as the roastery publishes them.'
+                : <>This shop isn't connected to the roastery yet. Enter the API key from the roastery under Settings → Ordering → Roastery Hub, and the live price list will appear here.</>}
+            </p>
+          </div>
+        </div>
       )}
 
       <div className="section">
@@ -368,67 +378,6 @@ export default function Order() {
             </table>
           </div>
         ) : <div className="empty">No orders yet. Your sent orders will be logged here for one-click reordering.</div>}
-      </div>
-    </div>
-  );
-}
-
-// Fallback for shops not yet connected to a roastery hub: the original
-// pool-based form, emailed to the roastery.
-function LegacyPoolOrder({ settings, orders, setOrders, setError, setResult }) {
-  const [form, setForm] = useState({ order_date: TODAY, espresso_lbs: '', drip_lbs: '', coldbrew_lbs: '', pourover_lbs: '', notes: '' });
-  const [sending, setSending] = useState(false);
-  const set = k => e => setForm(p => ({ ...p, [k]: e.target.value }));
-  const totalLbs = POOLS.reduce((s, p) => s + (parseFloat(form[p.field]) || 0), 0);
-  const emailTo = settings.order_email_to || 'hello@boxxcoffee.com';
-
-  async function send() {
-    if (totalLbs <= 0 || sending) return;
-    setSending(true); setResult(null); setError(null);
-    try {
-      const data = await apiJson('/api/orders', { method: 'POST', body: JSON.stringify(form) });
-      if (data.error) throw new Error(data.error);
-      setOrders(x => [data.order, ...x]);
-      setResult(data);
-      setForm({ order_date: TODAY, espresso_lbs: '', drip_lbs: '', coldbrew_lbs: '', pourover_lbs: '', notes: '' });
-    } catch (e) {
-      if (!e.unauthorized) setError(e.message);
-    } finally {
-      setSending(false);
-    }
-  }
-
-  return (
-    <div className="section">
-      <div className="section-title">New Order</div>
-      <div className="warn-box">
-        This shop isn't connected to a roastery hub yet, so ordering uses simple per-pool quantities emailed to {emailTo}.
-        Once the roastery connects you (Settings → Ordering → Roastery Hub), you'll order from their live price list instead.
-      </div>
-      <div className="card">
-        <div className="form-grid">
-          <div className="form-group">
-            <label className="form-lbl">Order Date</label>
-            <DateField value={form.order_date} onChange={v => setForm(p => ({ ...p, order_date: v }))} />
-          </div>
-          {POOLS.map(p => (
-            <div className="form-group" key={p.field}>
-              <label className="form-lbl">{p.label} (lbs)</label>
-              <input type="number" className="form-input" min="0" step="1" placeholder="0"
-                value={form[p.field]} onChange={set(p.field)} />
-            </div>
-          ))}
-        </div>
-        <div className="form-group" style={{ maxWidth: 480, marginTop: 6 }}>
-          <label className="form-lbl">Notes</label>
-          <input className="form-input" placeholder="e.g. deliver Tuesday morning" value={form.notes} onChange={set('notes')} />
-        </div>
-        <div style={{ display: 'flex', alignItems: 'center', gap: 16, marginTop: 18 }}>
-          <button className="btn btn-primary" onClick={send} disabled={sending || totalLbs <= 0}>
-            {sending ? '…Sending' : `Send Order${totalLbs > 0 ? ` — ${totalLbs} lbs` : ''}`}
-          </button>
-          <span style={{ fontFamily: 'var(--font-mono)', fontSize: 10, color: 'var(--drift)' }}>to {emailTo}</span>
-        </div>
       </div>
     </div>
   );
