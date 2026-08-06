@@ -168,9 +168,14 @@ app.get('/api/health', async (req, res) => {
     try {
       const r = await fetch('https://api.resend.com/domains', { headers: { 'Authorization': `Bearer ${RESEND_KEY}` } });
       const body = await r.json().catch(() => ({}));
-      report.email_probe = r.ok
-        ? { status: r.status, message: 'ok — Resend accepts this key', domains: (body.data || []).map(d => `${d.name}: ${d.status}`) }
-        : { status: r.status, message: body.message || 'error' };
+      if (r.ok) {
+        report.email_probe = { status: r.status, message: 'ok — Resend accepts this key (full access)', domains: (body.data || []).map(d => `${d.name}: ${d.status}`) };
+      } else if (/restricted to only send/i.test(body.message || '')) {
+        // Sending-only keys can't list domains but CAN send — that's a pass.
+        report.email_probe = { status: 200, message: 'ok — Resend accepts this key (sending-only; domain list not visible to it)' };
+      } else {
+        report.email_probe = { status: r.status, message: body.message || 'error' };
+      }
     } catch (e) {
       report.email_probe = { status: 0, message: `Could not reach Resend: ${e.message}` };
     }
