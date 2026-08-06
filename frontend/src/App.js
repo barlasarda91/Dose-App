@@ -7,26 +7,33 @@ import Recipes   from './pages/Recipes';
 import Settings  from './pages/Settings';
 import { api, setKey, clearKey } from './api';
 
-function Login() {
-  const [pw, setPw]     = useState('');
-  const [err, setErr]   = useState(null);
-  const [busy, setBusy] = useState(false);
+// First run: create the shop password. Every other visit: log in with it.
+// Both exchange the password for a session token stored in localStorage —
+// the password itself is never kept in the browser.
+function Gate({ mode }) {
+  const [pw, setPw]         = useState('');
+  const [confirm, setConfirm] = useState('');
+  const [err, setErr]       = useState(null);
+  const [busy, setBusy]     = useState(false);
+  const isSetup = mode === 'setup';
 
   async function submit(e) {
     e.preventDefault();
     if (!pw || busy) return;
+    if (isSetup && pw !== confirm) { setErr('Passwords do not match'); return; }
     setBusy(true); setErr(null);
     try {
-      const res = await fetch('/api/login', {
+      const res = await fetch(isSetup ? '/api/setup' : '/api/login', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ password: pw }),
       });
-      if (res.ok) {
-        setKey(pw);
+      const data = await res.json().catch(() => ({}));
+      if (res.ok && data.token) {
+        setKey(data.token);
         window.location.reload();
       } else {
-        setErr('Wrong password');
+        setErr(data.error || (isSetup ? 'Setup failed' : 'Wrong password'));
       }
     } catch {
       setErr('Could not reach the server');
@@ -40,12 +47,24 @@ function Login() {
       <form className="login-card" onSubmit={submit}>
         <div className="login-title">Dose</div>
         <div className="login-sub">Boxx Coffee Roasters Co.</div>
-        <label className="form-lbl" htmlFor="dose-pw">Password</label>
+        {isSetup && (
+          <p style={{ fontFamily: 'var(--font-mono)', fontSize: 11, color: 'var(--graphite)', lineHeight: 1.7, marginBottom: 14 }}>
+            Welcome — set a password for this shop. Everyone using the app shares it; you can change it later in Settings.
+          </p>
+        )}
+        <label className="form-lbl" htmlFor="dose-pw">{isSetup ? 'Create Password' : 'Password'}</label>
         <input id="dose-pw" type="password" className="form-input" autoFocus
           value={pw} onChange={e => setPw(e.target.value)} />
+        {isSetup && (
+          <>
+            <label className="form-lbl" htmlFor="dose-pw2" style={{ marginTop: 8 }}>Repeat Password</label>
+            <input id="dose-pw2" type="password" className="form-input"
+              value={confirm} onChange={e => setConfirm(e.target.value)} />
+          </>
+        )}
         {err && <div className="login-err">{err}</div>}
         <button className="btn btn-primary" type="submit" disabled={busy || !pw} style={{ marginTop: 14, width: '100%' }}>
-          {busy ? '…' : 'Enter'}
+          {busy ? '…' : isSetup ? 'Set Password & Enter' : 'Enter'}
         </button>
       </form>
     </div>
@@ -54,23 +73,29 @@ function Login() {
 
 export default function App() {
   const [page, setPage] = useState('dashboard');
-  // null = checking, true = in, false = show login
-  const [authed, setAuthed] = useState(null);
+  // 'checking' | 'setup' | 'login' | 'in'
+  const [auth, setAuth] = useState('checking');
 
   useEffect(() => {
-    api('/api/settings')
-      .then(() => setAuthed(true))
-      .catch(e => {
-        if (e.unauthorized) { clearKey(); setAuthed(false); }
-        else setAuthed(true); // server unreachable ≠ locked out; let pages surface the error
-      });
-    const onUnauth = () => { clearKey(); setAuthed(false); };
+    (async () => {
+      try {
+        const status = await fetch('/api/auth-status').then(r => r.json());
+        if (status.setup_required) { setAuth('setup'); return; }
+        await api('/api/settings');
+        setAuth('in');
+      } catch (e) {
+        if (e.unauthorized) { clearKey(); setAuth('login'); }
+        else setAuth('in'); // server unreachable ≠ locked out; let pages surface the error
+      }
+    })();
+    const onUnauth = () => { clearKey(); setAuth('login'); };
     window.addEventListener('dose:unauthorized', onUnauth);
     return () => window.removeEventListener('dose:unauthorized', onUnauth);
   }, []);
 
-  if (authed === null) return null;
-  if (!authed) return <Login />;
+  if (auth === 'checking') return null;
+  if (auth === 'setup') return <Gate mode="setup" />;
+  if (auth === 'login') return <Gate mode="login" />;
 
   const pages = [
     { id: 'dashboard', label: 'Dashboard' },

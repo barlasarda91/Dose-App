@@ -4,24 +4,27 @@ Track coffee and milk efficiency for your coffee shop by comparing Square POS sa
 
 ## Setup
 
+The app is self-configuring: on first visit it asks you to **create a shop password**, and everything shop-specific — the Square access token, Resend API key, order email — is entered on the **Settings page after logging in** and stored in that shop's own database. Deploying a new shop needs no secrets in Railway at all.
+
 ### Railway Environment Variables
-Set these in your Railway service → Variables tab:
 
 | Variable | Required | Description |
 |---|---|---|
-| `SQUARE_ACCESS_TOKEN` | Yes | Your Square production access token (starts with EAAA) |
 | `NODE_ENV` | Yes | Set to `production` |
 | `DB_PATH` | Recommended | SQLite path on the persistent volume, e.g. `/app/data/dose.db` |
-| `DOSE_PASSWORD` | Strongly recommended | Shared password protecting the app and API. Without it, anyone with the URL can read sales data and place orders. |
-| `RESEND_API_KEY` | For ordering | [Resend](https://resend.com) API key used to email orders to the roastery. Orders are saved (not emailed) without it. |
-| `ORDER_EMAIL_FROM` | Optional | From address for order emails, e.g. `Dose Orders <orders@yourdomain.com>`. Must be a Resend-verified sender. |
+| `DOSE_PASSWORD` | Optional | Seeds the shop password on first boot (skips the create-password screen). In-app password changes take precedence afterwards. |
+| `SQUARE_ACCESS_TOKEN` | Optional fallback | Used only when no token has been entered in Settings. |
+| `RESEND_API_KEY` | Optional fallback | Used only when no key has been entered in Settings. |
+| `ORDER_EMAIL_FROM` | Optional fallback | Used only when no from-address has been entered in Settings. |
+
+Secrets are stored in the shop's database (password as a salted scrypt hash; login uses random session tokens) and are never echoed back to the browser.
 
 ### Deploy
 1. Push this repo to GitHub
 2. Create a new Railway project → Deploy from GitHub repo
-3. Add the environment variables above
+3. Set `NODE_ENV=production` and `DB_PATH=/app/data/dose.db`
 4. Create a volume mounted at `/app/data` (without it, data resets on every deploy)
-5. Railway auto-builds and deploys
+5. Open the app → create the shop password → paste the Square token (and optionally Resend key) in Settings
 
 ## How it works
 
@@ -29,7 +32,7 @@ Set these in your Railway service → Variables tab:
 - **Stock Log** — log coffee deliveries (per pool) and milk deliveries / Numilk rates
 - **Order** — place a coffee order with the roastery, emailed to the configured address (default `hello@boxxcoffee.com`). Includes a suggested order computed from the current cycle's burn rate, a one-click **Duplicate Last Order**, and a full order history.
 - **Drink Recipes** — maps Square item names to coffee pool and gram dose. Pre-seeded with your menu on first run.
-- **Settings** — Square Location ID (optional), shop name + order email for ordering, and status of the token / password / email configuration
+- **Settings** — Square access token + Location ID, shop name / order email / Resend key for ordering, and password change. Secret fields are write-only: they show configured/not-configured, never the value.
 
 ## Delivery cycles
 
