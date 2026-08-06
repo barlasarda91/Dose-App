@@ -4,9 +4,11 @@ Track coffee and milk efficiency for your coffee shop by comparing Square POS sa
 
 ## Setup
 
-The app is self-configuring and uses **user accounts with roles** — there is no self-registration. The first visit to a fresh deployment shows a one-time setup screen that creates the **admin** account; whoever provisions the shop (the roastery) does this **before** handing the URL to the client, then creates the client's accounts from Settings → Users. Everything shop-specific — the Square access token, Resend API key, order email — is entered on the **Settings page by an admin** and stored in that shop's own database. Deploying a new shop needs no secrets in Railway at all.
+**Accounts are issued by the roastery hub.** Creating a shop in the hub creates its account: a login username (derived from the shop name, e.g. `boxx-kadikoy`), a registered email, a password, and the deployment's API key — all in one step. The shop app verifies logins **against the hub**, with a 24-hour cached-credential fallback so a hub outage doesn't lock out anyone who logged in recently (active sessions are never affected). There is no self-registration anywhere.
 
-**Roles:** `admin` — manage users, credentials (Square token, Resend key, order emails), everything else. `user` — run reports, log stock, place orders, edit recipes; cannot touch users or credentials.
+**Provisioning a shop:** create the shop in the hub → deploy the shop app → open its URL → the first-run screen (gated by the setup code from the server logs) connects it to the hub with the API key → hand the client the URL + their hub-issued username/password. Passwords are changed from the shop app (proxied to the hub) or reset by the roastery (Hub → Shops → Reset Login).
+
+**Standalone mode** remains for shops without a hub: the first-run screen can instead create a local admin who manages local user accounts (`admin`/`user` roles) from Settings → Users, exactly as before. A hub-connected deployment that predates hub logins keeps its local accounts working until a hub password is set.
 
 ### Railway Environment Variables
 
@@ -92,9 +94,9 @@ The `hub/` directory contains a separate service for the roastery:
 **Deploy** (own Railway service, same repo): New service → same GitHub repo → **Root Directory `/hub`** → variables above → volume at `/app/data`.
 
 **Connect a shop:**
-1. Hub → Shops → Add Shop (name + registered email) → copy the API key
-2. Shop's Dose app → Settings → Ordering → Roastery Hub → paste hub URL + API key
-3. The shop's Order page switches from pool quantities to the live price list (their personalized view). Orders are priced server-side at order time — later price changes never rewrite history — and roastery confirmations appear in the shop's order history automatically.
+1. Hub → Shops → Add Shop (name + registered email + login password) → copy the API key. The shop's login username is generated from its name and shown after creation.
+2. Fresh deployment: enter hub URL + API key on the first-run screen. Existing deployment: Settings → Ordering → Roastery Hub.
+3. The shop's Order page switches from pool quantities to the live price list (their personalized view), logins are verified by the hub, and roastery confirmations appear in the shop's order history automatically. Orders are priced server-side at order time — later price changes never rewrite history.
 
 Shop pushes are authenticated per shop (`Bearer dose_…`), re-priced and re-validated by the hub on ingest, and deduplicated (a retried push never duplicates an order). Hub login is rate-limited with expiring hashed session tokens — same security model as the shop app.
 
