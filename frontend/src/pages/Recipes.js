@@ -71,7 +71,6 @@ export default function Recipes() {
         <div className="batch-bar">
           <span className="batch-bar-label">Editing {selected.size} items —</span>
           <div className="batch-field"><label>Coffee (g)</label><input type="number" placeholder="skip if blank" value={batchFields.coffee_grams} onChange={e => setBatchFields(p => ({ ...p, coffee_grams: e.target.value }))} /></div>
-          <div className="batch-field"><label>Whole Milk (ml)</label><input type="number" placeholder="skip if blank" value={batchFields.milk_whole_ml} onChange={e => setBatchFields(p => ({ ...p, milk_whole_ml: e.target.value }))} /></div>
           <button className="btn btn-accent btn-sm" onClick={applyBatch}>Apply</button>
           <button className="btn btn-secondary btn-sm" onClick={() => { setShowBatch(false); setSelected(new Set()); }}>Cancel</button>
         </div>
@@ -89,7 +88,7 @@ export default function Recipes() {
                 <table>
                   <thead><tr>
                     <th className="checkbox-col"><input type="checkbox" checked={allSel} onChange={() => toggleAll(catIds)} /></th>
-                    <th>Square Item Name</th><th>Coffee (g)</th><th>Whole Milk (ml)</th><th>Notes</th><th></th>
+                    <th>Square Item Name</th><th>Coffee (g)</th><th>Notes</th><th></th>
                   </tr></thead>
                   <tbody>
                     {items.map(r => (
@@ -97,7 +96,6 @@ export default function Recipes() {
                         <td><input type="checkbox" checked={selected.has(r.id)} onChange={() => toggleSelect(r.id)} /></td>
                         <td style={{ fontWeight: 500 }}>{r.square_item_name}</td>
                         <td style={{ fontFamily: 'DM Mono' }}>{r.coffee_grams}g</td>
-                        <td style={{ fontFamily: 'DM Mono' }}>{r.milk_whole_ml > 0 ? `${r.milk_whole_ml}ml` : '—'}</td>
                         <td style={{ color: 'var(--steam)', fontSize: 11 }}>{r.notes || '—'}</td>
                         <td><div style={{ display: 'flex', gap: 6 }}>
                           <button className="btn btn-secondary btn-sm" onClick={() => { setEditItem(r); setForm({ ...r }); setShowModal(true); }}>Edit</button>
@@ -127,10 +125,7 @@ export default function Recipes() {
                 </div>
                 <div className="form-group"><label className="form-lbl">Coffee (g)</label><input className="form-input" type="number" placeholder="e.g. 18" value={form.coffee_grams} onChange={set('coffee_grams')} /></div>
               </div>
-              <div className="form-grid">
-                <div className="form-group"><label className="form-lbl">Whole Milk (ml)</label><input className="form-input" type="number" placeholder="e.g. 240" value={form.milk_whole_ml} onChange={set('milk_whole_ml')} /></div>
-                <div className="form-group"><label className="form-lbl">Notes</label><input className="form-input" placeholder="Optional" value={form.notes} onChange={set('notes')} /></div>
-              </div>
+              <div className="form-group"><label className="form-lbl">Notes</label><input className="form-input" placeholder="Optional" value={form.notes} onChange={set('notes')} /></div>
             </div>
             <div className="modal-actions">
               <button className="btn btn-secondary" onClick={() => setShowModal(false)}>Cancel</button>

@@ -62,8 +62,8 @@ Efficiency is measured between deliveries, not calendar periods. A delivery on d
 
 Square order timestamps are filtered in the shop's own timezone (read from the Square location), so a cycle's days match the shop's actual days.
 
-## Milk tracking
-Milk consumption is calculated from Square modifier counts (Whole / Oat / Almond), not recipe definitions. Configure ml-per-modifier in Stock Log (default 180ml).
+## Milk tracking (deferred)
+Milk/syrup tracking is currently hidden from the UI while the shop → hub → order cycle is the focus; the data model remains and the feature returns in the efficiency-precision phase.
 
 ## Coffee pools
 | Pool | Items |
@@ -83,9 +83,11 @@ Milk consumption is calculated from Square modifier counts (Whole / Oat / Almond
 
 The `hub/` directory contains a separate service for the roastery:
 
-- **Catalog** — the coffee list shops order from: name, tasting notes, base price/lb, badges (House / Seasonal / Low stock), archive flag. Items are *standard* (all shops) or *exclusive* (only the shops you pick — e.g. a custom blend for one client).
+- **Catalog** — the coffee list shops order from: name, tasting notes, base price/lb, optional **12oz retail bag price**, badges (Blend / Single Origin / Single Farm / Single Lot / Decaf + Low stock), archive flag. Items are *standard* (all shops) or *exclusive* (only the shops you pick — e.g. a custom blend for one client).
 - **Per-shop pricing** — per client, a catalog-wide or per-item rule: amount off, % off, or a fixed override. Shops only ever see their final price; base prices and rules never leave the hub.
-- **Orders inbox** — line-item orders (coffee × roast × lbs × price) worked through new → confirmed → delivered. **Confirming emails the shop.** New orders trigger a receipt email to the shop's registered address (and `HUB_NOTIFY_EMAIL` if set).
+- **Orders inbox** — line-item orders (coffee × roast × lbs, plus 12oz retail bags) worked through **new → confirmed → shipped → delivered**. Confirming emails the shop; the roaster can **edit an order's quantities** before shipping, which emails the shop an updated summary. New orders trigger a receipt email to the shop's registered address (and `HUB_NOTIFY_EMAIL` if set).
+- **Roast Program** — everything confirmed and waiting to roast, aggregated by coffee × roast profile (espresso / filter / retail) into total lbs, with per-shop breakdown. Orders leave the program when marked shipped.
+- **Reports** — roasted coffee per client, rolled up automatically at the close of each week and month. Orders are kept forever (storage is negligible).
 - **Shops** — create a shop with its registered email to mint its API key (shown once, stored hashed); edit, rotate keys.
 - **Patterns** — per shop: volume, spend, espresso/filter roast mix, top coffees, cadence, 12-week trend.
 
@@ -96,7 +98,7 @@ The `hub/` directory contains a separate service for the roastery:
 **Connect a shop:**
 1. Hub → Shops → Add Shop (name + registered email + login password) → copy the API key. The shop's login username is generated from its name and shown after creation.
 2. Fresh deployment: enter hub URL + API key on the first-run screen. Existing deployment: Settings → Ordering → Roastery Hub.
-3. The shop's Order page switches from pool quantities to the live price list (their personalized view), logins are verified by the hub, and roastery confirmations appear in the shop's order history automatically. Orders are priced server-side at order time — later price changes never rewrite history.
+3. The shop's Order page switches from pool quantities to the live price list (their personalized view, including 12oz retail bags where offered), supports **standing orders** (weekly / bi-weekly / monthly, placed automatically at live prices), logins are verified by the hub, and roastery confirm/ship/deliver statuses appear in the shop's order history automatically. The hub URL is fixed app-wide (`DEFAULT_HUB_URL` env to override) — shops only ever enter their API key. Orders are priced server-side at order time — later price changes never rewrite history.
 
 Shop pushes are authenticated per shop (`Bearer dose_…`), re-priced and re-validated by the hub on ingest, and deduplicated (a retried push never duplicates an order). Hub login is rate-limited with expiring hashed session tokens — same security model as the shop app.
 

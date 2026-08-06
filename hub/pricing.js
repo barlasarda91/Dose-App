@@ -32,8 +32,13 @@ function effectivePrice(item, shopId, rules) {
   return Math.round(price * 100) / 100;
 }
 
+// A 12oz retail bag holds 0.75 lb of roasted coffee (used for roast totals).
+const BAG_LBS = 0.75;
+
 // The catalog exactly as one shop should see it: visible+active items only,
 // effective prices only — base prices and rules never leave the hub.
+// Retail bag prices are flat (per-shop price rules apply to wholesale /lb
+// pricing only, v1).
 function catalogForShop(items, shopId, exclusiveGrants, rules) {
   return items
     .filter(i => i.active)
@@ -45,27 +50,42 @@ function catalogForShop(items, shopId, exclusiveGrants, rules) {
       badge: i.badge || null,
       low_stock: !!i.low_stock,
       price_per_lb: effectivePrice(i, shopId, rules),
+      retail_price: i.retail_price != null && i.retail_price > 0 ? Math.round(i.retail_price * 100) / 100 : null,
     }));
 }
 
 // Validate and price an incoming order's line items against the shop's own
 // catalog view. Client-supplied prices are ignored — the hub's price wins.
+// Lines are either wholesale (roast espresso/filter, lbs) or retail
+// (roast 'retail', bags of 12oz).
 function priceOrderItems(rawItems, shopCatalog) {
   if (!Array.isArray(rawItems) || rawItems.length === 0) throw new Error('Order has no items');
   const byId = new Map(shopCatalog.map(i => [i.id, i]));
   const items = rawItems.map(raw => {
     const coffee = byId.get(parseInt(raw.coffee_id, 10));
     if (!coffee) throw new Error(`Coffee ${raw.coffee_id} is not available to this shop`);
+    if (raw.roast === 'retail') {
+      if (coffee.retail_price == null) throw new Error(`${coffee.name} is not offered as retail bags`);
+      const bags = Math.round(parseFloat(raw.bags) || 0);
+      if (bags <= 0) throw new Error(`Invalid bag count for ${coffee.name}`);
+      const line_total = Math.round(bags * coffee.retail_price * 100) / 100;
+      return {
+        coffee_id: coffee.id, coffee_name: coffee.name, roast: 'retail',
+        bags, lbs: Math.round(bags * BAG_LBS * 100) / 100,
+        price_per_lb: coffee.retail_price, // unit price: per bag for retail lines
+        line_total,
+      };
+    }
     const roast = raw.roast === 'espresso' ? 'espresso' : raw.roast === 'filter' ? 'filter' : null;
-    if (!roast) throw new Error(`Invalid roast for ${coffee.name} — must be espresso or filter`);
+    if (!roast) throw new Error(`Invalid roast for ${coffee.name} — must be espresso, filter, or retail`);
     const lbs = Math.round((parseFloat(raw.lbs) || 0) * 10) / 10;
     if (lbs <= 0) throw new Error(`Invalid quantity for ${coffee.name}`);
     const line_total = Math.round(lbs * coffee.price_per_lb * 100) / 100;
-    return { coffee_id: coffee.id, coffee_name: coffee.name, roast, lbs, price_per_lb: coffee.price_per_lb, line_total };
+    return { coffee_id: coffee.id, coffee_name: coffee.name, roast, bags: null, lbs, price_per_lb: coffee.price_per_lb, line_total };
   });
-  const total_lbs = Math.round(items.reduce((s, i) => s + i.lbs, 0) * 10) / 10;
+  const total_lbs = Math.round(items.reduce((s, i) => s + i.lbs, 0) * 100) / 100;
   const total_cost = Math.round(items.reduce((s, i) => s + i.line_total, 0) * 100) / 100;
   return { items, total_lbs, total_cost };
 }
 
-module.exports = { isVisible, effectivePrice, catalogForShop, priceOrderItems };
+module.exports = { BAG_LBS, isVisible, effectivePrice, catalogForShop, priceOrderItems };

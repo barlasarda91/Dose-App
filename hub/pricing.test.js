@@ -65,3 +65,22 @@ test('priceOrderItems rejects invisible coffees, bad roasts, and zero qty', () =
   assert.throws(() => priceOrderItems([{ coffee_id: 1, roast: 'filter', lbs: 0 }], cat5), /quantity/);
   assert.throws(() => priceOrderItems([], cat5), /no items/);
 });
+
+test('retail bag lines: priced per bag, 0.75 lb each, only when offered', () => {
+  const items = [
+    { id: 10, name: 'Retail Blend', notes: '', badge: null, low_stock: 0, price_per_lb: 12, retail_price: 14.5, visibility: 'standard', active: 1 },
+    { id: 11, name: 'Wholesale Only', notes: '', badge: null, low_stock: 0, price_per_lb: 12, retail_price: null, visibility: 'standard', active: 1 },
+  ];
+  const cat = catalogForShop(items, 1, [], []);
+  assert.equal(cat[0].retail_price, 14.5);
+  assert.equal(cat[1].retail_price, null);
+  const { items: lines, total_lbs, total_cost } = priceOrderItems(
+    [{ coffee_id: 10, roast: 'retail', bags: 4 }, { coffee_id: 10, roast: 'espresso', lbs: 10 }], cat);
+  assert.equal(lines[0].bags, 4);
+  assert.equal(lines[0].lbs, 3);            // 4 × 0.75
+  assert.equal(lines[0].line_total, 58.00); // 4 × 14.50
+  assert.equal(total_lbs, 13);
+  assert.equal(total_cost, 178.00);
+  assert.throws(() => priceOrderItems([{ coffee_id: 11, roast: 'retail', bags: 2 }], cat), /not offered as retail/);
+  assert.throws(() => priceOrderItems([{ coffee_id: 10, roast: 'retail', bags: 0 }], cat), /bag count/);
+});
