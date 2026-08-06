@@ -71,12 +71,18 @@ db.exec(`
     value TEXT NOT NULL
   );
 
+  CREATE TABLE IF NOT EXISTS sessions (
+    token TEXT PRIMARY KEY,
+    created_at TEXT DEFAULT (datetime('now'))
+  );
+
   INSERT OR IGNORE INTO settings (key, value) VALUES ('alt_milk_ml_per_modifier', '180');
   INSERT OR IGNORE INTO settings (key, value) VALUES ('square_location_id', '');
   INSERT OR IGNORE INTO settings (key, value) VALUES ('numilk_oat_liters_per_day', '0');
   INSERT OR IGNORE INTO settings (key, value) VALUES ('numilk_almond_liters_per_day', '0');
   INSERT OR IGNORE INTO settings (key, value) VALUES ('shop_name', '');
   INSERT OR IGNORE INTO settings (key, value) VALUES ('order_email_to', 'hello@boxxcoffee.com');
+  INSERT OR IGNORE INTO settings (key, value) VALUES ('order_email_from', '');
 `);
 
 function getSettings() {
@@ -85,39 +91,112 @@ function getSettings() {
   return cfg;
 }
 
-// ─── Auth ─────────────────────────────────────────────────────────────────────
-// Shared-password protection. Set DOSE_PASSWORD in the environment to enable;
-// when unset the app runs open (dev / legacy deployments keep working).
-const DOSE_PASSWORD = process.env.DOSE_PASSWORD || '';
-
-function safeEqual(a, b) {
-  const ha = crypto.createHash('sha256').update(String(a)).digest();
-  const hb = crypto.createHash('sha256').update(String(b)).digest();
-  return crypto.timingSafeEqual(ha, hb);
+function setSetting(key, value) {
+  db.prepare('INSERT OR REPLACE INTO settings (key, value) VALUES (?,?)').run(key, String(value));
 }
 
+// Secrets live in the shop's own database (entered via Settings after login);
+// environment variables remain as a fallback so older deployments keep working.
+function getSecret(settingKey, envName) {
+  const v = (getSettings()[settingKey] || '').trim();
+  return v || process.env[envName] || '';
+}
+
+// ─── Auth ─────────────────────────────────────────────────────────────────────
+// Password is always required. On first run the app asks the user to create
+// one (POST /api/setup); a DOSE_PASSWORD env var, if present, seeds it
+// automatically so existing deployments never see the setup screen.
+// Login exchanges the password for a random session token; only the salted
+// scrypt hash of the password is ever stored.
+
+function hashPassword(password, saltHex) {
+  const salt = saltHex ? Buffer.from(saltHex, 'hex') : crypto.randomBytes(16);
+  const hash = crypto.scryptSync(String(password), salt, 64);
+  return { salt: salt.toString('hex'), hash: hash.toString('hex') };
+}
+
+function setPassword(password) {
+  const { salt, hash } = hashPassword(password);
+  setSetting('auth_salt', salt);
+  setSetting('auth_password_hash', hash);
+  db.prepare('DELETE FROM sessions').run(); // invalidate existing logins
+}
+
+function verifyPassword(password) {
+  const cfg = getSettings();
+  if (!cfg.auth_password_hash || !cfg.auth_salt) return false;
+  const { hash } = hashPassword(password, cfg.auth_salt);
+  return crypto.timingSafeEqual(Buffer.from(hash, 'hex'), Buffer.from(cfg.auth_password_hash, 'hex'));
+}
+
+function passwordConfigured() {
+  return !!getSettings().auth_password_hash;
+}
+
+function issueToken() {
+  const token = crypto.randomBytes(32).toString('hex');
+  db.prepare('INSERT INTO sessions (token) VALUES (?)').run(token);
+  return token;
+}
+
+if (!passwordConfigured() && process.env.DOSE_PASSWORD) {
+  setPassword(process.env.DOSE_PASSWORD);
+  console.log('Seeded password from DOSE_PASSWORD env var');
+}
+
+const OPEN_PATHS = new Set(['/login', '/setup', '/auth-status']);
+
 app.use('/api', (req, res, next) => {
-  if (!DOSE_PASSWORD) return next();
-  if (req.path === '/login') return next();
-  const key = req.get('x-dose-key') || '';
-  if (key && safeEqual(key, DOSE_PASSWORD)) return next();
+  if (OPEN_PATHS.has(req.path)) return next();
+  const token = req.get('x-dose-key') || '';
+  if (token && db.prepare('SELECT token FROM sessions WHERE token=?').get(token)) return next();
   res.status(401).json({ error: 'Unauthorized' });
 });
 
+app.get('/api/auth-status', (req, res) => {
+  res.json({ setup_required: !passwordConfigured() });
+});
+
+app.post('/api/setup', (req, res) => {
+  if (passwordConfigured()) return res.status(400).json({ error: 'Password already set — use login' });
+  const password = (req.body && req.body.password) || '';
+  if (String(password).length < 6) return res.status(400).json({ error: 'Password must be at least 6 characters' });
+  setPassword(password);
+  res.json({ ok: true, token: issueToken() });
+});
+
 app.post('/api/login', (req, res) => {
-  if (!DOSE_PASSWORD) return res.json({ ok: true, protected: false });
-  if (safeEqual((req.body && req.body.password) || '', DOSE_PASSWORD)) {
-    return res.json({ ok: true, protected: true });
+  if (!passwordConfigured()) return res.status(409).json({ error: 'Setup required' });
+  if (verifyPassword((req.body && req.body.password) || '')) {
+    return res.json({ ok: true, token: issueToken() });
   }
   res.status(401).json({ error: 'Wrong password' });
 });
 
+app.post('/api/change-password', (req, res) => {
+  const { current_password, new_password } = req.body || {};
+  if (!verifyPassword(current_password || '')) return res.status(401).json({ error: 'Current password is wrong' });
+  if (String(new_password || '').length < 6) return res.status(400).json({ error: 'New password must be at least 6 characters' });
+  setPassword(new_password);
+  res.json({ ok: true, token: issueToken() }); // fresh token — old sessions are now invalid
+});
+
 // ─── Settings ─────────────────────────────────────────────────────────────────
+const SECRET_SETTINGS = ['square_access_token', 'resend_api_key'];
+const HIDDEN_SETTINGS = new Set([...SECRET_SETTINGS, 'auth_password_hash', 'auth_salt']);
+
 app.get('/api/settings', (req, res) => {
-  const s = getSettings();
-  s.square_token_set = !!process.env.SQUARE_ACCESS_TOKEN;
-  s.password_protected = !!DOSE_PASSWORD;
-  s.resend_configured = !!process.env.RESEND_API_KEY;
+  const cfg = getSettings();
+  const s = {};
+  for (const [k, v] of Object.entries(cfg)) if (!HIDDEN_SETTINGS.has(k)) s[k] = v;
+  // Secrets are reported as configured/not — never echoed back
+  s.square_token_set  = !!getSecret('square_access_token', 'SQUARE_ACCESS_TOKEN');
+  s.square_token_source = (cfg.square_access_token || '').trim() ? 'settings'
+    : (process.env.SQUARE_ACCESS_TOKEN ? 'env' : null);
+  s.resend_configured = !!getSecret('resend_api_key', 'RESEND_API_KEY');
+  s.resend_source = (cfg.resend_api_key || '').trim() ? 'settings'
+    : (process.env.RESEND_API_KEY ? 'env' : null);
+  s.password_protected = passwordConfigured();
   res.json(s);
 });
 
@@ -125,22 +204,29 @@ app.post('/api/settings', (req, res) => {
   const allowed = [
     'alt_milk_ml_per_modifier', 'square_location_id',
     'numilk_oat_liters_per_day', 'numilk_almond_liters_per_day',
-    'shop_name', 'order_email_to',
+    'shop_name', 'order_email_to', 'order_email_from',
+    ...SECRET_SETTINGS,
   ];
   for (const key of allowed) {
-    if (req.body[key] !== undefined)
-      db.prepare('INSERT OR REPLACE INTO settings (key, value) VALUES (?,?)').run(key, String(req.body[key]));
+    if (req.body[key] !== undefined) setSetting(key, String(req.body[key]).trim());
   }
+  if (req.body.square_access_token !== undefined) cachedLocations = null; // token changed → re-resolve locations
   res.json({ success: true });
 });
 
 // ─── Square helpers ───────────────────────────────────────────────────────────
 let cachedLocations = null;
 
+function getSquareToken() {
+  const token = getSecret('square_access_token', 'SQUARE_ACCESS_TOKEN');
+  if (!token) throw new Error('Square access token not set — add it on the Settings page');
+  return token;
+}
+
 async function getLocations() {
   if (cachedLocations) return cachedLocations;
   const res = await fetch('https://connect.squareup.com/v2/locations', {
-    headers: { 'Authorization': `Bearer ${process.env.SQUARE_ACCESS_TOKEN}`, 'Square-Version': '2024-01-17' }
+    headers: { 'Authorization': `Bearer ${getSquareToken()}`, 'Square-Version': '2024-01-17' }
   });
   const data = await res.json();
   if (data.errors) throw new Error(data.errors[0]?.detail || 'Failed to fetch locations');
@@ -175,8 +261,7 @@ function utcOffset(dateStr, timeZone) {
 }
 
 async function squarePost(endpoint, body) {
-  const token = process.env.SQUARE_ACCESS_TOKEN;
-  if (!token) throw new Error('SQUARE_ACCESS_TOKEN not configured');
+  const token = getSquareToken();
   const res = await fetch(`https://connect.squareup.com/v2${endpoint}`, {
     method: 'POST',
     headers: { 'Authorization': `Bearer ${token}`, 'Content-Type': 'application/json', 'Square-Version': '2024-01-17' },
@@ -456,10 +541,10 @@ function orderEmailHtml(order, shopName) {
 }
 
 async function sendOrderEmail(order, cfg) {
-  const apiKey = process.env.RESEND_API_KEY;
-  if (!apiKey) return { sent: false, reason: 'Email not configured (RESEND_API_KEY missing) — order saved but not emailed' };
+  const apiKey = getSecret('resend_api_key', 'RESEND_API_KEY');
+  if (!apiKey) return { sent: false, reason: 'Email not configured — add a Resend API key on the Settings page. Order saved but not emailed.' };
   const to = (cfg.order_email_to || 'hello@boxxcoffee.com').trim();
-  const from = process.env.ORDER_EMAIL_FROM || 'Dose Orders <onboarding@resend.dev>';
+  const from = (cfg.order_email_from || '').trim() || process.env.ORDER_EMAIL_FROM || 'Dose Orders <onboarding@resend.dev>';
   const shopName = (cfg.shop_name || '').trim();
   try {
     const res = await fetch('https://api.resend.com/emails', {
