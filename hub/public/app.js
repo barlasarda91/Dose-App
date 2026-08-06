@@ -1,14 +1,10 @@
 /* Dose Hub dashboard — vanilla JS, no build step. */
 (() => {
-  const POOLS = [
-    ['espresso_lbs', 'Espresso', '#6B6E4A'],
-    ['drip_lbs', 'Drip', '#7A7268'],
-    ['coldbrew_lbs', 'Cold Brew', '#C4833A'],
-    ['pourover_lbs', 'Pour-Over', '#3D3A34'],
-  ];
   const app = document.getElementById('app');
   const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
   const getToken = () => localStorage.getItem('hub_key') || '';
+  let CURRENCY = '$';
+  const money = v => v == null ? '—' : `${CURRENCY}${(Math.round(v * 100) / 100).toFixed(2)}`;
 
   async function api(path, opts = {}) {
     const headers = { ...(opts.headers || {}) };
@@ -45,7 +41,7 @@
   }
 
   // ─── Shell + tabs ───────────────────────────────────────────────────────────
-  const TABS = [['orders', 'Orders'], ['shops', 'Shops'], ['patterns', 'Patterns']];
+  const TABS = [['orders', 'Orders'], ['catalog', 'Catalog'], ['shops', 'Shops'], ['patterns', 'Patterns']];
   function renderShell(active) {
     app.innerHTML = `
       <nav class="nav">
@@ -58,17 +54,18 @@
       <div class="page" id="page"></div>`;
     app.querySelectorAll('[data-tab]').forEach(el => el.onclick = () => renderShell(el.dataset.tab));
     document.getElementById('signout').onclick = () => { localStorage.removeItem('hub_key'); renderLogin(); };
-    ({ orders: renderOrders, shops: renderShops, patterns: renderPatterns })[active]();
+    ({ orders: renderOrders, catalog: renderCatalog, shops: renderShops, patterns: renderPatterns })[active]();
   }
 
-  function header(eyebrow, title, sub) {
-    return `<div class="eyebrow">${eyebrow}</div><h1 class="title">${title}</h1><p class="sub">${sub}</p><hr class="rule">`;
-  }
+  const header = (eyebrow, title, sub) =>
+    `<div class="eyebrow">${eyebrow}</div><h1 class="title">${title}</h1><p class="sub">${sub}</p><hr class="rule">`;
+
+  const roastTag = r => `<span class="roast-lbl">${r === 'espresso' ? 'ESP' : 'FLT'}</span>`;
 
   // ─── Orders inbox ───────────────────────────────────────────────────────────
   async function renderOrders() {
     const page = document.getElementById('page');
-    page.innerHTML = header('Roastery', 'Orders', 'Incoming orders from client shops — confirm and mark delivered as you work through them.');
+    page.innerHTML = header('Roastery', 'Orders', 'Incoming orders from client shops — confirming an order emails the shop.');
     let shops = [], orders = [];
     try { [shops, orders] = await Promise.all([api('/api/shops'), api('/api/orders')]); }
     catch (e) { if (e.message !== 'Unauthorized') page.innerHTML += `<div class="err">${esc(e.message)}</div>`; return; }
@@ -78,26 +75,33 @@
     filters.innerHTML = `
       <select id="f-shop"><option value="">All shops</option>${shops.map(s => `<option value="${s.id}">${esc(s.name)}</option>`).join('')}</select>
       <select id="f-status"><option value="">All statuses</option><option value="new">New</option><option value="confirmed">Confirmed</option><option value="delivered">Delivered</option></select>
-      <span style="font-size:10px;color:var(--drift)">${orders.filter(o => o.status === 'new').length} new</span>`;
+      <span style="font-size:10px;color:var(--drift)" id="new-count"></span>
+      <span class="ok" id="action-msg" style="margin:0"></span>`;
     page.appendChild(filters);
-
     const listEl = document.createElement('div');
     page.appendChild(listEl);
+
+    const itemsHtml = o => o.items && o.items.length
+      ? o.items.map(i => `<div style="white-space:nowrap">${roastTag(i.roast)} ${esc(i.coffee_name)} · ${i.lbs} lbs · ${money(i.line_total)}</div>`).join('')
+      : ['espresso_lbs', 'drip_lbs', 'coldbrew_lbs', 'pourover_lbs'].filter(f => o[f] > 0)
+          .map(f => `<div>${esc(f.replace('_lbs', ''))}: ${o[f]} lbs</div>`).join('') || '—';
 
     function draw() {
       const fs = document.getElementById('f-shop').value;
       const fst = document.getElementById('f-status').value;
+      document.getElementById('new-count').textContent = `${orders.filter(o => o.status === 'new').length} new`;
       const rows = orders.filter(o => (!fs || String(o.shop_id) === fs) && (!fst || o.status === fst));
-      if (!rows.length) { listEl.innerHTML = `<div class="empty">No orders${shops.length ? '' : ' — add a shop first (Shops tab) and connect it in the shop’s Settings'}.</div>`; return; }
+      if (!rows.length) { listEl.innerHTML = `<div class="empty">No orders${shops.length ? '' : ' — add a shop first (Shops tab)'}.</div>`; return; }
       listEl.innerHTML = `<div class="table-wrap"><table>
-        <thead><tr><th>Received</th><th>Shop</th><th>For date</th>${POOLS.map(p => `<th>${p[1]}</th>`).join('')}<th>Notes</th><th>By</th><th>Status</th><th></th></tr></thead>
+        <thead><tr><th>Received</th><th>Shop</th><th>Requested</th><th>Items</th><th class="num">Lbs</th><th class="num">Total</th><th>By</th><th>Status</th><th></th></tr></thead>
         <tbody>${rows.map(o => `
           <tr>
             <td>${esc((o.received_at || '').slice(0, 16))}</td>
             <td style="font-weight:500">${esc(o.shop_name)}</td>
-            <td>${esc(o.order_date)}</td>
-            ${POOLS.map(([f]) => `<td>${o[f] > 0 ? o[f] + ' lbs' : '—'}</td>`).join('')}
-            <td style="color:var(--drift)">${esc(o.notes || '—')}</td>
+            <td>${esc(o.requested_date || o.order_date)}</td>
+            <td style="line-height:1.9;font-size:10px">${itemsHtml(o)}${o.notes ? `<div style="color:var(--drift)">✎ ${esc(o.notes)}</div>` : ''}</td>
+            <td class="num">${o.total_lbs || '—'}</td>
+            <td class="num">${money(o.total_cost)}</td>
             <td style="color:var(--drift)">${esc(o.placed_by || '—')}</td>
             <td><span class="status ${o.status}">${o.status}</span></td>
             <td>${o.status === 'new' ? `<button class="btn-sm btn" data-adv="${o.id}" data-to="confirmed">Confirm</button>`
@@ -105,9 +109,15 @@
           </tr>`).join('')}
         </tbody></table></div>`;
       listEl.querySelectorAll('[data-adv]').forEach(btn => btn.onclick = async () => {
+        btn.disabled = true;
         try {
           const updated = await api(`/api/orders/${btn.dataset.adv}`, { method: 'PATCH', body: JSON.stringify({ status: btn.dataset.to }) });
           orders = orders.map(o => o.id === updated.id ? updated : o);
+          const msgEl = document.getElementById('action-msg');
+          if (updated.email) {
+            msgEl.textContent = updated.email.sent ? `✓ Confirmation email sent to ${updated.email.to}` : `⚠ Confirmed, but email not sent: ${updated.email.reason}`;
+            setTimeout(() => { msgEl.textContent = ''; }, 6000);
+          }
           draw();
         } catch (e) { alert(e.message); }
       });
@@ -117,10 +127,113 @@
     draw();
   }
 
+  // ─── Catalog ────────────────────────────────────────────────────────────────
+  async function renderCatalog() {
+    const page = document.getElementById('page');
+    page.innerHTML = header('Roastery', 'Catalog', 'The coffee list shops order from. Exclusive coffees are only visible to the shops you pick.');
+    let items = [], shops = [];
+    try { [items, shops] = await Promise.all([api('/api/catalog'), api('/api/shops')]); }
+    catch (e) { if (e.message !== 'Unauthorized') page.innerHTML += `<div class="err">${esc(e.message)}</div>`; return; }
+
+    const formEl = document.createElement('div');
+    formEl.className = 'card';
+    page.appendChild(formEl);
+    const listEl = document.createElement('div');
+    page.appendChild(listEl);
+
+    let editing = null; // item being edited, or null = adding
+
+    function drawForm() {
+      const it = editing || { name: '', notes: '', price_per_lb: '', badge: '', low_stock: 0, visibility: 'standard', exclusive_shop_ids: [], active: 1 };
+      formEl.innerHTML = `
+        <label class="lbl">${editing ? `Edit — ${esc(editing.name)}` : 'Add Coffee'}</label>
+        <div style="display:flex;gap:10px;flex-wrap:wrap;align-items:flex-end">
+          <div><label class="lbl">Name</label><input id="c-name" value="${esc(it.name)}" style="min-width:200px"></div>
+          <div><label class="lbl">Tasting Notes</label><input id="c-notes" value="${esc(it.notes || '')}" style="min-width:240px" placeholder="chocolate · hazelnut · fig"></div>
+          <div><label class="lbl">Base Price / lb</label><input id="c-price" type="number" step="0.01" value="${it.price_per_lb}" style="width:110px"></div>
+          <div><label class="lbl">Badge</label><select id="c-badge">
+            <option value="" ${!it.badge ? 'selected' : ''}>None</option>
+            <option value="house" ${it.badge === 'house' ? 'selected' : ''}>House</option>
+            <option value="seasonal" ${it.badge === 'seasonal' ? 'selected' : ''}>Seasonal</option>
+          </select></div>
+          <div><label class="lbl">Flags</label><div style="display:flex;gap:12px;padding:8px 0;font-size:10px">
+            <label><input type="checkbox" id="c-low" ${it.low_stock ? 'checked' : ''}> Low stock</label>
+            <label><input type="checkbox" id="c-active" ${it.active ? 'checked' : ''}> Active</label>
+          </div></div>
+          <div><label class="lbl">Visibility</label><select id="c-vis">
+            <option value="standard" ${it.visibility === 'standard' ? 'selected' : ''}>Standard — all shops</option>
+            <option value="exclusive" ${it.visibility === 'exclusive' ? 'selected' : ''}>Exclusive — selected shops</option>
+          </select></div>
+        </div>
+        <div id="c-shops" style="display:${it.visibility === 'exclusive' ? 'flex' : 'none'};gap:14px;flex-wrap:wrap;margin-top:12px;font-size:10px">
+          ${shops.map(s => `<label><input type="checkbox" class="c-shop" value="${s.id}" ${it.exclusive_shop_ids.includes(s.id) ? 'checked' : ''}> ${esc(s.name)}</label>`).join('') || '<span style="color:var(--drift)">No shops yet — add them in the Shops tab.</span>'}
+        </div>
+        <div style="display:flex;gap:10px;margin-top:14px">
+          <button class="btn" id="c-save">${editing ? 'Save Changes' : 'Add Coffee'}</button>
+          ${editing ? '<button class="btn btn-ghost" id="c-cancel">Cancel</button>' : ''}
+        </div>
+        <div class="err" id="c-err"></div>`;
+      document.getElementById('c-vis').onchange = e => {
+        document.getElementById('c-shops').style.display = e.target.value === 'exclusive' ? 'flex' : 'none';
+      };
+      if (editing) document.getElementById('c-cancel').onclick = () => { editing = null; drawForm(); };
+      document.getElementById('c-save').onclick = async () => {
+        const body = {
+          name: document.getElementById('c-name').value,
+          notes: document.getElementById('c-notes').value,
+          price_per_lb: document.getElementById('c-price').value,
+          badge: document.getElementById('c-badge').value,
+          low_stock: document.getElementById('c-low').checked,
+          active: document.getElementById('c-active').checked,
+          visibility: document.getElementById('c-vis').value,
+          exclusive_shop_ids: [...formEl.querySelectorAll('.c-shop:checked')].map(x => parseInt(x.value, 10)),
+        };
+        try {
+          const saved = editing
+            ? await api(`/api/catalog/${editing.id}`, { method: 'PUT', body: JSON.stringify(body) })
+            : await api('/api/catalog', { method: 'POST', body: JSON.stringify(body) });
+          items = editing ? items.map(i => i.id === saved.id ? saved : i) : [...items, saved];
+          editing = null;
+          drawForm(); drawList();
+        } catch (e) { document.getElementById('c-err').textContent = e.message; }
+      };
+    }
+
+    function drawList() {
+      if (!items.length) { listEl.innerHTML = '<div class="empty">No coffees yet — add your first above.</div>'; return; }
+      const badge = i => [
+        i.badge === 'house' ? '<span class="badge seasonal">House</span>' : '',
+        i.badge === 'seasonal' ? '<span class="badge seasonal">Seasonal</span>' : '',
+        i.low_stock ? '<span class="badge low">Low stock</span>' : '',
+        !i.active ? '<span class="badge">Archived</span>' : '',
+      ].join('');
+      listEl.innerHTML = `<div class="table-wrap" style="margin-top:14px"><table>
+        <thead><tr><th>Coffee</th><th class="num">Base / lb</th><th>Visibility</th><th></th></tr></thead>
+        <tbody>${items.map(i => `
+          <tr style="${i.active ? '' : 'opacity:.55'}">
+            <td><span style="font-family:var(--serif);font-size:13px;color:var(--ink)">${esc(i.name)}</span>${badge(i)}
+              <div style="font-size:9px;color:var(--drift)">${esc(i.notes || '')}</div></td>
+            <td class="num">${money(i.price_per_lb)}</td>
+            <td style="font-size:10px;color:var(--drift)">${i.visibility === 'exclusive'
+              ? `Exclusive: ${i.exclusive_shop_ids.map(id => esc((shops.find(s => s.id === id) || {}).name || '?')).join(', ') || 'nobody yet'}`
+              : 'All shops'}</td>
+            <td><button class="btn-sm btn" data-edit="${i.id}">Edit</button></td>
+          </tr>`).join('')}
+        </tbody></table></div>`;
+      listEl.querySelectorAll('[data-edit]').forEach(btn => btn.onclick = () => {
+        editing = items.find(i => String(i.id) === btn.dataset.edit);
+        drawForm();
+        window.scrollTo({ top: 0, behavior: 'smooth' });
+      });
+    }
+
+    drawForm(); drawList();
+  }
+
   // ─── Shops ──────────────────────────────────────────────────────────────────
   async function renderShops() {
     const page = document.getElementById('page');
-    page.innerHTML = header('Roastery', 'Shops', 'Client shops connected to the hub. Each shop authenticates with its own API key.');
+    page.innerHTML = header('Roastery', 'Shops', 'Client shops connected to the hub — each authenticates with its own API key. Receipts and confirmations go to the registered email.');
     let shops = [];
     try { shops = await api('/api/shops'); }
     catch (e) { if (e.message !== 'Unauthorized') page.innerHTML += `<div class="err">${esc(e.message)}</div>`; return; }
@@ -129,26 +242,37 @@
       <div class="card">
         <label class="lbl">Add Shop</label>
         <div style="display:flex;gap:10px;flex-wrap:wrap">
-          <input id="new-shop" placeholder="e.g. Boxx Kadıköy" style="min-width:220px">
+          <input id="new-shop" placeholder="Shop name, e.g. Boxx Kadıköy" style="min-width:200px">
+          <input id="new-email" placeholder="Registered email (receipts go here)" style="min-width:240px">
           <button class="btn" id="add-shop">Create Shop & API Key</button>
         </div>
         <div id="add-result"></div>
       </div>
-      <div id="shop-list">${shops.length ? `<div class="table-wrap"><table>
-        <thead><tr><th>Shop</th><th>Orders</th><th>Last order</th><th>Since</th><th></th></tr></thead>
+      <div id="shop-list"></div>
+      <div id="pricing-panel"></div>`;
+
+    function drawList() {
+      document.getElementById('shop-list').innerHTML = shops.length ? `<div class="table-wrap"><table>
+        <thead><tr><th>Shop</th><th>Email</th><th>Orders</th><th>Last order</th><th></th></tr></thead>
         <tbody>${shops.map(s => `<tr>
           <td style="font-weight:500">${esc(s.name)}</td>
+          <td style="color:var(--drift)">${esc(s.email || '— none —')}</td>
           <td>${s.orders_count}</td>
           <td>${esc(s.last_order_date || '—')}</td>
-          <td style="color:var(--drift)">${esc((s.created_at || '').slice(0, 10))}</td>
-          <td><button class="btn-sm btn" data-rotate="${s.id}">Rotate Key</button></td>
-        </tr>`).join('')}</tbody></table></div>` : '<div class="empty">No shops yet.</div>'}</div>`;
+          <td><div style="display:flex;gap:6px;flex-wrap:wrap">
+            <button class="btn-sm btn" data-pricing="${s.id}">Pricing</button>
+            <button class="btn-sm btn" data-editshop="${s.id}">Edit</button>
+            <button class="btn-sm btn" data-rotate="${s.id}">Rotate Key</button>
+          </div></td>
+        </tr>`).join('')}</tbody></table></div>` : '<div class="empty">No shops yet.</div>';
+      wireList();
+    }
 
     const showKey = (name, key) => {
       document.getElementById('add-result').innerHTML = `
         <div class="keybox">
           <strong>${esc(name)}</strong> — API key (shown once, copy it now):<br>
-          <code id="the-key">${esc(key)}</code>
+          <code>${esc(key)}</code>
           <button class="btn-sm btn" id="copy-key" style="margin-left:8px">Copy</button><br>
           Paste it into that shop's Dose app → Settings → Ordering → Hub API Key, along with this hub's URL.
         </div>`;
@@ -158,49 +282,138 @@
 
     document.getElementById('add-shop').onclick = async () => {
       const name = document.getElementById('new-shop').value.trim();
+      const email = document.getElementById('new-email').value.trim();
       if (!name) return;
       try {
-        const data = await api('/api/shops', { method: 'POST', body: JSON.stringify({ name }) });
+        const data = await api('/api/shops', { method: 'POST', body: JSON.stringify({ name, email }) });
+        shops = [...shops, data.shop].sort((a, b) => a.name.localeCompare(b.name));
         showKey(data.shop.name, data.api_key);
-        document.getElementById('new-shop').value = '';
+        document.getElementById('new-shop').value = ''; document.getElementById('new-email').value = '';
+        drawList();
       } catch (e) { document.getElementById('add-result').innerHTML = `<div class="err">${esc(e.message)}</div>`; }
     };
-    page.querySelectorAll('[data-rotate]').forEach(btn => btn.onclick = async () => {
-      if (!window.confirm('Rotate this shop’s API key? The old key stops working immediately — you must update the shop’s Settings with the new one.')) return;
-      try {
-        const shop = shops.find(s => String(s.id) === btn.dataset.rotate);
-        const data = await api(`/api/shops/${btn.dataset.rotate}/rotate-key`, { method: 'POST' });
-        showKey(shop ? shop.name : 'Shop', data.api_key);
-        window.scrollTo({ top: 0, behavior: 'smooth' });
-      } catch (e) { alert(e.message); }
-    });
+
+    function wireList() {
+      document.querySelectorAll('[data-rotate]').forEach(btn => btn.onclick = async () => {
+        if (!window.confirm('Rotate this shop’s API key? The old key stops working immediately.')) return;
+        try {
+          const shop = shops.find(s => String(s.id) === btn.dataset.rotate);
+          const data = await api(`/api/shops/${btn.dataset.rotate}/rotate-key`, { method: 'POST' });
+          showKey(shop ? shop.name : 'Shop', data.api_key);
+          window.scrollTo({ top: 0, behavior: 'smooth' });
+        } catch (e) { alert(e.message); }
+      });
+      document.querySelectorAll('[data-editshop]').forEach(btn => btn.onclick = async () => {
+        const shop = shops.find(s => String(s.id) === btn.dataset.editshop);
+        const name = window.prompt('Shop name:', shop.name);
+        if (name === null) return;
+        const email = window.prompt('Registered email (receipts + confirmations):', shop.email || '');
+        if (email === null) return;
+        try {
+          const updated = await api(`/api/shops/${shop.id}`, { method: 'PUT', body: JSON.stringify({ name, email }) });
+          shops = shops.map(s => s.id === updated.id ? updated : s);
+          drawList();
+        } catch (e) { alert(e.message); }
+      });
+      document.querySelectorAll('[data-pricing]').forEach(btn => btn.onclick = () => openPricing(btn.dataset.pricing));
+    }
+
+    async function openPricing(shopId) {
+      const shop = shops.find(s => String(s.id) === shopId);
+      const panel = document.getElementById('pricing-panel');
+      let data;
+      try { data = await api(`/api/shops/${shopId}/pricing`); }
+      catch (e) { panel.innerHTML = `<div class="err">${esc(e.message)}</div>`; return; }
+
+      const ruleSelect = (id, rule) => `
+        <select id="${id}-type">
+          <option value="" ${!rule ? 'selected' : ''}>Base price</option>
+          <option value="amount_off" ${rule?.rule_type === 'amount_off' ? 'selected' : ''}>Amount off /lb</option>
+          <option value="percent_off" ${rule?.rule_type === 'percent_off' ? 'selected' : ''}>% off</option>
+          <option value="override" ${rule?.rule_type === 'override' ? 'selected' : ''}>Set price</option>
+        </select>
+        <input id="${id}-val" type="number" step="0.01" style="width:80px" value="${rule ? rule.value : ''}" placeholder="0">`;
+
+      panel.innerHTML = `
+        <div class="card" style="margin-top:20px">
+          <label class="lbl">Pricing — ${esc(shop.name)}</label>
+          <div style="font-size:10px;color:var(--drift);margin-bottom:12px">
+            The shop only ever sees its final price. Item rules beat the catalog-wide rule. Prices already on past orders never change.
+          </div>
+          <div style="display:flex;gap:8px;align-items:center;margin-bottom:14px;font-size:11px">
+            <span style="min-width:180px">Catalog-wide rule</span>${ruleSelect('g', data.global_rule)}
+          </div>
+          <div class="table-wrap"><table>
+            <thead><tr><th>Coffee</th><th class="num">Base</th><th>Rule</th><th class="num">Their price</th></tr></thead>
+            <tbody>${data.items.map(i => `
+              <tr>
+                <td>${esc(i.name)}</td>
+                <td class="num">${money(i.base_price)}</td>
+                <td>${ruleSelect(`r${i.coffee_id}`, i.rule)}</td>
+                <td class="num" id="eff-${i.coffee_id}">${money(i.effective_price)}</td>
+              </tr>`).join('')}
+            </tbody></table></div>
+          <div style="display:flex;gap:10px;margin-top:14px;align-items:center">
+            <button class="btn" id="save-pricing">Save Pricing</button>
+            <button class="btn btn-ghost" id="close-pricing">Close</button>
+            <span class="ok" id="pricing-msg" style="margin:0"></span>
+          </div>
+        </div>`;
+      panel.scrollIntoView({ behavior: 'smooth' });
+
+      document.getElementById('close-pricing').onclick = () => { panel.innerHTML = ''; };
+      document.getElementById('save-pricing').onclick = async () => {
+        const read = id => {
+          const t = document.getElementById(`${id}-type`).value;
+          const v = parseFloat(document.getElementById(`${id}-val`).value);
+          return t && Number.isFinite(v) ? { rule_type: t, value: v } : null;
+        };
+        const body = {
+          global_rule: read('g'),
+          item_rules: data.items.map(i => {
+            const r = read(`r${i.coffee_id}`);
+            return r ? { coffee_id: i.coffee_id, ...r } : null;
+          }).filter(Boolean),
+        };
+        try {
+          await api(`/api/shops/${shopId}/pricing`, { method: 'PUT', body: JSON.stringify(body) });
+          document.getElementById('pricing-msg').textContent = '✓ Saved';
+          openPricing(shopId); // re-render with server-computed effective prices
+        } catch (e) { alert(e.message); }
+      };
+    }
+
+    drawList();
   }
 
   // ─── Patterns ───────────────────────────────────────────────────────────────
   async function renderPatterns() {
     const page = document.getElementById('page');
-    page.innerHTML = header('Roastery', 'Patterns', 'Ordering volume, pool mix, and cadence per shop.');
-    let data = [];
+    page.innerHTML = header('Roastery', 'Patterns', 'Ordering volume, spend, roast mix, and cadence per shop.');
+    let data;
     try { data = await api('/api/analytics'); }
     catch (e) { if (e.message !== 'Unauthorized') page.innerHTML += `<div class="err">${esc(e.message)}</div>`; return; }
-    if (!data.length) { page.innerHTML += '<div class="empty">No shops yet.</div>'; return; }
+    CURRENCY = data.currency || CURRENCY;
+    const list = data.shops || [];
+    if (!list.length) { page.innerHTML += '<div class="empty">No shops yet.</div>'; return; }
 
-    page.innerHTML += `<div class="stat-grid">${data.map(s => {
+    page.innerHTML += `<div class="stat-grid">${list.map(s => {
       const maxWeek = Math.max(1, ...s.weekly.map(w => w.lbs));
-      const totalPool = Math.max(1, POOLS.reduce((sum, [f, l]) => sum + (s.by_pool[f.replace('_lbs', '')] || 0), 0));
+      const mixTotal = Math.max(0.001, s.roast_mix.espresso + s.roast_mix.filter);
       return `<div class="card">
         <div class="stat-name">${esc(s.shop_name)}</div>
-        <div class="stat-line">${s.orders_count} orders · ${s.total_lbs} lbs total</div>
+        <div class="stat-line">${s.orders_count} orders · ${s.total_lbs} lbs${s.total_cost ? ` · ${money(s.total_cost)}` : ''}</div>
         <div class="stat-line">${s.avg_interval_days != null ? `orders every ~${s.avg_interval_days} days` : 'not enough orders for cadence yet'}</div>
         <div class="stat-line">last order: ${esc(s.last_order || '—')}</div>
-        <div class="pool-mix">${POOLS.map(([f, label, color]) => {
-          const v = s.by_pool[f.replace('_lbs', '')] || 0;
-          return v > 0 ? `<div style="width:${(v / totalPool * 100).toFixed(1)}%;background:${color}" title="${label}: ${Math.round(v * 10) / 10} lbs"></div>` : '';
-        }).join('')}</div>
-        <div class="legend">${POOLS.map(([f, label, color]) => {
-          const v = s.by_pool[f.replace('_lbs', '')] || 0;
-          return v > 0 ? `<span><span class="dot" style="background:${color}"></span>${label} ${Math.round(v * 10) / 10}</span>` : '';
-        }).join('')}</div>
+        <div class="pool-mix">
+          ${s.roast_mix.espresso > 0 ? `<div style="width:${(s.roast_mix.espresso / mixTotal * 100).toFixed(1)}%;background:#6B6E4A" title="Espresso roast: ${s.roast_mix.espresso} lbs"></div>` : ''}
+          ${s.roast_mix.filter > 0 ? `<div style="width:${(s.roast_mix.filter / mixTotal * 100).toFixed(1)}%;background:#C4833A" title="Filter roast: ${s.roast_mix.filter} lbs"></div>` : ''}
+        </div>
+        <div class="legend">
+          <span><span class="dot" style="background:#6B6E4A"></span>Espresso ${s.roast_mix.espresso} lbs</span>
+          <span><span class="dot" style="background:#C4833A"></span>Filter ${s.roast_mix.filter} lbs</span>
+        </div>
+        ${s.top_coffees.length ? `<div class="stat-line" style="margin-top:10px">${s.top_coffees.map((t, i) => `${i + 1}. ${esc(t.name)} (${t.lbs} lbs)`).join('<br>')}</div>` : ''}
         ${s.weekly.length ? `<div class="bars" title="Weekly lbs, last 12 weeks">${s.weekly.map(w =>
           `<div style="height:${Math.max(4, w.lbs / maxWeek * 100)}%" title="week ${esc(w.week)}: ${Math.round(w.lbs * 10) / 10} lbs"></div>`).join('')}</div>
         <div class="stat-line" style="margin-top:4px">weekly lbs · last 12 weeks</div>` : ''}

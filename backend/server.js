@@ -6,7 +6,7 @@ const fetch = require('node-fetch');
 const Database = require('better-sqlite3');
 const path = require('path');
 const { generateReport } = require('./report');
-const { LBS_TO_GRAMS, GALLONS_TO_ML, aggregateOrders, calcCoffeeStock, calcEfficiency, suggestOrderLbs } = require('./calc');
+const { LBS_TO_GRAMS, GALLONS_TO_ML, aggregateOrders, calcCoffeeStock, calcEfficiency, suggestOrderLbs, priceItemsFromCatalog } = require('./calc');
 
 const app = express();
 // Same-origin in production (frontend is served by this server) — CORS headers
@@ -69,6 +69,17 @@ db.exec(`
     sent_at TEXT,
     created_by TEXT,
     created_at TEXT DEFAULT (datetime('now'))
+  );
+
+  CREATE TABLE IF NOT EXISTS order_items (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    order_id INTEGER NOT NULL REFERENCES coffee_orders(id),
+    coffee_id INTEGER,
+    coffee_name TEXT NOT NULL,
+    roast TEXT NOT NULL CHECK(roast IN ('espresso','filter')),
+    lbs REAL NOT NULL,
+    price_per_lb REAL NOT NULL,
+    line_total REAL NOT NULL
   );
 
   CREATE TABLE IF NOT EXISTS settings (
@@ -158,6 +169,9 @@ for (const t of ['coffee_deliveries', 'milk_deliveries', 'coffee_orders', 'drink
   try { db.exec(`ALTER TABLE ${t} ADD COLUMN created_by TEXT`); } catch { /* already present */ }
 }
 try { db.exec('ALTER TABLE coffee_orders ADD COLUMN hub_status TEXT'); } catch { /* already present */ }
+for (const col of ['requested_date TEXT', 'total_lbs REAL', 'total_cost REAL']) {
+  try { db.exec(`ALTER TABLE coffee_orders ADD COLUMN ${col}`); } catch { /* already present */ }
+}
 
 const { promisify } = require('util');
 const scryptAsync = promisify(crypto.scrypt);
@@ -438,6 +452,7 @@ app.post('/api/settings', (req, res) => {
     setSetting(key, SECRET_SETTINGS.includes(key) ? encryptSecret(value) : value);
   }
   if (req.body.square_access_token !== undefined) cachedLocations = null; // token changed → re-resolve locations
+  if (req.body.hub_url !== undefined || req.body.hub_api_key !== undefined) catalogCache = { at: 0, data: null };
   res.json({ success: true });
 });
 
@@ -735,15 +750,21 @@ const ORDER_POOLS = [
   ['pourover_lbs', 'Pour-Over'],
 ];
 
-function orderEmailHtml(order, shopName) {
-  const rows = ORDER_POOLS
-    .filter(([field]) => order[field] > 0)
-    .map(([field, label]) =>
+function orderEmailHtml(order, shopName, items = []) {
+  const rows = items.length
+    ? items.map(i =>
       `<tr>
-        <td style="padding:10px 14px;border-bottom:1px solid #DDD6CC;font-family:monospace;font-size:13px;color:#3D3A34;">${label}</td>
-        <td style="padding:10px 14px;border-bottom:1px solid #DDD6CC;font-family:monospace;font-size:13px;color:#1A1916;text-align:right;">${order[field]} lbs</td>
-      </tr>`)
-    .join('');
+        <td style="padding:10px 14px;border-bottom:1px solid #DDD6CC;font-family:monospace;font-size:13px;color:#3D3A34;">${i.coffee_name} — ${i.roast === 'espresso' ? 'Espresso' : 'Filter'} Roast</td>
+        <td style="padding:10px 14px;border-bottom:1px solid #DDD6CC;font-family:monospace;font-size:13px;color:#1A1916;text-align:right;">${i.lbs} lbs</td>
+      </tr>`).join('')
+    : ORDER_POOLS
+      .filter(([field]) => order[field] > 0)
+      .map(([field, label]) =>
+        `<tr>
+          <td style="padding:10px 14px;border-bottom:1px solid #DDD6CC;font-family:monospace;font-size:13px;color:#3D3A34;">${label}</td>
+          <td style="padding:10px 14px;border-bottom:1px solid #DDD6CC;font-family:monospace;font-size:13px;color:#1A1916;text-align:right;">${order[field]} lbs</td>
+        </tr>`)
+      .join('');
   const esc = s => String(s).replace(/[<>&"]/g, c => ({ '<': '&lt;', '>': '&gt;', '&': '&amp;', '"': '&quot;' }[c]));
   return `
   <div style="max-width:520px;margin:0 auto;background:#F5EFE3;border:1px solid #DDD6CC;">
@@ -767,7 +788,7 @@ function orderEmailHtml(order, shopName) {
   </div>`;
 }
 
-async function sendOrderEmail(order, cfg) {
+async function sendOrderEmail(order, cfg, items = []) {
   const apiKey = getSecret('resend_api_key', 'RESEND_API_KEY');
   if (!apiKey) return { sent: false, reason: 'Email not configured — add a Resend API key on the Settings page. Order saved but not emailed.' };
   const to = (cfg.order_email_to || 'hello@boxxcoffee.com').trim();
@@ -781,7 +802,7 @@ async function sendOrderEmail(order, cfg) {
         from,
         to: [to],
         subject: `Coffee order — ${shopName || 'Dose shop'} — ${order.order_date}`,
-        html: orderEmailHtml(order, shopName),
+        html: orderEmailHtml(order, shopName, items),
       }),
     });
     const data = await res.json().catch(() => ({}));
@@ -792,57 +813,154 @@ async function sendOrderEmail(order, cfg) {
   }
 }
 
-// Push a sent order to the roastery hub, when one is configured in Settings.
-// Email and hub are independent transports — failure of one doesn't block the
-// other, and the order is always saved locally first.
-async function pushOrderToHub(order, cfg) {
-  const url = (cfg.hub_url || '').trim().replace(/\/+$/, '');
-  const apiKey = getSecret('hub_api_key', 'HUB_API_KEY');
-  if (!url || !apiKey) return { pushed: false, reason: 'Hub not configured' };
+// ─── Hub connection ──────────────────────────────────────────────────────────
+function hubConn(cfg) {
+  return {
+    url: (cfg.hub_url || '').trim().replace(/\/+$/, ''),
+    key: getSecret('hub_api_key', 'HUB_API_KEY'),
+  };
+}
+
+async function hubFetch(cfg, path, opts = {}, timeoutMs = 6000) {
+  const { url, key } = hubConn(cfg);
+  if (!url || !key) throw new Error('Hub not configured');
+  const controller = new AbortController();
+  const t = setTimeout(() => controller.abort(), timeoutMs);
   try {
-    const res = await fetch(`${url}/api/ingest/orders`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${apiKey}` },
-      body: JSON.stringify({
-        order_date: order.order_date,
-        espresso_lbs: order.espresso_lbs, drip_lbs: order.drip_lbs,
-        coldbrew_lbs: order.coldbrew_lbs, pourover_lbs: order.pourover_lbs,
-        notes: order.notes, placed_by: order.created_by, source_order_id: order.id,
-      }),
+    const res = await fetch(`${url}${path}`, {
+      ...opts,
+      headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${key}`, ...(opts.headers || {}) },
+      signal: controller.signal,
     });
     const data = await res.json().catch(() => ({}));
-    if (!res.ok) return { pushed: false, reason: data.error || `Hub error (${res.status})` };
-    return { pushed: true };
-  } catch (err) {
-    return { pushed: false, reason: err.message };
+    if (!res.ok) throw new Error(data.error || `Hub error (${res.status})`);
+    return data;
+  } finally {
+    clearTimeout(t);
   }
 }
 
-app.get('/api/orders', (req, res) =>
-  res.json(db.prepare('SELECT * FROM coffee_orders ORDER BY order_date DESC, id DESC').all()));
+// The shop's personalized price list, proxied so the hub API key never
+// reaches the browser. Cached for 60s.
+let catalogCache = { at: 0, data: null };
+async function getHubCatalog(cfg, fresh = false) {
+  if (!fresh && catalogCache.data && Date.now() - catalogCache.at < 60_000) return catalogCache.data;
+  const data = await hubFetch(cfg, '/api/ingest/catalog');
+  catalogCache = { at: Date.now(), data };
+  return data;
+}
+
+app.get('/api/hub-catalog', async (req, res) => {
+  const cfg = getSettings();
+  const { url, key } = hubConn(cfg);
+  if (!url || !key) return res.json({ configured: false, items: [] });
+  try {
+    const data = await getHubCatalog(cfg);
+    res.json({ configured: true, currency: data.currency || '$', items: data.items || [] });
+  } catch (err) {
+    res.json({ configured: true, error: err.message, items: [] });
+  }
+});
+
+// Push a sent order to the roastery hub. Email and hub are independent
+// transports — the order is always saved locally first.
+async function pushOrderToHub(order, cfg, items = []) {
+  try {
+    const body = {
+      order_date: order.order_date,
+      requested_date: order.requested_date || null,
+      notes: order.notes, placed_by: order.created_by, source_order_id: order.id,
+    };
+    if (items.length) body.items = items.map(i => ({ coffee_id: i.coffee_id, roast: i.roast, lbs: i.lbs }));
+    else {
+      body.espresso_lbs = order.espresso_lbs; body.drip_lbs = order.drip_lbs;
+      body.coldbrew_lbs = order.coldbrew_lbs; body.pourover_lbs = order.pourover_lbs;
+    }
+    const data = await hubFetch(cfg, '/api/ingest/orders', { method: 'POST', body: JSON.stringify(body) });
+    return { pushed: true, receipt: data.receipt || null };
+  } catch (err) {
+    return { pushed: false, reason: err.message === 'Hub not configured' ? 'Hub not configured' : err.message };
+  }
+}
+
+const orderWithItems = o => ({
+  ...o,
+  items: db.prepare('SELECT * FROM order_items WHERE order_id=? ORDER BY roast, coffee_name').all(o.id),
+});
+
+// Reflect roastery confirmations (from the hub) into local hub_status.
+async function syncHubStatuses(cfg) {
+  const pending = db.prepare("SELECT id FROM coffee_orders WHERE hub_status IN ('sent','confirmed')").all().map(r => r.id);
+  if (!pending.length) return;
+  const statuses = await hubFetch(cfg, `/api/ingest/order-status?ids=${pending.join(',')}`, {}, 3000);
+  const upd = db.prepare('UPDATE coffee_orders SET hub_status=? WHERE id=? AND hub_status IS NOT ?');
+  for (const s of statuses) {
+    const mapped = s.status === 'new' ? 'sent' : s.status; // hub 'new' = delivered-to-hub
+    upd.run(mapped, s.source_order_id, mapped);
+  }
+}
+
+app.get('/api/orders', async (req, res) => {
+  const cfg = getSettings();
+  await syncHubStatuses(cfg).catch(() => { /* hub unreachable — show last known */ });
+  res.json(db.prepare('SELECT * FROM coffee_orders ORDER BY order_date DESC, id DESC').all().map(orderWithItems));
+});
 
 app.post('/api/orders', async (req, res) => {
   try {
-    const { order_date, espresso_lbs, drip_lbs, coldbrew_lbs, pourover_lbs, notes } = req.body;
+    const { order_date, requested_date, notes, items: rawItems } = req.body;
     if (!order_date) return res.status(400).json({ error: 'order_date required' });
+    const cfg = getSettings();
+
+    // ── Catalog order: line items priced from the hub's price list ──
+    if (Array.isArray(rawItems) && rawItems.length) {
+      let catalog;
+      try { catalog = await getHubCatalog(cfg, true); }
+      catch (err) { return res.status(502).json({ error: `Could not load the price list from the hub: ${err.message}` }); }
+      let priced;
+      try { priced = priceItemsFromCatalog(rawItems, catalog.items || []); }
+      catch (err) { return res.status(400).json({ error: err.message }); }
+
+      const r = db.prepare(`INSERT INTO coffee_orders (order_date, requested_date, total_lbs, total_cost, notes, created_by)
+        VALUES (?,?,?,?,?,?)`)
+        .run(order_date, requested_date || null, priced.total_lbs, priced.total_cost, notes || null, req.user.username);
+      const ins = db.prepare('INSERT INTO order_items (order_id, coffee_id, coffee_name, roast, lbs, price_per_lb, line_total) VALUES (?,?,?,?,?,?,?)');
+      for (const i of priced.items) ins.run(r.lastInsertRowid, i.coffee_id, i.coffee_name, i.roast, i.lbs, i.price_per_lb, i.line_total);
+      const order = db.prepare('SELECT * FROM coffee_orders WHERE id=?').get(r.lastInsertRowid);
+
+      // The hub emails the receipt itself; shop-side email is only the fallback
+      // when the push fails.
+      const hub = await pushOrderToHub(order, cfg, priced.items);
+      let email = null;
+      if (!hub.pushed) email = await sendOrderEmail(order, cfg, priced.items);
+
+      db.prepare('UPDATE coffee_orders SET status=?, sent_to=?, sent_at=?, hub_status=? WHERE id=?')
+        .run((hub.pushed || email?.sent) ? 'sent' : 'email_failed',
+             email?.sent ? email.to : null,
+             (hub.pushed || email?.sent) ? new Date().toISOString() : null,
+             hub.pushed ? 'sent' : 'failed',
+             order.id);
+
+      return res.json({ order: orderWithItems(db.prepare('SELECT * FROM coffee_orders WHERE id=?').get(order.id)), hub, email });
+    }
+
+    // ── Legacy pool-based order (no hub catalog connected) ──
     const qty = {
-      espresso_lbs: Math.max(0, parseFloat(espresso_lbs) || 0),
-      drip_lbs:     Math.max(0, parseFloat(drip_lbs)     || 0),
-      coldbrew_lbs: Math.max(0, parseFloat(coldbrew_lbs) || 0),
-      pourover_lbs: Math.max(0, parseFloat(pourover_lbs) || 0),
+      espresso_lbs: Math.max(0, parseFloat(req.body.espresso_lbs) || 0),
+      drip_lbs:     Math.max(0, parseFloat(req.body.drip_lbs)     || 0),
+      coldbrew_lbs: Math.max(0, parseFloat(req.body.coldbrew_lbs) || 0),
+      pourover_lbs: Math.max(0, parseFloat(req.body.pourover_lbs) || 0),
     };
     if (Object.values(qty).every(v => v === 0))
-      return res.status(400).json({ error: 'Order must include at least one pool quantity' });
+      return res.status(400).json({ error: 'Order must include at least one quantity' });
 
-    const cfg = getSettings();
-    const r = db.prepare(`INSERT INTO coffee_orders (order_date, espresso_lbs, drip_lbs, coldbrew_lbs, pourover_lbs, notes, created_by)
-      VALUES (?,?,?,?,?,?,?)`)
-      .run(order_date, qty.espresso_lbs, qty.drip_lbs, qty.coldbrew_lbs, qty.pourover_lbs, notes || null, req.user.username);
+    const totalLbs = Math.round(Object.values(qty).reduce((s, v) => s + v, 0) * 10) / 10;
+    const r = db.prepare(`INSERT INTO coffee_orders (order_date, requested_date, espresso_lbs, drip_lbs, coldbrew_lbs, pourover_lbs, total_lbs, notes, created_by)
+      VALUES (?,?,?,?,?,?,?,?,?)`)
+      .run(order_date, requested_date || null, qty.espresso_lbs, qty.drip_lbs, qty.coldbrew_lbs, qty.pourover_lbs, totalLbs, notes || null, req.user.username);
     const order = db.prepare('SELECT * FROM coffee_orders WHERE id=?').get(r.lastInsertRowid);
 
     const [email, hub] = await Promise.all([sendOrderEmail(order, cfg), pushOrderToHub(order, cfg)]);
-    // 'sent' if the roastery got it by either transport; 'email_failed' only
-    // when nothing reached them.
     db.prepare('UPDATE coffee_orders SET status=?, sent_to=?, sent_at=?, hub_status=? WHERE id=?')
       .run((email.sent || hub.pushed) ? 'sent' : 'email_failed',
            email.sent ? email.to : null,
@@ -850,14 +968,18 @@ app.post('/api/orders', async (req, res) => {
            hub.pushed ? 'sent' : (hub.reason === 'Hub not configured' ? null : 'failed'),
            order.id);
 
-    res.json({ order: db.prepare('SELECT * FROM coffee_orders WHERE id=?').get(order.id), email, hub });
+    res.json({ order: orderWithItems(db.prepare('SELECT * FROM coffee_orders WHERE id=?').get(order.id)), email, hub });
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: err.message });
   }
 });
 
-app.delete('/api/orders/:id', (req, res) => { db.prepare('DELETE FROM coffee_orders WHERE id=?').run(req.params.id); res.json({ success: true }); });
+app.delete('/api/orders/:id', (req, res) => {
+  db.prepare('DELETE FROM order_items WHERE order_id=?').run(req.params.id);
+  db.prepare('DELETE FROM coffee_orders WHERE id=?').run(req.params.id);
+  res.json({ success: true });
+});
 
 // Suggested order quantities from the current open cycle's burn rate.
 app.get('/api/order-suggestion', async (req, res) => {

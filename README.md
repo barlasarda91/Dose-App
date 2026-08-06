@@ -79,19 +79,24 @@ Milk consumption is calculated from Square modifier counts (Whole / Oat / Almond
 
 ## Dose Hub (roastery side)
 
-The `hub/` directory contains a separate, lightweight service for the roastery: an **orders inbox** (new → confirmed → delivered), **per-shop order history**, and **ordering patterns** (volume, pool mix, cadence, 12-week trend per shop). Client shops push orders to it automatically when they hit Send Order — email keeps working independently as a fallback.
+The `hub/` directory contains a separate service for the roastery:
 
-**Deploy** (own Railway service, same repo):
-1. New Railway service → same GitHub repo → set **Root Directory** to `/hub`
-2. Variables: `HUB_PASSWORD` (roastery login), optionally `HUB_DB_PATH=/app/data/hub.db`
-3. Volume mounted at `/app/data`
+- **Catalog** — the coffee list shops order from: name, tasting notes, base price/lb, badges (House / Seasonal / Low stock), archive flag. Items are *standard* (all shops) or *exclusive* (only the shops you pick — e.g. a custom blend for one client).
+- **Per-shop pricing** — per client, a catalog-wide or per-item rule: amount off, % off, or a fixed override. Shops only ever see their final price; base prices and rules never leave the hub.
+- **Orders inbox** — line-item orders (coffee × roast × lbs × price) worked through new → confirmed → delivered. **Confirming emails the shop.** New orders trigger a receipt email to the shop's registered address (and `HUB_NOTIFY_EMAIL` if set).
+- **Shops** — create a shop with its registered email to mint its API key (shown once, stored hashed); edit, rotate keys.
+- **Patterns** — per shop: volume, spend, espresso/filter roast mix, top coffees, cadence, 12-week trend.
+
+**Hub environment variables:** `HUB_PASSWORD` (roastery login, required), `HUB_DB_PATH=/app/data/hub.db`, `RESEND_API_KEY` + `HUB_EMAIL_FROM` (receipt/confirmation emails), `HUB_NOTIFY_EMAIL` (your copy of new orders), `HUB_CURRENCY` (default `$`).
+
+**Deploy** (own Railway service, same repo): New service → same GitHub repo → **Root Directory `/hub`** → variables above → volume at `/app/data`.
 
 **Connect a shop:**
-1. In the hub: Shops tab → Add Shop → copy the API key (shown once; stored only as a hash)
-2. In that shop's Dose app: Settings → Ordering → Roastery Hub → paste the hub URL + API key
-3. From then on, every sent order appears in the hub inbox with who placed it; work it through Confirm → Delivered
+1. Hub → Shops → Add Shop (name + registered email) → copy the API key
+2. Shop's Dose app → Settings → Ordering → Roastery Hub → paste hub URL + API key
+3. The shop's Order page switches from pool quantities to the live price list (their personalized view). Orders are priced server-side at order time — later price changes never rewrite history — and roastery confirmations appear in the shop's order history automatically.
 
-Shop pushes are authenticated per shop (`Bearer dose_…`), deduplicated (a retried push never duplicates an order), and the hub login is rate-limited with expiring hashed session tokens — same security model as the shop app.
+Shop pushes are authenticated per shop (`Bearer dose_…`), re-priced and re-validated by the hub on ingest, and deduplicated (a retried push never duplicates an order). Hub login is rate-limited with expiring hashed session tokens — same security model as the shop app.
 
 ## Development
 

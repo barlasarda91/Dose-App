@@ -90,4 +90,27 @@ function suggestOrderLbs({ usedGrams, days, expectedRemainingGrams, horizonDays 
   return Math.max(0, Math.ceil(needGrams / LBS_TO_GRAMS));
 }
 
-module.exports = { LBS_TO_GRAMS, GALLONS_TO_ML, aggregateOrders, calcCoffeeStock, calcEfficiency, suggestOrderLbs };
+// Price an order's line items against the catalog fetched from the hub.
+// The hub recomputes prices on ingest with the same rules — this keeps the
+// locally stored copy identical to what the roastery bills.
+function priceItemsFromCatalog(rawItems, catalogItems) {
+  if (!Array.isArray(rawItems) || rawItems.length === 0) throw new Error('Order has no items');
+  const byId = new Map(catalogItems.map(i => [i.id, i]));
+  const items = rawItems.map(raw => {
+    const coffee = byId.get(parseInt(raw.coffee_id, 10));
+    if (!coffee) throw new Error(`Coffee ${raw.coffee_id} is not on your price list`);
+    const roast = raw.roast === 'espresso' ? 'espresso' : raw.roast === 'filter' ? 'filter' : null;
+    if (!roast) throw new Error(`Invalid roast for ${coffee.name}`);
+    const lbs = Math.round((parseFloat(raw.lbs) || 0) * 10) / 10;
+    if (lbs <= 0) throw new Error(`Invalid quantity for ${coffee.name}`);
+    const line_total = Math.round(lbs * coffee.price_per_lb * 100) / 100;
+    return { coffee_id: coffee.id, coffee_name: coffee.name, roast, lbs, price_per_lb: coffee.price_per_lb, line_total };
+  });
+  return {
+    items,
+    total_lbs: Math.round(items.reduce((s, i) => s + i.lbs, 0) * 10) / 10,
+    total_cost: Math.round(items.reduce((s, i) => s + i.line_total, 0) * 100) / 100,
+  };
+}
+
+module.exports = { LBS_TO_GRAMS, GALLONS_TO_ML, aggregateOrders, calcCoffeeStock, calcEfficiency, suggestOrderLbs, priceItemsFromCatalog };
