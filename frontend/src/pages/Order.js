@@ -188,7 +188,7 @@ export default function Order() {
             <table>
               <thead><tr>
                 <th>Date</th><th>Espresso</th><th>Drip</th><th>Cold Brew</th><th>Pour-Over</th>
-                <th>Notes</th><th>Status</th><th></th>
+                <th>Notes</th><th>By</th><th>Status</th><th></th>
               </tr></thead>
               <tbody>
                 {orders.map(o => (
@@ -196,6 +196,7 @@ export default function Order() {
                     <td>{o.order_date}</td>
                     {POOLS.map(p => <td key={p.field}>{o[p.field] > 0 ? `${o[p.field]} lbs` : '—'}</td>)}
                     <td style={{ color: 'var(--drift)', fontSize: 11 }}>{o.notes || '—'}</td>
+                    <td style={{ color: 'var(--drift)', fontSize: 11 }}>{o.created_by || '—'}</td>
                     <td style={{ color: o.status === 'sent' ? 'var(--olive)' : 'var(--warn)' }}>
                       {STATUS_LABELS[o.status] || o.status}
                     </td>

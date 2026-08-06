@@ -4,7 +4,9 @@ Track coffee and milk efficiency for your coffee shop by comparing Square POS sa
 
 ## Setup
 
-The app is self-configuring: on first visit it asks you to **create a shop password**, and everything shop-specific — the Square access token, Resend API key, order email — is entered on the **Settings page after logging in** and stored in that shop's own database. Deploying a new shop needs no secrets in Railway at all.
+The app is self-configuring and uses **user accounts with roles** — there is no self-registration. The first visit to a fresh deployment shows a one-time setup screen that creates the **admin** account; whoever provisions the shop (the roastery) does this **before** handing the URL to the client, then creates the client's accounts from Settings → Users. Everything shop-specific — the Square access token, Resend API key, order email — is entered on the **Settings page by an admin** and stored in that shop's own database. Deploying a new shop needs no secrets in Railway at all.
+
+**Roles:** `admin` — manage users, credentials (Square token, Resend key, order emails), everything else. `user` — run reports, log stock, place orders, edit recipes; cannot touch users or credentials.
 
 ### Railway Environment Variables
 
@@ -12,19 +14,33 @@ The app is self-configuring: on first visit it asks you to **create a shop passw
 |---|---|---|
 | `NODE_ENV` | Yes | Set to `production` |
 | `DB_PATH` | Recommended | SQLite path on the persistent volume, e.g. `/app/data/dose.db` |
-| `DOSE_PASSWORD` | Optional | Seeds the shop password on first boot (skips the create-password screen). In-app password changes take precedence afterwards. |
+| `DOSE_PASSWORD` | Optional | Seeds the admin account's password on first boot, skipping the setup screen (username from `ADMIN_USERNAME`, default `admin`). |
+| `ADMIN_USERNAME` | Optional | Username for the seeded admin account (default `admin`). |
+| `SETUP_SECRET` | Optional | Overrides the auto-generated first-run setup code. |
+| `DOSE_SECRET_KEY` | Recommended | Any long random string. When set, credentials stored in the database (Square token, Resend key) are AES-256-GCM encrypted, so a leaked database file alone reveals nothing. Don't lose it — re-enter credentials if it changes. |
 | `SQUARE_ACCESS_TOKEN` | Optional fallback | Used only when no token has been entered in Settings. |
 | `RESEND_API_KEY` | Optional fallback | Used only when no key has been entered in Settings. |
 | `ORDER_EMAIL_FROM` | Optional fallback | Used only when no from-address has been entered in Settings. |
 
-Secrets are stored in the shop's database (password as a salted scrypt hash; login uses random session tokens) and are never echoed back to the browser.
+### Security model
 
-### Deploy
+- **No self-registration.** The first-run setup screen requires a one-time **setup code printed to the server logs** (Railway → Deployments → View Logs), so only whoever operates the deployment can claim the admin account — even if someone else finds the URL first.
+- Passwords are salted **scrypt** hashes (hashed asynchronously — login never blocks the server). Admin accounts require 10+ character passwords, users 6+.
+- Login is **rate-limited** per IP and per username: 5 failures triggers an escalating lockout (30s doubling up to 15 min).
+- Sessions are random 256-bit tokens; the database stores only their **SHA-256 hash**, and sessions **expire after 30 days** (sliding renewal while active). Password changes/resets and account deletion revoke sessions immediately.
+- Credentials in the database are **encrypted at rest** when `DOSE_SECRET_KEY` is set, and are never echoed back to the browser.
+- Stock, order, and recipe writes record **which user made them** (`created_by`).
+- Deployments upgraded from the earlier shared-password version migrate automatically: the old password becomes the `admin` account.
+- Known accepted trade-off: the session token lives in `localStorage` (not an httpOnly cookie). Revisit if the app ever renders user-supplied HTML.
+
+### Deploy (provisioning a shop)
 1. Push this repo to GitHub
 2. Create a new Railway project → Deploy from GitHub repo
 3. Set `NODE_ENV=production` and `DB_PATH=/app/data/dose.db`
 4. Create a volume mounted at `/app/data` (without it, data resets on every deploy)
-5. Open the app → create the shop password → paste the Square token (and optionally Resend key) in Settings
+5. Open the app → enter the **setup code** from the deploy logs → create the **admin** account (this is you, the provisioner)
+6. Settings: paste the shop's Square token, set shop name / order email, create the client's user account(s)
+7. Hand the client the URL and their username + password
 
 ## How it works
 
@@ -32,7 +48,7 @@ Secrets are stored in the shop's database (password as a salted scrypt hash; log
 - **Stock Log** — log coffee deliveries (per pool) and milk deliveries / Numilk rates
 - **Order** — place a coffee order with the roastery, emailed to the configured address (default `hello@boxxcoffee.com`). Includes a suggested order computed from the current cycle's burn rate, a one-click **Duplicate Last Order**, and a full order history.
 - **Drink Recipes** — maps Square item names to coffee pool and gram dose. Pre-seeded with your menu on first run.
-- **Settings** — Square access token + Location ID, shop name / order email / Resend key for ordering, and password change. Secret fields are write-only: they show configured/not-configured, never the value.
+- **Settings** — Square access token + Location ID, ordering config, and user management (all admin-only), plus own-password change for everyone. Secret fields are write-only: they show configured/not-configured, never the value.
 
 ## Delivery cycles
 
