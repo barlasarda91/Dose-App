@@ -112,12 +112,9 @@ export default function Settings({ me }) {
   const isAdmin = me?.role === 'admin';
   const [locationId, setLocationId] = useState('');
   const [shopName, setShopName]     = useState('');
-  const [orderEmail, setOrderEmail] = useState('');
-  const [orderFrom, setOrderFrom]   = useState('');
   const [hubUrl, setHubUrl]         = useState('');
   // Secret inputs are write-only: blank = keep current value
   const [squareToken, setSquareToken] = useState('');
-  const [resendKey, setResendKey]     = useState('');
   const [hubApiKey, setHubApiKey]     = useState('');
   const [status, setStatus] = useState({ tokenSet: false, tokenSource: null, resendConfigured: false, resendSource: null, hubConfigured: false, authMode: 'local' });
   const [saved, setSaved]   = useState(false);
@@ -128,8 +125,6 @@ export default function Settings({ me }) {
     const s = await apiJson('/api/settings');
     setLocationId(s.square_location_id || '');
     setShopName(s.shop_name || '');
-    setOrderEmail(s.order_email_to || '');
-    setOrderFrom(s.order_email_from || '');
     setHubUrl(s.hub_url || '');
     setStatus({
       tokenSet: !!s.square_token_set,
@@ -147,15 +142,12 @@ export default function Settings({ me }) {
     const body = { shop_name: shopName };
     if (isAdmin) {
       body.square_location_id = locationId;
-      body.order_email_to = orderEmail;
-      body.order_email_from = orderFrom;
       // Only send secrets the user actually typed — blank means "keep as is"
       if (squareToken.trim() !== '') body.square_access_token = squareToken.trim();
-      if (resendKey.trim()   !== '') body.resend_api_key = resendKey.trim();
       if (hubApiKey.trim()   !== '') body.hub_api_key = hubApiKey.trim();
     }
     await apiJson('/api/settings', { method: 'POST', body: JSON.stringify(body) });
-    setSquareToken(''); setResendKey(''); setHubApiKey('');
+    setSquareToken(''); setHubApiKey('');
     await load().catch(() => {});
     setSaved(true);
     setTimeout(() => setSaved(false), 2500);
@@ -260,36 +252,6 @@ export default function Settings({ me }) {
               </div>
             </div>
 
-            {!status.hubConfigured && (
-              <>
-                <div className="settings-field">
-                  <label className="settings-field-lbl">Order Email</label>
-                  <input type="text" placeholder="hello@boxxcoffee.com" value={orderEmail} onChange={e => setOrderEmail(e.target.value)} style={{ maxWidth: 320 }} />
-                  <div className="settings-field-hint">Where Place Order sends the order when no hub is connected.</div>
-                </div>
-
-                <div className="settings-field">
-                  <label className="settings-field-lbl">Resend API Key</label>
-                  <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginTop: 4, marginBottom: 8 }}>
-                    <span className={`conn-status ${status.resendConfigured ? 'ok' : 'fail'}`} style={{ marginTop: 0 }}>
-                      {status.resendConfigured
-                        ? `● Email sending configured${sourceNote(status.resendSource)}`
-                        : '✕ Not set — orders are saved to the log but not emailed'}
-                    </span>
-                  </div>
-                  <input type="password" placeholder={status.resendConfigured ? '•••••••• (leave blank to keep current)' : 're_…'}
-                    value={resendKey} onChange={e => setResendKey(e.target.value)} style={{ maxWidth: 420 }}
-                    autoComplete="new-password" />
-                  <div className="settings-field-hint">From resend.com → API Keys. Only needed when no hub is connected.</div>
-                </div>
-
-                <div className="settings-field">
-                  <label className="settings-field-lbl">From Address <span style={{ fontWeight: 300, textTransform: 'none', letterSpacing: 0 }}>(optional)</span></label>
-                  <input type="text" placeholder="Dose Orders <orders@yourdomain.com>" value={orderFrom} onChange={e => setOrderFrom(e.target.value)} style={{ maxWidth: 420 }} />
-                  <div className="settings-field-hint">Must be a Resend-verified sender.</div>
-                </div>
-              </>
-            )}
           </div>
         </div>
       )}
