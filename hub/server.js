@@ -1,11 +1,13 @@
-// Dose Hub — the roastery-side service. Client shops push their coffee orders
-// here (authenticated by a per-shop API key); the roastery logs in to work the
-// orders inbox, browse per-shop history, and see ordering patterns.
+// Dose Hub — the roastery-side service. Holds the coffee catalog and price
+// rules, receives orders from client shops (per-shop API keys), sends receipt
+// and confirmation emails, and serves the roastery dashboard: orders inbox,
+// shops, catalog, and patterns.
 require('dotenv').config();
 const express = require('express');
 const crypto = require('crypto');
 const Database = require('better-sqlite3');
 const path = require('path');
+const { catalogForShop, priceOrderItems } = require('./pricing');
 
 const app = express();
 app.use(express.json());
@@ -14,22 +16,56 @@ const dbPath = process.env.HUB_DB_PATH || '/app/data/hub.db';
 require('fs').mkdirSync(path.dirname(dbPath), { recursive: true });
 const db = new Database(dbPath);
 
+const CURRENCY = process.env.HUB_CURRENCY || '$';
+
 db.exec(`
   CREATE TABLE IF NOT EXISTS shops (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     name TEXT NOT NULL UNIQUE,
+    email TEXT,
     api_key_hash TEXT NOT NULL,
     created_at TEXT DEFAULT (datetime('now'))
   );
+
+  CREATE TABLE IF NOT EXISTS catalog (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT NOT NULL,
+    notes TEXT,
+    price_per_lb REAL NOT NULL DEFAULT 0,
+    badge TEXT DEFAULT '',
+    low_stock INTEGER DEFAULT 0,
+    visibility TEXT NOT NULL DEFAULT 'standard' CHECK(visibility IN ('standard','exclusive')),
+    active INTEGER NOT NULL DEFAULT 1,
+    created_at TEXT DEFAULT (datetime('now'))
+  );
+
+  CREATE TABLE IF NOT EXISTS catalog_visibility (
+    coffee_id INTEGER NOT NULL REFERENCES catalog(id),
+    shop_id INTEGER NOT NULL REFERENCES shops(id),
+    PRIMARY KEY (coffee_id, shop_id)
+  );
+
+  CREATE TABLE IF NOT EXISTS price_rules (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    shop_id INTEGER NOT NULL REFERENCES shops(id),
+    coffee_id INTEGER REFERENCES catalog(id),
+    rule_type TEXT NOT NULL CHECK(rule_type IN ('amount_off','percent_off','override')),
+    value REAL NOT NULL DEFAULT 0
+  );
+
+  CREATE UNIQUE INDEX IF NOT EXISTS idx_rules_unique ON price_rules(shop_id, IFNULL(coffee_id, 0));
 
   CREATE TABLE IF NOT EXISTS orders (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     shop_id INTEGER NOT NULL REFERENCES shops(id),
     order_date TEXT NOT NULL,
+    requested_date TEXT,
     espresso_lbs REAL DEFAULT 0,
     drip_lbs REAL DEFAULT 0,
     coldbrew_lbs REAL DEFAULT 0,
     pourover_lbs REAL DEFAULT 0,
+    total_lbs REAL DEFAULT 0,
+    total_cost REAL,
     notes TEXT,
     placed_by TEXT,
     source_order_id INTEGER,
@@ -39,6 +75,17 @@ db.exec(`
 
   CREATE UNIQUE INDEX IF NOT EXISTS idx_orders_dedupe ON orders(shop_id, source_order_id);
 
+  CREATE TABLE IF NOT EXISTS order_items (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    order_id INTEGER NOT NULL REFERENCES orders(id),
+    coffee_id INTEGER,
+    coffee_name TEXT NOT NULL,
+    roast TEXT NOT NULL CHECK(roast IN ('espresso','filter')),
+    lbs REAL NOT NULL,
+    price_per_lb REAL NOT NULL,
+    line_total REAL NOT NULL
+  );
+
   CREATE TABLE IF NOT EXISTS sessions (
     token TEXT PRIMARY KEY,
     expires_at TEXT,
@@ -46,8 +93,15 @@ db.exec(`
   );
 `);
 
+// Databases created before this version predate some columns.
+try { db.exec('ALTER TABLE shops ADD COLUMN email TEXT'); } catch { /* present */ }
+for (const col of ['requested_date TEXT', 'total_lbs REAL DEFAULT 0', 'total_cost REAL']) {
+  try { db.exec(`ALTER TABLE orders ADD COLUMN ${col}`); } catch { /* present */ }
+}
+
 const sha256 = s => crypto.createHash('sha256').update(String(s)).digest('hex');
 const SESSION_DAYS = 30;
+const money = v => `${CURRENCY}${(Math.round(v * 100) / 100).toFixed(2)}`;
 
 // ─── Roastery auth (shared password from HUB_PASSWORD) ───────────────────────
 const HUB_PASSWORD = process.env.HUB_PASSWORD || '';
@@ -73,7 +127,6 @@ function purgeExpiredSessions() {
 purgeExpiredSessions();
 setInterval(purgeExpiredSessions, 6 * 60 * 60 * 1000).unref();
 
-// Login rate limiting (same escalating-lockout scheme as the shop app)
 const loginFailures = new Map();
 const LOCK_AFTER = 5;
 function lockedFor(key) {
@@ -101,31 +154,162 @@ app.post('/api/login', (req, res) => {
   res.json({ ok: true, token: issueToken() });
 });
 
-// ─── Shop ingest (per-shop API key) — must come BEFORE the dashboard gate ────
-app.post('/api/ingest/orders', (req, res) => {
+// ─── Email (Resend) ───────────────────────────────────────────────────────────
+async function sendEmail(to, subject, html) {
+  const apiKey = process.env.RESEND_API_KEY;
+  if (!apiKey) return { sent: false, reason: 'RESEND_API_KEY not set on the hub' };
+  if (!to) return { sent: false, reason: 'No recipient email registered for this shop' };
+  const from = process.env.HUB_EMAIL_FROM || 'Dose Hub <onboarding@resend.dev>';
+  try {
+    const res = await fetch('https://api.resend.com/emails', {
+      method: 'POST',
+      headers: { 'Authorization': `Bearer ${apiKey}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ from, to: [to], subject, html }),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) return { sent: false, reason: data.message || `Email provider error (${res.status})` };
+    return { sent: true, to };
+  } catch (err) {
+    return { sent: false, reason: err.message };
+  }
+}
+
+const esc = s => String(s ?? '').replace(/[<>&"]/g, c => ({ '<': '&lt;', '>': '&gt;', '&': '&amp;', '"': '&quot;' }[c]));
+
+function orderEmailHtml(order, items, shop, headline, sub) {
+  const roastLabel = r => r === 'espresso' ? 'Espresso Roast' : 'Filter Roast';
+  const rows = items.length
+    ? items.map(i =>
+      `<tr>
+        <td style="padding:9px 14px;border-bottom:1px solid #DDD6CC;font-family:monospace;font-size:12px;color:#3D3A34;">${esc(i.coffee_name)}<br><span style="font-size:10px;color:#7A7268;">${roastLabel(i.roast)}</span></td>
+        <td style="padding:9px 14px;border-bottom:1px solid #DDD6CC;font-family:monospace;font-size:12px;color:#1A1916;text-align:right;">${i.lbs} lbs</td>
+        <td style="padding:9px 14px;border-bottom:1px solid #DDD6CC;font-family:monospace;font-size:12px;color:#7A7268;text-align:right;">${money(i.price_per_lb)}/lb</td>
+        <td style="padding:9px 14px;border-bottom:1px solid #DDD6CC;font-family:monospace;font-size:12px;color:#1A1916;text-align:right;">${money(i.line_total)}</td>
+      </tr>`).join('')
+    : `<tr><td colspan="4" style="padding:9px 14px;font-family:monospace;font-size:12px;color:#3D3A34;">
+        ${['espresso_lbs', 'drip_lbs', 'coldbrew_lbs', 'pourover_lbs'].filter(f => order[f] > 0).map(f => `${f.replace('_lbs', '')}: ${order[f]} lbs`).join(' · ')}
+      </td></tr>`;
+  return `
+  <div style="max-width:560px;margin:0 auto;background:#F5EFE3;border:1px solid #DDD6CC;">
+    <div style="background:#1A1916;padding:22px 26px;">
+      <div style="font-family:Georgia,serif;font-size:18px;color:#F5EFE3;">${esc(headline)}</div>
+      <div style="font-family:monospace;font-size:11px;color:#B8AFA3;letter-spacing:0.14em;text-transform:uppercase;margin-top:6px;">
+        ${esc(shop.name)} · placed ${esc(order.order_date)}${order.requested_date ? ` · requested ${esc(order.requested_date)}` : ''}
+      </div>
+    </div>
+    ${sub ? `<div style="padding:14px 26px;font-family:monospace;font-size:12px;color:#3D3A34;border-bottom:1px solid #DDD6CC;">${esc(sub)}</div>` : ''}
+    <table style="width:100%;border-collapse:collapse;">
+      <thead><tr>
+        ${['Coffee', 'Qty', 'Price', 'Total'].map((h, i) => `<th style="padding:9px 14px;background:#DDD6CC;font-family:monospace;font-size:10px;letter-spacing:0.16em;text-transform:uppercase;color:#7A7268;text-align:${i ? 'right' : 'left'};">${h}</th>`).join('')}
+      </tr></thead>
+      <tbody>${rows}</tbody>
+      <tfoot><tr>
+        <td style="padding:11px 14px;font-family:monospace;font-size:12px;color:#1A1916;background:#DDD6CC;">Total</td>
+        <td style="padding:11px 14px;font-family:monospace;font-size:12px;color:#1A1916;background:#DDD6CC;text-align:right;">${order.total_lbs} lbs</td>
+        <td style="background:#DDD6CC;"></td>
+        <td style="padding:11px 14px;font-family:monospace;font-size:12px;color:#1A1916;background:#DDD6CC;text-align:right;">${order.total_cost != null ? money(order.total_cost) : '—'}</td>
+      </tr></tfoot>
+    </table>
+    ${order.notes ? `<div style="padding:14px 26px;font-family:monospace;font-size:12px;color:#3D3A34;">Notes: ${esc(order.notes)}</div>` : ''}
+    <div style="padding:14px 26px;font-family:monospace;font-size:10px;color:#7A7268;border-top:1px solid #DDD6CC;">
+      Dose Hub · Boxx Coffee Roasters Co.
+    </div>
+  </div>`;
+}
+
+// ─── Shop ingest (per-shop API key) — before the dashboard gate ──────────────
+function shopFromBearer(req) {
   const auth = req.get('authorization') || '';
   const apiKey = auth.startsWith('Bearer ') ? auth.slice(7).trim() : '';
-  const shop = apiKey && db.prepare('SELECT * FROM shops WHERE api_key_hash=?').get(sha256(apiKey));
+  return apiKey ? db.prepare('SELECT * FROM shops WHERE api_key_hash=?').get(sha256(apiKey)) : null;
+}
+
+function shopCatalog(shopId) {
+  const items = db.prepare('SELECT * FROM catalog').all();
+  const grants = db.prepare('SELECT * FROM catalog_visibility').all();
+  const rules = db.prepare('SELECT * FROM price_rules').all();
+  return catalogForShop(items, shopId, grants, rules);
+}
+
+app.get('/api/ingest/catalog', (req, res) => {
+  const shop = shopFromBearer(req);
   if (!shop) return res.status(401).json({ error: 'Invalid shop API key' });
+  res.json({ currency: CURRENCY, items: shopCatalog(shop.id) });
+});
 
-  const b = req.body || {};
-  if (!b.order_date) return res.status(400).json({ error: 'order_date required' });
-  const qty = {};
-  for (const k of ['espresso_lbs', 'drip_lbs', 'coldbrew_lbs', 'pourover_lbs']) qty[k] = Math.max(0, parseFloat(b[k]) || 0);
-  if (Object.values(qty).every(v => v === 0)) return res.status(400).json({ error: 'Order has no quantities' });
-
+app.post('/api/ingest/orders', async (req, res) => {
   try {
-    const r = db.prepare(`INSERT INTO orders (shop_id, order_date, espresso_lbs, drip_lbs, coldbrew_lbs, pourover_lbs, notes, placed_by, source_order_id)
-      VALUES (?,?,?,?,?,?,?,?,?)`)
-      .run(shop.id, String(b.order_date), qty.espresso_lbs, qty.drip_lbs, qty.coldbrew_lbs, qty.pourover_lbs,
-           b.notes ? String(b.notes).slice(0, 500) : null,
-           b.placed_by ? String(b.placed_by).slice(0, 64) : null,
-           b.source_order_id != null ? parseInt(b.source_order_id, 10) : null);
-    res.json({ ok: true, hub_order_id: r.lastInsertRowid });
+    const shop = shopFromBearer(req);
+    if (!shop) return res.status(401).json({ error: 'Invalid shop API key' });
+
+    const b = req.body || {};
+    if (!b.order_date) return res.status(400).json({ error: 'order_date required' });
+
+    let priced = null;
+    const legacyQty = {};
+    if (Array.isArray(b.items) && b.items.length) {
+      // Catalog order: hub validates visibility and computes prices itself.
+      try { priced = priceOrderItems(b.items, shopCatalog(shop.id)); }
+      catch (err) { return res.status(400).json({ error: err.message }); }
+    } else {
+      // Legacy pool-based order.
+      for (const k of ['espresso_lbs', 'drip_lbs', 'coldbrew_lbs', 'pourover_lbs']) legacyQty[k] = Math.max(0, parseFloat(b[k]) || 0);
+      if (Object.values(legacyQty).every(v => v === 0)) return res.status(400).json({ error: 'Order has no quantities' });
+    }
+
+    const totalLbs = priced ? priced.total_lbs
+      : Math.round(Object.values(legacyQty).reduce((s, v) => s + v, 0) * 10) / 10;
+
+    let orderId;
+    try {
+      const r = db.prepare(`INSERT INTO orders
+        (shop_id, order_date, requested_date, espresso_lbs, drip_lbs, coldbrew_lbs, pourover_lbs, total_lbs, total_cost, notes, placed_by, source_order_id)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`)
+        .run(shop.id, String(b.order_date),
+          b.requested_date ? String(b.requested_date) : null,
+          legacyQty.espresso_lbs || 0, legacyQty.drip_lbs || 0, legacyQty.coldbrew_lbs || 0, legacyQty.pourover_lbs || 0,
+          totalLbs, priced ? priced.total_cost : null,
+          b.notes ? String(b.notes).slice(0, 500) : null,
+          b.placed_by ? String(b.placed_by).slice(0, 64) : null,
+          b.source_order_id != null ? parseInt(b.source_order_id, 10) : null);
+      orderId = r.lastInsertRowid;
+    } catch (err) {
+      if (String(err.message).includes('UNIQUE')) return res.json({ ok: true, duplicate: true });
+      throw err;
+    }
+
+    if (priced) {
+      const ins = db.prepare('INSERT INTO order_items (order_id, coffee_id, coffee_name, roast, lbs, price_per_lb, line_total) VALUES (?,?,?,?,?,?,?)');
+      for (const i of priced.items) ins.run(orderId, i.coffee_id, i.coffee_name, i.roast, i.lbs, i.price_per_lb, i.line_total);
+    }
+
+    // Receipt email to the shop's registered address; copy to the roastery.
+    const order = db.prepare('SELECT * FROM orders WHERE id=?').get(orderId);
+    const items = db.prepare('SELECT * FROM order_items WHERE order_id=?').all(orderId);
+    const receipt = await sendEmail(shop.email, `Order received — ${shop.name} — ${order.order_date}`,
+      orderEmailHtml(order, items, shop, 'Order Received', 'Your order has been received by the roastery. You will get another email when it is confirmed.'));
+    if (process.env.HUB_NOTIFY_EMAIL) {
+      await sendEmail(process.env.HUB_NOTIFY_EMAIL, `New order — ${shop.name} — ${order.order_date}`,
+        orderEmailHtml(order, items, shop, 'New Order', null));
+    }
+
+    res.json({ ok: true, hub_order_id: orderId, total_lbs: totalLbs, total_cost: priced ? priced.total_cost : null, receipt });
   } catch (err) {
-    if (String(err.message).includes('UNIQUE')) return res.json({ ok: true, duplicate: true });
-    throw err;
+    console.error(err);
+    res.status(500).json({ error: err.message });
   }
+});
+
+// Shops poll this to reflect roastery confirmations in their order history.
+app.get('/api/ingest/order-status', (req, res) => {
+  const shop = shopFromBearer(req);
+  if (!shop) return res.status(401).json({ error: 'Invalid shop API key' });
+  const ids = String(req.query.ids || '').split(',').map(s => parseInt(s, 10)).filter(Number.isFinite).slice(0, 200);
+  if (!ids.length) return res.json([]);
+  const rows = db.prepare(
+    `SELECT source_order_id, status FROM orders WHERE shop_id=? AND source_order_id IN (${ids.map(() => '?').join(',')})`
+  ).all(shop.id, ...ids);
+  res.json(rows);
 });
 
 // ─── Dashboard auth gate ──────────────────────────────────────────────────────
@@ -136,9 +320,58 @@ app.use('/api', (req, res, next) => {
   res.status(401).json({ error: 'Unauthorized' });
 });
 
+// ─── Catalog management ───────────────────────────────────────────────────────
+function catalogItemFull(id) {
+  const item = db.prepare('SELECT * FROM catalog WHERE id=?').get(id);
+  if (!item) return null;
+  item.exclusive_shop_ids = db.prepare('SELECT shop_id FROM catalog_visibility WHERE coffee_id=?').all(id).map(r => r.shop_id);
+  return item;
+}
+
+app.get('/api/catalog', (req, res) => {
+  res.json(db.prepare('SELECT * FROM catalog ORDER BY active DESC, name').all().map(i => catalogItemFull(i.id)));
+});
+
+function saveCatalogBody(b) {
+  return {
+    name: String(b.name || '').trim(),
+    notes: b.notes ? String(b.notes).slice(0, 300) : null,
+    price: Math.max(0, parseFloat(b.price_per_lb) || 0),
+    badge: ['house', 'seasonal'].includes(b.badge) ? b.badge : '',
+    low_stock: b.low_stock ? 1 : 0,
+    visibility: b.visibility === 'exclusive' ? 'exclusive' : 'standard',
+    shopIds: Array.isArray(b.exclusive_shop_ids) ? b.exclusive_shop_ids.map(n => parseInt(n, 10)).filter(Number.isFinite) : [],
+    active: b.active === undefined ? 1 : (b.active ? 1 : 0),
+  };
+}
+
+app.post('/api/catalog', (req, res) => {
+  const v = saveCatalogBody(req.body || {});
+  if (v.name.length < 2) return res.status(400).json({ error: 'Coffee name required' });
+  const r = db.prepare('INSERT INTO catalog (name, notes, price_per_lb, badge, low_stock, visibility, active) VALUES (?,?,?,?,?,?,?)')
+    .run(v.name, v.notes, v.price, v.badge, v.low_stock, v.visibility, v.active);
+  const setGrants = db.prepare('INSERT INTO catalog_visibility (coffee_id, shop_id) VALUES (?,?)');
+  if (v.visibility === 'exclusive') for (const sid of v.shopIds) setGrants.run(r.lastInsertRowid, sid);
+  res.json(catalogItemFull(r.lastInsertRowid));
+});
+
+app.put('/api/catalog/:id', (req, res) => {
+  if (!db.prepare('SELECT id FROM catalog WHERE id=?').get(req.params.id)) return res.status(404).json({ error: 'Not found' });
+  const v = saveCatalogBody(req.body || {});
+  if (v.name.length < 2) return res.status(400).json({ error: 'Coffee name required' });
+  db.prepare('UPDATE catalog SET name=?, notes=?, price_per_lb=?, badge=?, low_stock=?, visibility=?, active=? WHERE id=?')
+    .run(v.name, v.notes, v.price, v.badge, v.low_stock, v.visibility, v.active, req.params.id);
+  db.prepare('DELETE FROM catalog_visibility WHERE coffee_id=?').run(req.params.id);
+  if (v.visibility === 'exclusive') {
+    const ins = db.prepare('INSERT INTO catalog_visibility (coffee_id, shop_id) VALUES (?,?)');
+    for (const sid of v.shopIds) ins.run(req.params.id, sid);
+  }
+  res.json(catalogItemFull(req.params.id));
+});
+
 // ─── Shops management ─────────────────────────────────────────────────────────
 const shopWithStats = s => ({
-  id: s.id, name: s.name, created_at: s.created_at,
+  id: s.id, name: s.name, email: s.email, created_at: s.created_at,
   orders_count: db.prepare('SELECT COUNT(*) n FROM orders WHERE shop_id=?').get(s.id).n,
   last_order_date: db.prepare('SELECT MAX(order_date) d FROM orders WHERE shop_id=?').get(s.id).d,
 });
@@ -147,13 +380,13 @@ app.get('/api/shops', (req, res) => {
   res.json(db.prepare('SELECT * FROM shops ORDER BY name').all().map(shopWithStats));
 });
 
-// Creates a shop and returns its API key ONCE — only the hash is stored.
 app.post('/api/shops', (req, res) => {
   const name = String((req.body && req.body.name) || '').trim();
+  const email = String((req.body && req.body.email) || '').trim() || null;
   if (name.length < 2) return res.status(400).json({ error: 'Shop name required (2+ characters)' });
   const apiKey = 'dose_' + crypto.randomBytes(24).toString('hex');
   try {
-    const r = db.prepare('INSERT INTO shops (name, api_key_hash) VALUES (?,?)').run(name, sha256(apiKey));
+    const r = db.prepare('INSERT INTO shops (name, email, api_key_hash) VALUES (?,?,?)').run(name, email, sha256(apiKey));
     res.json({ shop: shopWithStats(db.prepare('SELECT * FROM shops WHERE id=?').get(r.lastInsertRowid)), api_key: apiKey });
   } catch (err) {
     if (String(err.message).includes('UNIQUE')) return res.status(400).json({ error: 'A shop with that name already exists' });
@@ -161,7 +394,16 @@ app.post('/api/shops', (req, res) => {
   }
 });
 
-// Rotate a shop's API key (old key stops working immediately).
+app.put('/api/shops/:id', (req, res) => {
+  const shop = db.prepare('SELECT * FROM shops WHERE id=?').get(req.params.id);
+  if (!shop) return res.status(404).json({ error: 'Shop not found' });
+  const name = req.body.name !== undefined ? String(req.body.name).trim() : shop.name;
+  const email = req.body.email !== undefined ? (String(req.body.email).trim() || null) : shop.email;
+  if (name.length < 2) return res.status(400).json({ error: 'Shop name required' });
+  db.prepare('UPDATE shops SET name=?, email=? WHERE id=?').run(name, email, shop.id);
+  res.json(shopWithStats(db.prepare('SELECT * FROM shops WHERE id=?').get(shop.id)));
+});
+
 app.post('/api/shops/:id/rotate-key', (req, res) => {
   const shop = db.prepare('SELECT * FROM shops WHERE id=?').get(req.params.id);
   if (!shop) return res.status(404).json({ error: 'Shop not found' });
@@ -170,7 +412,48 @@ app.post('/api/shops/:id/rotate-key', (req, res) => {
   res.json({ ok: true, api_key: apiKey });
 });
 
+// ─── Per-shop pricing rules ───────────────────────────────────────────────────
+app.get('/api/shops/:id/pricing', (req, res) => {
+  const shop = db.prepare('SELECT * FROM shops WHERE id=?').get(req.params.id);
+  if (!shop) return res.status(404).json({ error: 'Shop not found' });
+  const rules = db.prepare('SELECT * FROM price_rules WHERE shop_id=?').all(shop.id);
+  const items = db.prepare('SELECT * FROM catalog WHERE active=1 ORDER BY name').all();
+  const grants = db.prepare('SELECT * FROM catalog_visibility').all();
+  const effective = shopCatalog(shop.id);
+  const effById = new Map(effective.map(i => [i.id, i.price_per_lb]));
+  res.json({
+    global_rule: rules.find(r => r.coffee_id === null) || null,
+    items: items
+      .filter(i => i.visibility !== 'exclusive' || grants.some(g => g.coffee_id === i.id && g.shop_id === shop.id))
+      .map(i => ({
+        coffee_id: i.id, name: i.name, base_price: i.price_per_lb,
+        rule: rules.find(r => r.coffee_id === i.id) || null,
+        effective_price: effById.get(i.id),
+      })),
+  });
+});
+
+// Replace-all semantics: the payload is the complete rule set for this shop.
+app.put('/api/shops/:id/pricing', (req, res) => {
+  const shop = db.prepare('SELECT * FROM shops WHERE id=?').get(req.params.id);
+  if (!shop) return res.status(404).json({ error: 'Shop not found' });
+  const { global_rule, item_rules } = req.body || {};
+  const valid = r => r && ['amount_off', 'percent_off', 'override'].includes(r.rule_type) && Number.isFinite(parseFloat(r.value));
+  db.prepare('DELETE FROM price_rules WHERE shop_id=?').run(shop.id);
+  const ins = db.prepare('INSERT INTO price_rules (shop_id, coffee_id, rule_type, value) VALUES (?,?,?,?)');
+  if (valid(global_rule)) ins.run(shop.id, null, global_rule.rule_type, parseFloat(global_rule.value));
+  for (const r of (Array.isArray(item_rules) ? item_rules : [])) {
+    if (valid(r) && Number.isFinite(parseInt(r.coffee_id, 10))) ins.run(shop.id, parseInt(r.coffee_id, 10), r.rule_type, parseFloat(r.value));
+  }
+  res.json({ ok: true });
+});
+
 // ─── Orders inbox ─────────────────────────────────────────────────────────────
+function orderFull(o) {
+  o.items = db.prepare('SELECT * FROM order_items WHERE order_id=? ORDER BY roast, coffee_name').all(o.id);
+  return o;
+}
+
 app.get('/api/orders', (req, res) => {
   const clauses = [], params = [];
   if (req.query.shop_id) { clauses.push('o.shop_id=?'); params.push(req.query.shop_id); }
@@ -179,54 +462,75 @@ app.get('/api/orders', (req, res) => {
   res.json(db.prepare(
     `SELECT o.*, s.name AS shop_name FROM orders o JOIN shops s ON s.id=o.shop_id
      ${where} ORDER BY o.received_at DESC, o.id DESC LIMIT 500`
-  ).all(...params));
+  ).all(...params).map(orderFull));
 });
 
-app.patch('/api/orders/:id', (req, res) => {
+app.patch('/api/orders/:id', async (req, res) => {
   const status = (req.body && req.body.status) || '';
   if (!['new', 'confirmed', 'delivered'].includes(status)) return res.status(400).json({ error: 'Invalid status' });
-  const r = db.prepare('UPDATE orders SET status=? WHERE id=?').run(status, req.params.id);
-  if (!r.changes) return res.status(404).json({ error: 'Order not found' });
-  res.json(db.prepare('SELECT o.*, s.name AS shop_name FROM orders o JOIN shops s ON s.id=o.shop_id WHERE o.id=?').get(req.params.id));
+  const before = db.prepare('SELECT * FROM orders WHERE id=?').get(req.params.id);
+  if (!before) return res.status(404).json({ error: 'Order not found' });
+  db.prepare('UPDATE orders SET status=? WHERE id=?').run(status, req.params.id);
+
+  // Confirming an order notifies the shop by email.
+  let email = null;
+  if (status === 'confirmed' && before.status !== 'confirmed') {
+    const shop = db.prepare('SELECT * FROM shops WHERE id=?').get(before.shop_id);
+    const order = db.prepare('SELECT * FROM orders WHERE id=?').get(req.params.id);
+    const items = db.prepare('SELECT * FROM order_items WHERE order_id=?').all(order.id);
+    email = await sendEmail(shop.email, `Order confirmed — ${shop.name} — ${order.order_date}`,
+      orderEmailHtml(order, items, shop, 'Order Confirmed', 'The roastery has confirmed your order and it is being prepared.'));
+  }
+
+  const updated = orderFull(db.prepare('SELECT o.*, s.name AS shop_name FROM orders o JOIN shops s ON s.id=o.shop_id WHERE o.id=?').get(req.params.id));
+  res.json({ ...updated, email });
 });
 
 // ─── Patterns ─────────────────────────────────────────────────────────────────
-// Per shop: totals, pool mix, ordering cadence, and a 12-week volume series.
 app.get('/api/analytics', (req, res) => {
   const shops = db.prepare('SELECT * FROM shops ORDER BY name').all();
   const out = shops.map(s => {
     const totals = db.prepare(
-      `SELECT COUNT(*) orders_count,
-              COALESCE(SUM(espresso_lbs),0) espresso, COALESCE(SUM(drip_lbs),0) drip,
-              COALESCE(SUM(coldbrew_lbs),0) coldbrew, COALESCE(SUM(pourover_lbs),0) pourover,
+      `SELECT COUNT(*) orders_count, COALESCE(SUM(total_lbs),0) lbs, COALESCE(SUM(total_cost),0) cost,
               MIN(order_date) first_order, MAX(order_date) last_order
-       FROM orders WHERE shop_id=?`
-    ).get(s.id);
-    // Average days between orders
+       FROM orders WHERE shop_id=?`).get(s.id);
+    // Roast mix: items carry it directly; legacy pool orders map espresso→espresso, rest→filter
+    const mix = db.prepare(
+      `SELECT COALESCE(SUM(CASE WHEN roast='espresso' THEN lbs END),0) esp,
+              COALESCE(SUM(CASE WHEN roast='filter' THEN lbs END),0) flt
+       FROM order_items oi JOIN orders o ON o.id=oi.order_id WHERE o.shop_id=?`).get(s.id);
+    const legacy = db.prepare(
+      `SELECT COALESCE(SUM(espresso_lbs),0) esp, COALESCE(SUM(drip_lbs + coldbrew_lbs + pourover_lbs),0) flt
+       FROM orders WHERE shop_id=? AND id NOT IN (SELECT DISTINCT order_id FROM order_items)`).get(s.id);
+    const topCoffees = db.prepare(
+      `SELECT coffee_name, SUM(lbs) lbs FROM order_items oi JOIN orders o ON o.id=oi.order_id
+       WHERE o.shop_id=? GROUP BY coffee_name ORDER BY lbs DESC LIMIT 3`).all(s.id);
     const dates = db.prepare('SELECT DISTINCT order_date FROM orders WHERE shop_id=? ORDER BY order_date').all(s.id).map(r => r.order_date);
     let avgInterval = null;
     if (dates.length >= 2) {
       const spanDays = (new Date(dates[dates.length - 1]) - new Date(dates[0])) / 86400000;
       avgInterval = Math.round(spanDays / (dates.length - 1) * 10) / 10;
     }
-    // Weekly total lbs, last 12 weeks
     const weekly = db.prepare(
-      `SELECT strftime('%Y-%W', order_date) week,
-              COALESCE(SUM(espresso_lbs + drip_lbs + coldbrew_lbs + pourover_lbs),0) lbs
+      `SELECT strftime('%Y-%W', order_date) week, COALESCE(SUM(total_lbs),0) lbs
        FROM orders WHERE shop_id=? AND order_date >= date('now', '-84 days')
-       GROUP BY week ORDER BY week`
-    ).all(s.id);
+       GROUP BY week ORDER BY week`).all(s.id);
     return {
       shop_id: s.id, shop_name: s.name,
       orders_count: totals.orders_count,
-      total_lbs: Math.round((totals.espresso + totals.drip + totals.coldbrew + totals.pourover) * 10) / 10,
-      by_pool: { espresso: totals.espresso, drip: totals.drip, coldbrew: totals.coldbrew, pourover: totals.pourover },
+      total_lbs: Math.round(totals.lbs * 10) / 10,
+      total_cost: Math.round(totals.cost * 100) / 100,
+      roast_mix: {
+        espresso: Math.round((mix.esp + legacy.esp) * 10) / 10,
+        filter: Math.round((mix.flt + legacy.flt) * 10) / 10,
+      },
+      top_coffees: topCoffees.map(t => ({ name: t.coffee_name, lbs: Math.round(t.lbs * 10) / 10 })),
       first_order: totals.first_order, last_order: totals.last_order,
       avg_interval_days: avgInterval,
       weekly,
     };
   });
-  res.json(out);
+  res.json({ currency: CURRENCY, shops: out });
 });
 
 // ─── Static dashboard ────────────────────────────────────────────────────────

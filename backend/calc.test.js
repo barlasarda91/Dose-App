@@ -1,6 +1,6 @@
 const { test } = require('node:test');
 const assert = require('node:assert/strict');
-const { LBS_TO_GRAMS, aggregateOrders, calcCoffeeStock, calcEfficiency, suggestOrderLbs } = require('./calc');
+const { LBS_TO_GRAMS, aggregateOrders, calcCoffeeStock, calcEfficiency, suggestOrderLbs, priceItemsFromCatalog } = require('./calc');
 
 // ─── aggregateOrders ──────────────────────────────────────────────────────────
 
@@ -104,4 +104,26 @@ test('suggestOrderLbs orders the 7-day burn minus expected remaining, rounded up
 test('suggestOrderLbs never goes negative and survives missing remaining', () => {
   assert.equal(suggestOrderLbs({ usedGrams: 700, days: 7, expectedRemainingGrams: 99999 }), 0);
   assert.equal(suggestOrderLbs({ usedGrams: 0, days: 0, expectedRemainingGrams: null }), 0);
+});
+
+// ─── priceItemsFromCatalog ────────────────────────────────────────────────────
+
+test('priceItemsFromCatalog prices lines and totals from the hub catalog', () => {
+  const catalog = [
+    { id: 1, name: 'Blend', price_per_lb: 12.40 },
+    { id: 2, name: 'Yirgacheffe', price_per_lb: 16.80 },
+  ];
+  const { items, total_lbs, total_cost } = priceItemsFromCatalog(
+    [{ coffee_id: 1, roast: 'espresso', lbs: 15 }, { coffee_id: 2, roast: 'filter', lbs: 10 }], catalog);
+  assert.equal(items[0].line_total, 186.00);
+  assert.equal(items[1].line_total, 168.00);
+  assert.equal(total_lbs, 25);
+  assert.equal(total_cost, 354.00);
+});
+
+test('priceItemsFromCatalog rejects unknown coffees and bad input', () => {
+  const catalog = [{ id: 1, name: 'Blend', price_per_lb: 12 }];
+  assert.throws(() => priceItemsFromCatalog([{ coffee_id: 99, roast: 'filter', lbs: 5 }], catalog), /price list/);
+  assert.throws(() => priceItemsFromCatalog([{ coffee_id: 1, roast: 'light', lbs: 5 }], catalog), /roast/);
+  assert.throws(() => priceItemsFromCatalog([], catalog), /no items/);
 });
