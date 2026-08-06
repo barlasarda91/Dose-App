@@ -332,12 +332,14 @@ app.get('/api/catalog', (req, res) => {
   res.json(db.prepare('SELECT * FROM catalog ORDER BY active DESC, name').all().map(i => catalogItemFull(i.id)));
 });
 
+const BADGES = ['Blend', 'Single Origin', 'Single Farm', 'Single Lot', 'Decaf'];
+
 function saveCatalogBody(b) {
   return {
     name: String(b.name || '').trim(),
     notes: b.notes ? String(b.notes).slice(0, 300) : null,
     price: Math.max(0, parseFloat(b.price_per_lb) || 0),
-    badge: ['house', 'seasonal'].includes(b.badge) ? b.badge : '',
+    badge: BADGES.includes(b.badge) ? b.badge : '',
     low_stock: b.low_stock ? 1 : 0,
     visibility: b.visibility === 'exclusive' ? 'exclusive' : 'standard',
     shopIds: Array.isArray(b.exclusive_shop_ids) ? b.exclusive_shop_ids.map(n => parseInt(n, 10)).filter(Number.isFinite) : [],

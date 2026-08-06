@@ -153,8 +153,8 @@
           <div><label class="lbl">Base Price / lb</label><input id="c-price" type="number" step="0.01" value="${it.price_per_lb}" style="width:110px"></div>
           <div><label class="lbl">Badge</label><select id="c-badge">
             <option value="" ${!it.badge ? 'selected' : ''}>None</option>
-            <option value="house" ${it.badge === 'house' ? 'selected' : ''}>House</option>
-            <option value="seasonal" ${it.badge === 'seasonal' ? 'selected' : ''}>Seasonal</option>
+            ${['Blend', 'Single Origin', 'Single Farm', 'Single Lot', 'Decaf'].map(b =>
+              `<option value="${b}" ${it.badge === b ? 'selected' : ''}>${b}</option>`).join('')}
           </select></div>
           <div><label class="lbl">Flags</label><div style="display:flex;gap:12px;padding:8px 0;font-size:10px">
             <label><input type="checkbox" id="c-low" ${it.low_stock ? 'checked' : ''}> Low stock</label>
@@ -202,8 +202,7 @@
     function drawList() {
       if (!items.length) { listEl.innerHTML = '<div class="empty">No coffees yet — add your first above.</div>'; return; }
       const badge = i => [
-        i.badge === 'house' ? '<span class="badge seasonal">House</span>' : '',
-        i.badge === 'seasonal' ? '<span class="badge seasonal">Seasonal</span>' : '',
+        i.badge ? `<span class="badge seasonal">${esc(i.badge)}</span>` : '',
         i.low_stock ? '<span class="badge low">Low stock</span>' : '',
         !i.active ? '<span class="badge">Archived</span>' : '',
       ].join('');
