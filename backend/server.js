@@ -71,6 +71,15 @@ db.exec(`
     value TEXT NOT NULL
   );
 
+  CREATE TABLE IF NOT EXISTS users (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    username TEXT NOT NULL UNIQUE,
+    password_hash TEXT NOT NULL,
+    salt TEXT NOT NULL,
+    role TEXT NOT NULL DEFAULT 'user' CHECK(role IN ('admin','user')),
+    created_at TEXT DEFAULT (datetime('now'))
+  );
+
   CREATE TABLE IF NOT EXISTS sessions (
     token TEXT PRIMARY KEY,
     created_at TEXT DEFAULT (datetime('now'))
@@ -103,11 +112,15 @@ function getSecret(settingKey, envName) {
 }
 
 // ─── Auth ─────────────────────────────────────────────────────────────────────
-// Password is always required. On first run the app asks the user to create
-// one (POST /api/setup); a DOSE_PASSWORD env var, if present, seeds it
-// automatically so existing deployments never see the setup screen.
-// Login exchanges the password for a random session token; only the salted
-// scrypt hash of the password is ever stored.
+// Real user accounts with roles ('admin' | 'user'). There is no
+// self-registration: the one-time setup screen creates the ADMIN account
+// (done by whoever provisions the deployment, before clients get the URL),
+// and only admins can create further accounts. Passwords are stored as
+// salted scrypt hashes; login exchanges credentials for a random session
+// token tied to the user.
+
+// Older databases have a sessions table without user_id — add it in place.
+try { db.exec('ALTER TABLE sessions ADD COLUMN user_id INTEGER'); } catch { /* already present */ }
 
 function hashPassword(password, saltHex) {
   const salt = saltHex ? Buffer.from(saltHex, 'hex') : crypto.randomBytes(16);
@@ -115,33 +128,48 @@ function hashPassword(password, saltHex) {
   return { salt: salt.toString('hex'), hash: hash.toString('hex') };
 }
 
-function setPassword(password) {
+const USERNAME_RE = /^[a-z0-9][a-z0-9._-]{2,31}$/;
+const normUsername = u => String(u || '').toLowerCase().trim();
+const publicUser = u => ({ id: u.id, username: u.username, role: u.role, created_at: u.created_at });
+
+function createUser(username, password, role) {
   const { salt, hash } = hashPassword(password);
-  setSetting('auth_salt', salt);
-  setSetting('auth_password_hash', hash);
-  db.prepare('DELETE FROM sessions').run(); // invalidate existing logins
+  const r = db.prepare('INSERT INTO users (username, password_hash, salt, role) VALUES (?,?,?,?)')
+    .run(normUsername(username), hash, salt, role);
+  return db.prepare('SELECT * FROM users WHERE id=?').get(r.lastInsertRowid);
 }
 
-function verifyPassword(password) {
-  const cfg = getSettings();
-  if (!cfg.auth_password_hash || !cfg.auth_salt) return false;
-  const { hash } = hashPassword(password, cfg.auth_salt);
-  return crypto.timingSafeEqual(Buffer.from(hash, 'hex'), Buffer.from(cfg.auth_password_hash, 'hex'));
+function verifyUser(username, password) {
+  const u = db.prepare('SELECT * FROM users WHERE username=?').get(normUsername(username));
+  if (!u) return null;
+  const { hash } = hashPassword(password, u.salt);
+  return crypto.timingSafeEqual(Buffer.from(hash, 'hex'), Buffer.from(u.password_hash, 'hex')) ? u : null;
 }
 
-function passwordConfigured() {
-  return !!getSettings().auth_password_hash;
+function usersExist() {
+  return db.prepare('SELECT COUNT(*) AS n FROM users').get().n > 0;
 }
 
-function issueToken() {
+function issueToken(userId) {
   const token = crypto.randomBytes(32).toString('hex');
-  db.prepare('INSERT INTO sessions (token) VALUES (?)').run(token);
+  db.prepare('INSERT INTO sessions (token, user_id) VALUES (?,?)').run(token, userId);
   return token;
 }
 
-if (!passwordConfigured() && process.env.DOSE_PASSWORD) {
-  setPassword(process.env.DOSE_PASSWORD);
-  console.log('Seeded password from DOSE_PASSWORD env var');
+// One-time migrations into the users table:
+//  - a legacy shared password (settings) becomes the 'admin' account
+//  - otherwise DOSE_PASSWORD / ADMIN_USERNAME env vars seed the admin
+if (!usersExist()) {
+  const cfg = getSettings();
+  if (cfg.auth_password_hash && cfg.auth_salt) {
+    db.prepare('INSERT INTO users (username, password_hash, salt, role) VALUES (?,?,?,?)')
+      .run('admin', cfg.auth_password_hash, cfg.auth_salt, 'admin');
+    db.prepare("DELETE FROM settings WHERE key IN ('auth_password_hash','auth_salt')").run();
+    console.log("Migrated shared password to user 'admin' — log in as admin with the same password");
+  } else if (process.env.DOSE_PASSWORD) {
+    createUser(process.env.ADMIN_USERNAME || 'admin', process.env.DOSE_PASSWORD, 'admin');
+    console.log(`Seeded admin account '${process.env.ADMIN_USERNAME || 'admin'}' from env`);
+  }
 }
 
 const OPEN_PATHS = new Set(['/login', '/setup', '/auth-status']);
@@ -149,36 +177,94 @@ const OPEN_PATHS = new Set(['/login', '/setup', '/auth-status']);
 app.use('/api', (req, res, next) => {
   if (OPEN_PATHS.has(req.path)) return next();
   const token = req.get('x-dose-key') || '';
-  if (token && db.prepare('SELECT token FROM sessions WHERE token=?').get(token)) return next();
+  const user = token && db.prepare(
+    'SELECT u.id, u.username, u.role FROM sessions s JOIN users u ON u.id = s.user_id WHERE s.token=?'
+  ).get(token);
+  if (user) { req.user = user; return next(); }
   res.status(401).json({ error: 'Unauthorized' });
 });
 
+function requireAdmin(req, res, next) {
+  if (req.user && req.user.role === 'admin') return next();
+  res.status(403).json({ error: 'Admin access required' });
+}
+
 app.get('/api/auth-status', (req, res) => {
-  res.json({ setup_required: !passwordConfigured() });
+  res.json({ setup_required: !usersExist() });
 });
 
+// First run only: create the admin account.
 app.post('/api/setup', (req, res) => {
-  if (passwordConfigured()) return res.status(400).json({ error: 'Password already set — use login' });
-  const password = (req.body && req.body.password) || '';
-  if (String(password).length < 6) return res.status(400).json({ error: 'Password must be at least 6 characters' });
-  setPassword(password);
-  res.json({ ok: true, token: issueToken() });
+  if (usersExist()) return res.status(400).json({ error: 'Already set up — use login' });
+  const { username, password } = req.body || {};
+  const uname = normUsername(username);
+  if (!USERNAME_RE.test(uname)) return res.status(400).json({ error: 'Username: 3–32 chars, letters/numbers/._- only' });
+  if (String(password || '').length < 6) return res.status(400).json({ error: 'Password must be at least 6 characters' });
+  const u = createUser(uname, password, 'admin');
+  res.json({ ok: true, token: issueToken(u.id), user: publicUser(u) });
 });
 
 app.post('/api/login', (req, res) => {
-  if (!passwordConfigured()) return res.status(409).json({ error: 'Setup required' });
-  if (verifyPassword((req.body && req.body.password) || '')) {
-    return res.json({ ok: true, token: issueToken() });
-  }
-  res.status(401).json({ error: 'Wrong password' });
+  if (!usersExist()) return res.status(409).json({ error: 'Setup required' });
+  const { username, password } = req.body || {};
+  const u = verifyUser(username, password || '');
+  if (!u) return res.status(401).json({ error: 'Wrong username or password' });
+  res.json({ ok: true, token: issueToken(u.id), user: publicUser(u) });
 });
 
+app.get('/api/me', (req, res) => res.json(req.user));
+
+// Change your own password; signs out your other sessions.
 app.post('/api/change-password', (req, res) => {
   const { current_password, new_password } = req.body || {};
-  if (!verifyPassword(current_password || '')) return res.status(401).json({ error: 'Current password is wrong' });
+  const u = db.prepare('SELECT * FROM users WHERE id=?').get(req.user.id);
+  if (!verifyUser(u.username, current_password || '')) return res.status(401).json({ error: 'Current password is wrong' });
   if (String(new_password || '').length < 6) return res.status(400).json({ error: 'New password must be at least 6 characters' });
-  setPassword(new_password);
-  res.json({ ok: true, token: issueToken() }); // fresh token — old sessions are now invalid
+  const { salt, hash } = hashPassword(new_password);
+  db.prepare('UPDATE users SET password_hash=?, salt=? WHERE id=?').run(hash, salt, u.id);
+  db.prepare('DELETE FROM sessions WHERE user_id=?').run(u.id);
+  res.json({ ok: true, token: issueToken(u.id) });
+});
+
+// ─── User management (admin only) ────────────────────────────────────────────
+app.get('/api/users', requireAdmin, (req, res) => {
+  res.json(db.prepare('SELECT id, username, role, created_at FROM users ORDER BY username').all());
+});
+
+app.post('/api/users', requireAdmin, (req, res) => {
+  const { username, password, role } = req.body || {};
+  const uname = normUsername(username);
+  if (!USERNAME_RE.test(uname)) return res.status(400).json({ error: 'Username: 3–32 chars, letters/numbers/._- only' });
+  if (String(password || '').length < 6) return res.status(400).json({ error: 'Password must be at least 6 characters' });
+  const r = role === 'admin' ? 'admin' : 'user';
+  try {
+    res.json(publicUser(createUser(uname, password, r)));
+  } catch (err) {
+    if (String(err.message).includes('UNIQUE')) return res.status(400).json({ error: 'Username already exists' });
+    throw err;
+  }
+});
+
+app.post('/api/users/:id/reset-password', requireAdmin, (req, res) => {
+  const target = db.prepare('SELECT * FROM users WHERE id=?').get(req.params.id);
+  if (!target) return res.status(404).json({ error: 'User not found' });
+  const { new_password } = req.body || {};
+  if (String(new_password || '').length < 6) return res.status(400).json({ error: 'Password must be at least 6 characters' });
+  const { salt, hash } = hashPassword(new_password);
+  db.prepare('UPDATE users SET password_hash=?, salt=? WHERE id=?').run(hash, salt, target.id);
+  db.prepare('DELETE FROM sessions WHERE user_id=?').run(target.id); // sign them out everywhere
+  res.json({ ok: true });
+});
+
+app.delete('/api/users/:id', requireAdmin, (req, res) => {
+  const target = db.prepare('SELECT * FROM users WHERE id=?').get(req.params.id);
+  if (!target) return res.status(404).json({ error: 'User not found' });
+  if (target.id === req.user.id) return res.status(400).json({ error: 'You cannot delete your own account' });
+  const admins = db.prepare("SELECT COUNT(*) AS n FROM users WHERE role='admin'").get().n;
+  if (target.role === 'admin' && admins <= 1) return res.status(400).json({ error: 'Cannot delete the last admin' });
+  db.prepare('DELETE FROM sessions WHERE user_id=?').run(target.id);
+  db.prepare('DELETE FROM users WHERE id=?').run(target.id);
+  res.json({ success: true });
 });
 
 // ─── Settings ─────────────────────────────────────────────────────────────────
@@ -196,16 +282,19 @@ app.get('/api/settings', (req, res) => {
   s.resend_configured = !!getSecret('resend_api_key', 'RESEND_API_KEY');
   s.resend_source = (cfg.resend_api_key || '').trim() ? 'settings'
     : (process.env.RESEND_API_KEY ? 'env' : null);
-  s.password_protected = passwordConfigured();
+  s.password_protected = true; // login is always required
   res.json(s);
 });
 
 app.post('/api/settings', (req, res) => {
+  // Day-to-day settings are open to any user; credentials are admin-only.
+  const ADMIN_ONLY = [...SECRET_SETTINGS, 'order_email_to', 'order_email_from', 'square_location_id'];
+  if (ADMIN_ONLY.some(k => req.body[k] !== undefined) && req.user.role !== 'admin')
+    return res.status(403).json({ error: 'Admin access required to change credentials' });
   const allowed = [
-    'alt_milk_ml_per_modifier', 'square_location_id',
+    'alt_milk_ml_per_modifier',
     'numilk_oat_liters_per_day', 'numilk_almond_liters_per_day',
-    'shop_name', 'order_email_to', 'order_email_from',
-    ...SECRET_SETTINGS,
+    'shop_name', ...ADMIN_ONLY,
   ];
   for (const key of allowed) {
     if (req.body[key] !== undefined) setSetting(key, String(req.body[key]).trim());
