@@ -70,11 +70,69 @@ tr:last-child td{border-bottom:none}
 .pool-mix>div{height:100%}
 .legend{display:flex;gap:12px;font-size:9px;color:var(--drift);margin-top:6px;flex-wrap:wrap}
 .dot{display:inline-block;width:8px;height:8px;margin-right:4px}
-@media(max-width:640px){.page{padding:24px 16px 60px}.nav{padding:0 16px}}
+/* Fulfillment */
+.summary{display:flex;gap:36px;flex-wrap:wrap;border:1px solid var(--linen);padding:18px 22px;margin-bottom:20px;align-items:baseline}
+.s-num{font-family:var(--serif);font-size:30px}
+.s-num span{font-size:14px}
+.s-lbl{font-size:8px;letter-spacing:.22em;text-transform:uppercase;color:var(--drift)}
+.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(370px,1fr));gap:16px}
+.order-card{background:var(--parch);border:1px solid var(--linen)}
+.order-card.complete{border-color:var(--olive)}
+.oc-head{display:flex;justify-content:space-between;align-items:baseline;gap:10px;padding:14px 18px;border-bottom:1px solid var(--linen);background:var(--stone)}
+.oc-shop{font-family:var(--serif);font-size:16px}
+.oc-meta{font-size:9px;color:var(--drift)}
+.oc-meta b{color:var(--warn);font-weight:400}
+.pick{padding:8px 18px 4px}
+.pick-row{display:flex;align-items:center;gap:12px;padding:8px 0;border-bottom:1px solid rgba(184,175,163,.35);font-size:11px;cursor:pointer}
+.pick-row:last-child{border-bottom:none}
+.pick-row input[type=checkbox]{width:17px;height:17px;accent-color:#6B6E4A;cursor:pointer;flex-shrink:0}
+.pick-row.await{cursor:default}
+.pick-row.await .pick-name,.pick-row.await .pick-qty,.pick-row.await .pick-name small{color:var(--linen)}
+.pick-row.done .pick-name,.pick-row.done .pick-qty,.pick-row.done .pick-name small{color:var(--linen)}
+.pick-name{flex:1}
+.pick-name small{display:block;font-size:9px;color:var(--drift)}
+.pick-qty{white-space:nowrap;color:var(--ink);font-weight:400}
+.pick-qty span{color:var(--drift);font-weight:300}
+.awaitlbl{font-size:8px;letter-spacing:.12em;text-transform:uppercase;color:var(--warn);border:1px solid var(--warn);padding:2px 6px;white-space:nowrap}
+.readylbl{font-size:8px;letter-spacing:.12em;text-transform:uppercase;color:var(--olive);white-space:nowrap}
+.oc-notes{padding:8px 18px;font-size:10px;color:var(--warn);border-top:1px solid var(--linen)}
+.oc-foot{display:flex;justify-content:flex-end;align-items:center;gap:8px;padding:12px 18px;border-top:1px solid var(--linen)}
+.prog{flex:1;height:8px;background:var(--stone);border:1px solid var(--linen)}
+.prog>div{height:100%;background:var(--olive);transition:width .3s ease}
+.prog-lbl{font-size:9px;color:var(--drift);white-space:nowrap}
+.prog-lbl.ok{color:var(--olive)}
+/* 4×6 packing slip */
+#slip-bg{position:fixed;inset:0;background:rgba(26,25,22,.55);display:none;align-items:flex-start;justify-content:center;padding:30px 16px;z-index:200;overflow:auto}
+#slip-wrap{display:flex;flex-direction:column;gap:10px;align-items:center}
+#slip{background:#fff;color:#1A1916;width:384px;height:576px;padding:20px 22px;font-size:10px;line-height:1.5;display:flex;flex-direction:column;overflow:hidden}
+#slip h2{font-family:var(--serif);font-size:17px;font-weight:400}
+.slip-sub{font-size:8px;letter-spacing:.16em;text-transform:uppercase;color:#7A7268;margin-bottom:10px}
+.slip-row{display:flex;justify-content:space-between;gap:8px;padding:5px 0;border-bottom:1px solid #DDD6CC}
+.slip-box{display:inline-block;width:10px;height:10px;border:1px solid #7A7268;margin-right:7px;vertical-align:-1px}
+.slip-notes{margin-top:8px;font-size:9px;color:#3D3A34}
+.slip-foot{margin-top:auto;font-size:8px;color:#7A7268;border-top:1px solid #DDD6CC;padding-top:8px;display:flex;justify-content:space-between}
+.slip-actions{display:flex;gap:8px}
+.slip-actions .btn-sm{background:var(--parch)}
+.slip-dim{font-size:9px;color:#F5EFE3;opacity:.8}
+@media print {
+  @page { size: 4in 6in; margin: 0.15in; }
+  body>*{display:none !important}
+  #slip-bg{display:flex !important;position:static;background:none;padding:0}
+  #slip-wrap .slip-actions,#slip-wrap .slip-dim{display:none !important}
+  #slip{box-shadow:none;width:100%;height:auto;min-height:5.5in;padding:0}
+}
+@media(max-width:640px){.page{padding:24px 16px 60px}.nav{padding:0 16px}.grid{grid-template-columns:1fr}}
 </style>
 </head>
 <body>
 <div id="app"></div>
-<script src="/app.js?v=3"></script>
+<div id="slip-bg"><div id="slip-wrap"><div id="slip"></div>
+  <div class="slip-actions">
+    <button class="btn-sm" onclick="window.print()">Print (4×6)</button>
+    <button class="btn-sm" onclick="document.getElementById('slip-bg').style.display='none'">Close</button>
+  </div>
+  <div class="slip-dim">4 in × 6 in label</div>
+</div></div>
+<script src="/app.js?v=4"></script>
 </body>
 </html>

@@ -41,7 +41,7 @@
   }
 
   // ─── Shell + tabs ───────────────────────────────────────────────────────────
-  const TABS = [['orders', 'Orders'], ['roast', 'Roast'], ['catalog', 'Catalog'], ['shops', 'Shops'], ['patterns', 'Patterns'], ['reports', 'Reports']];
+  const TABS = [['orders', 'Orders'], ['roast', 'Roast'], ['fulfill', 'Fulfillment'], ['catalog', 'Catalog'], ['shops', 'Shops'], ['patterns', 'Patterns'], ['reports', 'Reports']];
   function renderShell(active) {
     app.innerHTML = `
       <nav class="nav">
@@ -54,7 +54,7 @@
       <div class="page" id="page"></div>`;
     app.querySelectorAll('[data-tab]').forEach(el => el.onclick = () => renderShell(el.dataset.tab));
     document.getElementById('signout').onclick = () => { localStorage.removeItem('hub_key'); renderLogin(); };
-    ({ orders: renderOrders, roast: renderRoast, catalog: renderCatalog, shops: renderShops, patterns: renderPatterns, reports: renderReports })[active]();
+    ({ orders: renderOrders, roast: renderRoast, fulfill: renderFulfill, catalog: renderCatalog, shops: renderShops, patterns: renderPatterns, reports: renderReports })[active]();
   }
 
   const header = (eyebrow, title, sub) =>
@@ -75,7 +75,7 @@
     filters.className = 'filters';
     filters.innerHTML = `
       <select id="f-shop"><option value="">All shops</option>${shops.map(s => `<option value="${s.id}">${esc(s.name)}</option>`).join('')}</select>
-      <select id="f-status"><option value="">All statuses</option><option value="new">New</option><option value="confirmed">Confirmed</option><option value="delivered">Delivered</option></select>
+      <select id="f-status"><option value="">All statuses</option><option value="new">New</option><option value="confirmed">Confirmed</option><option value="shipped">Shipped</option><option value="delivered">Delivered</option></select>
       <span style="font-size:10px;color:var(--drift)" id="new-count"></span>
       <span class="ok" id="action-msg" style="margin:0"></span>`;
     page.appendChild(filters);
@@ -143,7 +143,7 @@
         try {
           const updated = await api(`/api/orders/${btn.dataset.adv}`, { method: 'PATCH', body: JSON.stringify({ status: btn.dataset.to }) });
           orders = orders.map(o => o.id === updated.id ? updated : o);
-          if (updated.email) flash(updated.email.sent ? `✓ Confirmation email sent to ${updated.email.to}` : `⚠ Confirmed, but email not sent: ${updated.email.reason}`);
+          if (updated.email) flash(updated.email.sent ? `✓ ${updated.status === 'shipped' ? 'Shipped' : 'Confirmation'} email sent to ${updated.email.to}` : `⚠ Status updated, but email not sent: ${updated.email.reason}`);
           draw();
         } catch (e) { alert(e.message); }
       });
@@ -167,14 +167,16 @@
   }
 
   // ─── Roast Program ──────────────────────────────────────────────────────────
-  async function renderRoast() {
+  async function renderRoast(flashMsg) {
     const page = document.getElementById('page');
-    page.innerHTML = header('Roastery', 'Roast Program', 'Everything confirmed and waiting to roast, aggregated by coffee and roast profile. Mark orders shipped from the Orders tab to clear them.');
+    page.innerHTML = header('Roastery', 'Roast Program', 'Everything confirmed and not yet roasted, aggregated per coffee — retail included, everything roasts together. Marking a coffee roasted moves it into the Fulfillment buckets.');
     let data;
     try { data = await api('/api/roast-program'); }
     catch (e) { if (e.message !== 'Unauthorized') page.innerHTML += `<div class="err">${esc(e.message)}</div>`; return; }
+    if (flashMsg) page.innerHTML += `<div class="ok" style="margin-bottom:14px">${flashMsg}</div>`;
     if (!data.batches.length) {
-      page.innerHTML += '<div class="empty">Nothing to roast — no confirmed orders waiting.</div>';
+      page.innerHTML += '<div class="empty">Nothing left to roast — roasted orders are waiting in <span class="nav-link" data-goto="fulfill" style="text-decoration:underline;cursor:pointer">Fulfillment</span>, new ones in Orders.</div>';
+      page.querySelectorAll('[data-goto]').forEach(el => el.onclick = () => renderShell(el.dataset.goto));
       return;
     }
     const breakdown = b => [
@@ -184,22 +186,174 @@
     ].filter(Boolean).join(' · ');
     page.innerHTML += `
       <div class="card" style="display:flex;gap:36px;flex-wrap:wrap;align-items:baseline">
-        <div><div class="lbl">Total to roast</div><div style="font-family:var(--serif);font-size:34px">${data.total_lbs} lbs</div></div>
-        <div class="stat-line">${data.batches.length} coffee${data.batches.length === 1 ? '' : 's'} across ${[...new Set(data.batches.flatMap(b => b.shops))].length} shop(s) — retail bags included in totals; the split matters at fulfillment, not the roaster</div>
+        <div><div class="lbl">Still to roast</div><div style="font-family:var(--serif);font-size:34px">${data.total_lbs} lbs</div></div>
+        <div class="stat-line">${data.batches.length} coffee${data.batches.length === 1 ? '' : 's'} across ${[...new Set(data.batches.flatMap(b => b.shops))].length} shop(s) — roasted coffee flows into the Fulfillment buckets automatically</div>
         ${data.legacy_orders_excluded ? `<div class="stat-line" style="color:var(--warn)">${data.legacy_orders_excluded} legacy pool order(s) not included — handle manually from Orders</div>` : ''}
       </div>
       <div class="table-wrap"><table>
-        <thead><tr><th>Coffee</th><th class="num">To Roast</th><th>Breakdown (for fulfillment)</th><th class="num">Orders</th><th>For Shops</th></tr></thead>
-        <tbody>${data.batches.map(b => `
+        <thead><tr><th>Coffee</th><th class="num">To Roast</th><th>Breakdown (for fulfillment)</th><th class="num">Orders</th><th>For Shops</th><th></th></tr></thead>
+        <tbody>${data.batches.map((b, idx) => `
           <tr>
             <td style="font-family:var(--serif);font-size:13px;color:var(--ink)">${esc(b.coffee_name)}</td>
             <td class="num" style="font-weight:500;color:var(--ink);font-size:13px">${b.lbs} lbs</td>
             <td style="color:var(--drift);font-size:10px">${breakdown(b)}</td>
             <td class="num">${b.orders_count}</td>
             <td style="color:var(--drift);font-size:10px">${b.shops.map(esc).join(', ')}</td>
+            <td class="num"><button class="btn" data-roasted="${idx}">Mark Roasted</button></td>
           </tr>`).join('')}
         </tbody></table></div>`;
+    page.querySelectorAll('[data-roasted]').forEach(btn => btn.onclick = async () => {
+      const b = data.batches[parseInt(btn.dataset.roasted, 10)];
+      btn.disabled = true;
+      try {
+        const r = await api('/api/roast-program/mark-roasted', { method: 'POST', body: JSON.stringify({ coffee_name: b.coffee_name }) });
+        const mails = (r.roasted_emails || []).map(m =>
+          m.sent ? `✉ “Roasted” email sent to ${esc(m.shop_name)}` : `⚠ ${esc(m.shop_name)} fully roasted, but email not sent: ${esc(m.reason)}`);
+        renderRoast([`☕ ${esc(b.coffee_name)} roasted — moved to the fulfillment buckets of ${r.shops.map(esc).join(', ')}.`, ...mails].join('<br>'));
+      } catch (e) { alert(e.message); btn.disabled = false; }
+    });
   }
+
+  // ─── Fulfillment ────────────────────────────────────────────────────────────
+  // Customer buckets fill as coffee comes off the roaster: items stay greyed
+  // until roasted, get checked off as they're packed, and a fully packed order
+  // ships with one click (which emails the shop).
+  async function renderFulfill() {
+    const page = document.getElementById('page');
+    page.innerHTML = header('Roastery', 'Fulfillment', "Customer buckets fill as coffee comes off the roaster — pack what's ready, print the 4×6 slip, then mark shipped.");
+    let shops = [], orders = [];
+    try { [shops, orders] = await Promise.all([api('/api/shops'), api('/api/orders')]); }
+    catch (e) { if (e.message !== 'Unauthorized') page.innerHTML += `<div class="err">${esc(e.message)}</div>`; return; }
+
+    let fShop = '', fView = 'topack';
+    const wrap = document.createElement('div');
+    page.appendChild(wrap);
+
+    const wholesaleQty = i => Number.isInteger(i.lbs / 5) && i.lbs > 0
+      ? `${i.lbs / 5} × 5 lb bags <span>(${i.lbs} lbs)</span>` : `${i.lbs} lbs`;
+    const qtyHtml = i => i.roast === 'retail' ? `${i.bags} × 12oz bags` : wholesaleQty(i);
+    const roastSub = { espresso: 'wholesale · espresso roast', filter: 'wholesale · filter roast', retail: 'retail shelf' };
+    const legacyLines = o => ['espresso_lbs', 'drip_lbs', 'coldbrew_lbs', 'pourover_lbs'].filter(f => o[f] > 0)
+      .map(f => `<div class="pick-row" style="cursor:default"><div class="pick-name">${esc(f.replace('_lbs', ''))}</div><div class="pick-qty">${o[f]} lbs</div></div>`).join('');
+
+    function draw() {
+      const toPack = orders.filter(o => o.status === 'confirmed');
+      const allItems = toPack.flatMap(o => o.items || []);
+      const ready = allItems.filter(i => i.roasted && !i.packed);
+      const awaiting = allItems.filter(i => !i.roasted);
+      const lbsReady = Math.round(ready.reduce((s, i) => s + i.lbs, 0) * 100) / 100;
+      const list = orders
+        .filter(o => fView === 'shipped' ? o.status === 'shipped' : o.status === 'confirmed')
+        .filter(o => !fShop || String(o.shop_id) === fShop)
+        .sort((a, b) => String(a.requested_date || a.order_date || '9999').localeCompare(String(b.requested_date || b.order_date || '9999')))
+        .slice(0, 60);
+
+      wrap.innerHTML = `
+        <div class="summary">
+          <div><div class="s-lbl">To Pack</div><div class="s-num">${toPack.length} <span>order${toPack.length === 1 ? '' : 's'}</span></div></div>
+          <div><div class="s-lbl">Ready to Pack</div><div class="s-num">${ready.length} <span>items · ${lbsReady} lbs</span></div></div>
+          <div><div class="s-lbl">Awaiting Roast</div><div class="s-num">${awaiting.length} <span>items</span></div></div>
+          <div class="stat-line">sorted by requested delivery — earliest first</div>
+        </div>
+        <div class="filters">
+          <select id="ff-shop"><option value="">All shops</option>${shops.map(s => `<option value="${s.id}" ${fShop === String(s.id) ? 'selected' : ''}>${esc(s.name)}</option>`).join('')}</select>
+          <select id="ff-view">
+            <option value="topack" ${fView === 'topack' ? 'selected' : ''}>To pack (confirmed)</option>
+            <option value="shipped" ${fView === 'shipped' ? 'selected' : ''}>Shipped</option>
+          </select>
+          <span class="ok" id="ff-msg" style="margin:0"></span>
+        </div>
+        <div class="grid">
+          ${list.length ? list.map(o => {
+            const items = o.items || [];
+            const done = items.filter(i => i.packed).length;
+            const complete = items.length > 0 && done === items.length;
+            return `<div class="order-card ${complete && o.status === 'confirmed' ? 'complete' : ''}">
+              <div class="oc-head">
+                <div>
+                  <div class="oc-shop">${esc(o.shop_name)}</div>
+                  <div class="oc-meta">#${o.id} · placed ${esc(o.order_date)}${o.placed_by ? ` by ${esc(o.placed_by)}` : ''} · ${o.requested_date ? `<b>requested ${esc(o.requested_date)}</b>` : 'requested —'}</div>
+                </div>
+                <span class="status ${o.status}">${o.status}</span>
+              </div>
+              <div class="pick">
+                ${items.length ? items.map(i => `
+                  <label class="pick-row ${i.roasted ? '' : 'await'} ${i.packed ? 'done' : ''}">
+                    <input type="checkbox" ${i.packed ? 'checked' : ''} ${!i.roasted || o.status !== 'confirmed' ? 'disabled' : ''} data-pack="${i.id}" data-order="${o.id}">
+                    <div class="pick-name"><span class="roast-lbl">${i.roast === 'espresso' ? 'ESP' : i.roast === 'retail' ? 'RTL' : 'FLT'}</span>${esc(i.coffee_name)}<small>${roastSub[i.roast] || ''}</small></div>
+                    <div class="pick-qty">${qtyHtml(i)}</div>
+                    ${i.roasted ? (i.packed ? '' : '<span class="readylbl">ready</span>') : '<span class="awaitlbl">awaiting roast</span>'}
+                  </label>`).join('') : legacyLines(o) || '<div class="empty" style="padding:10px 0">No line items</div>'}
+              </div>
+              ${o.notes ? `<div class="oc-notes">✎ ${esc(o.notes)}</div>` : ''}
+              <div class="oc-foot">
+                <span class="prog-lbl ${complete ? 'ok' : ''}">${items.length ? (complete ? '✓ all packed' : `${done} / ${items.length} packed`) : 'legacy order'}</span>
+                <div class="prog"><div style="width:${items.length ? done / items.length * 100 : 0}%"></div></div>
+                <button class="btn-sm" data-slip="${o.id}">Packing Slip</button>
+                ${o.status === 'confirmed' ? `<button class="btn" ${complete || !items.length ? '' : 'disabled'} data-ship="${o.id}">Mark Shipped</button>` : ''}
+              </div>
+            </div>`;
+          }).join('') : `<div class="empty" style="grid-column:1/-1">${fView === 'shipped' ? 'Nothing shipped yet.' : 'Nothing to pack — all caught up.'}</div>`}
+        </div>`;
+
+      document.getElementById('ff-shop').onchange = e => { fShop = e.target.value; draw(); };
+      document.getElementById('ff-view').onchange = e => { fView = e.target.value; draw(); };
+      const flash = text => {
+        const el = document.getElementById('ff-msg');
+        if (el) { el.innerHTML = text; setTimeout(() => { if (el.isConnected) el.innerHTML = ''; }, 8000); }
+      };
+      wrap.querySelectorAll('[data-pack]').forEach(cb => cb.onchange = async () => {
+        cb.disabled = true;
+        try {
+          const updated = await api(`/api/order-items/${cb.dataset.pack}`, { method: 'PATCH', body: JSON.stringify({ packed: cb.checked }) });
+          orders = orders.map(o => o.id === updated.id ? updated : o);
+          draw();
+        } catch (e) { alert(e.message); draw(); }
+      });
+      wrap.querySelectorAll('[data-slip]').forEach(btn => btn.onclick = () => {
+        openSlip(orders.find(o => String(o.id) === btn.dataset.slip));
+      });
+      wrap.querySelectorAll('[data-ship]').forEach(btn => btn.onclick = async () => {
+        const o = orders.find(x => String(x.id) === btn.dataset.ship);
+        const unpacked = (o.items || []).filter(i => !i.packed).length;
+        if (unpacked && !window.confirm(`${unpacked} item(s) not checked off as packed — ship anyway?`)) return;
+        btn.disabled = true;
+        try {
+          const updated = await api(`/api/orders/${o.id}`, { method: 'PATCH', body: JSON.stringify({ status: 'shipped' }) });
+          orders = orders.map(x => x.id === updated.id ? updated : x);
+          draw();
+          flash(updated.email
+            ? (updated.email.sent ? `✓ Order #${o.id} shipped — email sent to ${esc(updated.email.to)}` : `⚠ Order #${o.id} shipped, but email not sent: ${esc(updated.email.reason)}`)
+            : `✓ Order #${o.id} shipped`);
+        } catch (e) { alert(e.message); btn.disabled = false; }
+      });
+    }
+    draw();
+  }
+
+  // 4×6 packing slip — @media print in index.html prints ONLY this element.
+  function openSlip(o) {
+    if (!o) return;
+    const qty = i => i.roast === 'retail' ? `${i.bags} × 12oz`
+      : (Number.isInteger(i.lbs / 5) && i.lbs > 0 ? `${i.lbs / 5} × 5 lb` : `${i.lbs} lbs`);
+    const lines = (o.items && o.items.length)
+      ? o.items.map(i => `<div class="slip-row"><span><span class="slip-box"></span>${esc(i.coffee_name)}</span><span>${qty(i)}</span></div>`).join('')
+      : ['espresso_lbs', 'drip_lbs', 'coldbrew_lbs', 'pourover_lbs'].filter(f => o[f] > 0)
+          .map(f => `<div class="slip-row"><span><span class="slip-box"></span>${esc(f.replace('_lbs', ''))}</span><span>${o[f]} lbs</span></div>`).join('');
+    document.getElementById('slip').innerHTML = `
+      <h2>Packing Slip</h2>
+      <div class="slip-sub">Boxx Coffee Roasters Co. · Dose</div>
+      <div class="slip-row" style="border-bottom:2px solid #1A1916;font-weight:400">
+        <span>${esc(o.shop_name)}</span><span>Order #${o.id}</span>
+      </div>
+      <div class="slip-row"><span>Placed</span><span>${esc(o.order_date)}${o.placed_by ? ` by ${esc(o.placed_by)}` : ''}</span></div>
+      <div class="slip-row"><span>Requested delivery</span><span>${esc(o.requested_date || '—')}</span></div>
+      <div style="margin-top:8px">${lines}</div>
+      ${o.notes ? `<div class="slip-notes">✎ ${esc(o.notes)}</div>` : ''}
+      <div class="slip-foot"><span>Packed: ________</span><span>Checked: ________</span></div>`;
+    document.getElementById('slip-bg').style.display = 'flex';
+  }
+  document.getElementById('slip-bg').addEventListener('click', e => { if (e.target.id === 'slip-bg') e.target.style.display = 'none'; });
 
   // ─── Reports ────────────────────────────────────────────────────────────────
   async function renderReports() {

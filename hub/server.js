@@ -100,7 +100,11 @@ db.exec(`
     lbs REAL NOT NULL,
     bags INTEGER,
     price_per_lb REAL NOT NULL,
-    line_total REAL NOT NULL
+    line_total REAL NOT NULL,
+    roasted INTEGER DEFAULT 0,
+    roasted_at TEXT,
+    packed INTEGER DEFAULT 0,
+    packed_at TEXT
   );
 
   CREATE TABLE IF NOT EXISTS sessions (
@@ -119,7 +123,9 @@ for (const col of ['requested_date TEXT', 'total_lbs REAL DEFAULT 0', 'total_cos
   try { db.exec(`ALTER TABLE orders ADD COLUMN ${col}`); } catch { /* present */ }
 }
 try { db.exec('ALTER TABLE catalog ADD COLUMN retail_price REAL'); } catch { /* present */ }
-try { db.exec('ALTER TABLE order_items ADD COLUMN bags INTEGER'); } catch { /* present */ }
+for (const col of ['bags INTEGER', 'roasted INTEGER DEFAULT 0', 'roasted_at TEXT', 'packed INTEGER DEFAULT 0', 'packed_at TEXT']) {
+  try { db.exec(`ALTER TABLE order_items ADD COLUMN ${col}`); } catch { /* present */ }
+}
 
 // Widen CHECK constraints from earlier versions (SQLite requires a rebuild).
 function rebuildTable(table, needle, createSql, columns) {
@@ -152,8 +158,12 @@ rebuildTable('order_items', "'retail'", `CREATE TABLE order_items (
   lbs REAL NOT NULL,
   bags INTEGER,
   price_per_lb REAL NOT NULL,
-  line_total REAL NOT NULL
-)`, 'id, order_id, coffee_id, coffee_name, roast, lbs, bags, price_per_lb, line_total');
+  line_total REAL NOT NULL,
+  roasted INTEGER DEFAULT 0,
+  roasted_at TEXT,
+  packed INTEGER DEFAULT 0,
+  packed_at TEXT
+)`, 'id, order_id, coffee_id, coffee_name, roast, lbs, bags, price_per_lb, line_total, roasted, roasted_at, packed, packed_at');
 
 const sha256 = s => crypto.createHash('sha256').update(String(s)).digest('hex');
 const SESSION_DAYS = 30;
@@ -775,14 +785,17 @@ app.patch('/api/orders/:id', async (req, res) => {
   if (!before) return res.status(404).json({ error: 'Order not found' });
   db.prepare('UPDATE orders SET status=? WHERE id=?').run(status, req.params.id);
 
-  // Confirming an order notifies the shop by email.
+  // Confirming and shipping each notify the shop by email.
   let email = null;
-  if (status === 'confirmed' && before.status !== 'confirmed') {
+  if ((status === 'confirmed' && before.status !== 'confirmed') || (status === 'shipped' && before.status !== 'shipped')) {
     const shop = db.prepare('SELECT * FROM shops WHERE id=?').get(before.shop_id);
     const order = db.prepare('SELECT * FROM orders WHERE id=?').get(req.params.id);
     const items = db.prepare('SELECT * FROM order_items WHERE order_id=?').all(order.id);
-    email = await sendEmail(shop.email, `Order confirmed — ${shop.name} — ${order.order_date}`,
-      orderEmailHtml(order, items, shop, 'Order Confirmed', 'The roastery has confirmed your order and it is being prepared.'));
+    email = status === 'confirmed'
+      ? await sendEmail(shop.email, `Order confirmed — ${shop.name} — ${order.order_date}`,
+          orderEmailHtml(order, items, shop, 'Order Confirmed', 'The roastery has confirmed your order and it is being prepared.'))
+      : await sendEmail(shop.email, `Order shipped — ${shop.name} — ${order.order_date}`,
+          orderEmailHtml(order, items, shop, 'Order Shipped', 'Your order is packed and on the way.'));
   }
 
   const updated = orderFull(db.prepare('SELECT o.*, s.name AS shop_name FROM orders o JOIN shops s ON s.id=o.shop_id WHERE o.id=?').get(req.params.id));
@@ -833,9 +846,10 @@ app.put('/api/orders/:id/items', async (req, res) => {
 });
 
 // ─── Roast Program ────────────────────────────────────────────────────────────
-// Confirmed (not yet shipped) orders, aggregated PER COFFEE — everything gets
-// roasted together, so retail bag weight folds into the roast total. The
-// wholesale/retail breakdown is kept for the fulfillment phase.
+// Confirmed orders' UNROASTED items, aggregated PER COFFEE — everything gets
+// roasted together, so retail bag weight folds into the roast total. Marking a
+// coffee roasted moves its quantities into the fulfillment buckets; when that
+// completes an order's roasting, the shop gets the "Roasted" email.
 app.get('/api/roast-program', (req, res) => {
   const rows = db.prepare(
     `SELECT oi.coffee_name, oi.roast, SUM(oi.lbs) lbs, SUM(COALESCE(oi.bags,0)) bags,
@@ -844,7 +858,7 @@ app.get('/api/roast-program', (req, res) => {
      FROM order_items oi
      JOIN orders o ON o.id = oi.order_id
      JOIN shops s ON s.id = o.shop_id
-     WHERE o.status = 'confirmed'
+     WHERE o.status = 'confirmed' AND COALESCE(oi.roasted, 0) = 0
      GROUP BY oi.coffee_name, oi.roast`
   ).all();
   const r2 = v => Math.round(v * 100) / 100;
@@ -879,6 +893,55 @@ app.get('/api/roast-program', (req, res) => {
     total_lbs: r2(batches.reduce((s, b) => s + b.lbs, 0)),
     legacy_orders_excluded: legacy,
   });
+});
+
+// Mark every unroasted line of a coffee (across confirmed orders) as roasted.
+// Orders whose entire contents are now roasted trigger the "Roasted" email.
+app.post('/api/roast-program/mark-roasted', async (req, res) => {
+  try {
+    const coffeeName = String((req.body && req.body.coffee_name) || '').trim();
+    if (!coffeeName) return res.status(400).json({ error: 'coffee_name required' });
+    const items = db.prepare(
+      `SELECT oi.id, oi.order_id FROM order_items oi JOIN orders o ON o.id = oi.order_id
+       WHERE o.status = 'confirmed' AND oi.coffee_name = ? AND COALESCE(oi.roasted, 0) = 0`
+    ).all(coffeeName);
+    if (!items.length) return res.status(404).json({ error: `No unroasted items for "${coffeeName}"` });
+    const upd = db.prepare("UPDATE order_items SET roasted=1, roasted_at=datetime('now') WHERE id=?");
+    for (const i of items) upd.run(i.id);
+
+    const orderIds = [...new Set(items.map(i => i.order_id))];
+    const shopNames = new Set();
+    const emails = [];
+    for (const oid of orderIds) {
+      const order = db.prepare('SELECT * FROM orders WHERE id=?').get(oid);
+      const shop = db.prepare('SELECT * FROM shops WHERE id=?').get(order.shop_id);
+      shopNames.add(shop.name);
+      const left = db.prepare('SELECT COUNT(*) n FROM order_items WHERE order_id=? AND COALESCE(roasted,0)=0').get(oid).n;
+      if (left > 0) continue;
+      const its = db.prepare('SELECT * FROM order_items WHERE order_id=?').all(oid);
+      const email = await sendEmail(shop.email, `Order roasted — ${shop.name} — ${order.order_date}`,
+        orderEmailHtml(order, its, shop, 'Order Roasted',
+          'Your coffee has been roasted. Packing is next — you will get another email when your order ships.'));
+      emails.push({ order_id: oid, shop_name: shop.name, ...email });
+    }
+    res.json({ ok: true, items_roasted: items.length, orders_affected: orderIds.length, shops: [...shopNames], roasted_emails: emails });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Fulfillment pack tracking: tick items off as they are physically packed.
+app.patch('/api/order-items/:id', (req, res) => {
+  const item = db.prepare('SELECT * FROM order_items WHERE id=?').get(req.params.id);
+  if (!item) return res.status(404).json({ error: 'Item not found' });
+  const order = db.prepare('SELECT * FROM orders WHERE id=?').get(item.order_id);
+  if (order.status !== 'confirmed') return res.status(400).json({ error: 'Only items of confirmed (unshipped) orders can be packed' });
+  const packed = req.body && req.body.packed ? 1 : 0;
+  if (packed && !item.roasted) return res.status(400).json({ error: 'This coffee has not been roasted yet — mark it roasted in the Roast Program first' });
+  db.prepare("UPDATE order_items SET packed=?, packed_at=CASE WHEN ?=1 THEN datetime('now') ELSE NULL END WHERE id=?")
+    .run(packed, packed, item.id);
+  res.json(orderFull(db.prepare('SELECT o.*, s.name AS shop_name FROM orders o JOIN shops s ON s.id=o.shop_id WHERE o.id=?').get(order.id)));
 });
 
 // ─── Weekly / monthly roast reports ──────────────────────────────────────────
