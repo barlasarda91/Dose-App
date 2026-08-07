@@ -1047,6 +1047,20 @@ async function getHubCatalog(cfg, fresh = false) {
   return data;
 }
 
+// Live verification of the stored hub API key: asks the hub who this key
+// belongs to. Settings uses it to show a real verdict instead of just
+// "a key is saved".
+app.get('/api/hub-status', async (req, res) => {
+  const cfg = getSettings();
+  if (!isHubConfigured(cfg)) return res.json({ configured: false });
+  try {
+    const data = await getHubCatalog(cfg, true);
+    res.json({ configured: true, ok: true, shop_name: data.shop_name || null, items: (data.items || []).length });
+  } catch (err) {
+    res.json({ configured: true, ok: false, error: err.message });
+  }
+});
+
 app.get('/api/hub-catalog', async (req, res) => {
   const cfg = getSettings();
   const { url, key } = hubConn(cfg);
