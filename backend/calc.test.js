@@ -127,3 +127,10 @@ test('priceItemsFromCatalog rejects unknown coffees and bad input', () => {
   assert.throws(() => priceItemsFromCatalog([{ coffee_id: 1, roast: 'light', lbs: 5 }], catalog), /roast/);
   assert.throws(() => priceItemsFromCatalog([], catalog), /no items/);
 });
+
+test('priceItemsFromCatalog enforces 5-lb wholesale increments', () => {
+  const catalog = [{ id: 1, name: 'Blend', price_per_lb: 12, retail_price: 14 }];
+  assert.throws(() => priceItemsFromCatalog([{ coffee_id: 1, roast: 'filter', lbs: 3 }], catalog), /multiples of 5/);
+  const ok = priceItemsFromCatalog([{ coffee_id: 1, roast: 'filter', lbs: 10 }, { coffee_id: 1, roast: 'retail', bags: 2 }], catalog);
+  assert.equal(ok.total_lbs, 11.5);
+});

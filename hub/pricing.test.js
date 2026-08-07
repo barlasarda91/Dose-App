@@ -84,3 +84,13 @@ test('retail bag lines: priced per bag, 0.75 lb each, only when offered', () => 
   assert.throws(() => priceOrderItems([{ coffee_id: 11, roast: 'retail', bags: 2 }], cat), /not offered as retail/);
   assert.throws(() => priceOrderItems([{ coffee_id: 10, roast: 'retail', bags: 0 }], cat), /bag count/);
 });
+
+test('wholesale quantities must be multiples of 5 lbs; retail bags are free', () => {
+  const cat = catalogForShop([
+    { id: 20, name: 'Inc Blend', notes: '', badge: null, low_stock: 0, price_per_lb: 12, retail_price: 14, visibility: 'standard', active: 1 },
+  ], 1, [], []);
+  assert.throws(() => priceOrderItems([{ coffee_id: 20, roast: 'espresso', lbs: 12 }], cat), /multiples of 5/);
+  assert.throws(() => priceOrderItems([{ coffee_id: 20, roast: 'filter', lbs: 7.5 }], cat), /multiples of 5/);
+  const ok = priceOrderItems([{ coffee_id: 20, roast: 'espresso', lbs: 25 }, { coffee_id: 20, roast: 'retail', bags: 3 }], cat);
+  assert.equal(ok.total_lbs, 27.25);
+});

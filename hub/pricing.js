@@ -80,6 +80,8 @@ function priceOrderItems(rawItems, shopCatalog) {
     if (!roast) throw new Error(`Invalid roast for ${coffee.name} — must be espresso, filter, or retail`);
     const lbs = Math.round((parseFloat(raw.lbs) || 0) * 10) / 10;
     if (lbs <= 0) throw new Error(`Invalid quantity for ${coffee.name}`);
+    if (Math.abs(lbs / 5 - Math.round(lbs / 5)) > 1e-9)
+      throw new Error(`Wholesale orders are in multiples of 5 lbs — ${coffee.name} has ${lbs} lbs`);
     const line_total = Math.round(lbs * coffee.price_per_lb * 100) / 100;
     return { coffee_id: coffee.id, coffee_name: coffee.name, roast, bags: null, lbs, price_per_lb: coffee.price_per_lb, line_total };
   });

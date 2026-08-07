@@ -85,6 +85,12 @@ export default function Order() {
 
   const setQ = (id, roast) => e => { setQty(p => ({ ...p, [`${id}:${roast}`]: e.target.value })); setDupNote(null); };
 
+  // Wholesale ships in 5-lb multiples; retail in whole bags.
+  const invalidLines = lines.filter(l => l.roast !== 'retail' && Math.abs(l.lbs / 5 - Math.round(l.lbs / 5)) > 1e-9);
+  const incrementError = invalidLines.length
+    ? `Wholesale quantities must be multiples of 5 lbs — check ${invalidLines.map(l => `${l.coffee_name} (${l.lbs} lbs)`).join(', ')}`
+    : null;
+
   const payloadItems = () => lines.map(l =>
     l.roast === 'retail'
       ? { coffee_id: l.coffee_id, roast: 'retail', bags: l.bags }
@@ -109,6 +115,7 @@ export default function Order() {
 
   async function send() {
     if (!hasLines || sending) return;
+    if (incrementError) { setError(incrementError); return; }
     setSending(true); setResult(null); setError(null);
     try {
       const data = await apiJson('/api/orders', {
@@ -128,6 +135,7 @@ export default function Order() {
 
   async function saveStanding() {
     if (!hasLines) return;
+    if (incrementError) { setSoMsg({ ok: false, text: incrementError }); return; }
     setSoMsg(null);
     try {
       const data = await apiJson('/api/standing-orders', {
@@ -192,8 +200,8 @@ export default function Order() {
                 <tr>
                   <th style={{ minWidth: 200 }}>Coffee</th>
                   <th style={{ textAlign: 'right' }}>Price / lb</th>
-                  <th style={{ textAlign: 'right' }}>Espresso Roast (lbs)</th>
-                  <th style={{ textAlign: 'right' }}>Filter Roast (lbs)</th>
+                  <th style={{ textAlign: 'right' }}>Espresso Roast (lbs, ×5)</th>
+                  <th style={{ textAlign: 'right' }}>Filter Roast (lbs, ×5)</th>
                   {anyRetail && <th style={{ textAlign: 'right' }}>12oz Bags</th>}
                   <th style={{ textAlign: 'right' }}>Line Total</th>
                 </tr>
@@ -217,11 +225,11 @@ export default function Order() {
                         {it.retail_price != null && <div style={{ fontSize: 9, color: 'var(--drift)' }}>{money(it.retail_price)}/bag</div>}
                       </td>
                       <td style={{ textAlign: 'right' }}>
-                        <input type="number" min="0" step="1" placeholder="0" style={{ width: 72, textAlign: 'right' }}
+                        <input type="number" min="0" step="5" placeholder="0" style={{ width: 72, textAlign: 'right' }}
                           value={qty[`${it.id}:espresso`] || ''} onChange={setQ(it.id, 'espresso')} />
                       </td>
                       <td style={{ textAlign: 'right' }}>
-                        <input type="number" min="0" step="1" placeholder="0" style={{ width: 72, textAlign: 'right' }}
+                        <input type="number" min="0" step="5" placeholder="0" style={{ width: 72, textAlign: 'right' }}
                           value={qty[`${it.id}:filter`] || ''} onChange={setQ(it.id, 'filter')} />
                       </td>
                       {anyRetail && (
