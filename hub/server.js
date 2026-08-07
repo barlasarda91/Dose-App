@@ -833,31 +833,50 @@ app.put('/api/orders/:id/items', async (req, res) => {
 });
 
 // ─── Roast Program ────────────────────────────────────────────────────────────
-// Confirmed (not yet shipped) orders, aggregated by coffee × roast profile:
-// what the roaster needs to roast today.
+// Confirmed (not yet shipped) orders, aggregated PER COFFEE — everything gets
+// roasted together, so retail bag weight folds into the roast total. The
+// wholesale/retail breakdown is kept for the fulfillment phase.
 app.get('/api/roast-program', (req, res) => {
   const rows = db.prepare(
     `SELECT oi.coffee_name, oi.roast, SUM(oi.lbs) lbs, SUM(COALESCE(oi.bags,0)) bags,
-            COUNT(DISTINCT o.id) orders_count,
+            GROUP_CONCAT(DISTINCT o.id) order_ids,
             GROUP_CONCAT(DISTINCT s.name) shop_names
      FROM order_items oi
      JOIN orders o ON o.id = oi.order_id
      JOIN shops s ON s.id = o.shop_id
      WHERE o.status = 'confirmed'
-     GROUP BY oi.coffee_name, oi.roast
-     ORDER BY oi.coffee_name, oi.roast`
+     GROUP BY oi.coffee_name, oi.roast`
   ).all();
+  const r2 = v => Math.round(v * 100) / 100;
+  const byCoffee = new Map();
+  for (const r of rows) {
+    const c = byCoffee.get(r.coffee_name) || {
+      coffee_name: r.coffee_name, lbs: 0,
+      espresso_lbs: 0, filter_lbs: 0, retail_lbs: 0, retail_bags: 0,
+      orderIds: new Set(), shops: new Set(),
+    };
+    c.lbs += r.lbs;
+    if (r.roast === 'espresso') c.espresso_lbs += r.lbs;
+    else if (r.roast === 'filter') c.filter_lbs += r.lbs;
+    else { c.retail_lbs += r.lbs; c.retail_bags += r.bags; }
+    String(r.order_ids || '').split(',').filter(Boolean).forEach(id => c.orderIds.add(id));
+    String(r.shop_names || '').split(',').filter(Boolean).forEach(s => c.shops.add(s));
+    byCoffee.set(r.coffee_name, c);
+  }
+  const batches = [...byCoffee.values()]
+    .map(c => ({
+      coffee_name: c.coffee_name,
+      lbs: r2(c.lbs),
+      espresso_lbs: r2(c.espresso_lbs), filter_lbs: r2(c.filter_lbs),
+      retail_lbs: r2(c.retail_lbs), retail_bags: c.retail_bags,
+      orders_count: c.orderIds.size,
+      shops: [...c.shops],
+    }))
+    .sort((a, b) => a.coffee_name.localeCompare(b.coffee_name));
   const legacy = db.prepare("SELECT COUNT(*) n FROM orders WHERE status='confirmed' AND id NOT IN (SELECT DISTINCT order_id FROM order_items)").get().n;
   res.json({
-    batches: rows.map(r => ({
-      coffee_name: r.coffee_name,
-      roast: r.roast,
-      lbs: Math.round(r.lbs * 100) / 100,
-      bags: r.roast === 'retail' ? r.bags : null,
-      orders_count: r.orders_count,
-      shops: String(r.shop_names || '').split(','),
-    })),
-    total_lbs: Math.round(rows.reduce((s, r) => s + r.lbs, 0) * 100) / 100,
+    batches,
+    total_lbs: r2(batches.reduce((s, b) => s + b.lbs, 0)),
     legacy_orders_excluded: legacy,
   });
 });

@@ -177,20 +177,24 @@
       page.innerHTML += '<div class="empty">Nothing to roast — no confirmed orders waiting.</div>';
       return;
     }
-    const roastLabel = r => r === 'espresso' ? 'Espresso Roast' : r === 'retail' ? 'Retail (12oz bags)' : 'Filter Roast';
+    const breakdown = b => [
+      b.espresso_lbs > 0 ? `Espresso ${b.espresso_lbs} lbs` : null,
+      b.filter_lbs > 0 ? `Filter ${b.filter_lbs} lbs` : null,
+      b.retail_lbs > 0 ? `Retail ${b.retail_lbs} lbs (${b.retail_bags} × 12oz)` : null,
+    ].filter(Boolean).join(' · ');
     page.innerHTML += `
       <div class="card" style="display:flex;gap:36px;flex-wrap:wrap;align-items:baseline">
         <div><div class="lbl">Total to roast</div><div style="font-family:var(--serif);font-size:34px">${data.total_lbs} lbs</div></div>
-        <div class="stat-line">${data.batches.length} batch${data.batches.length === 1 ? '' : 'es'} across ${[...new Set(data.batches.flatMap(b => b.shops))].length} shop(s)</div>
+        <div class="stat-line">${data.batches.length} coffee${data.batches.length === 1 ? '' : 's'} across ${[...new Set(data.batches.flatMap(b => b.shops))].length} shop(s) — retail bags included in totals; the split matters at fulfillment, not the roaster</div>
         ${data.legacy_orders_excluded ? `<div class="stat-line" style="color:var(--warn)">${data.legacy_orders_excluded} legacy pool order(s) not included — handle manually from Orders</div>` : ''}
       </div>
       <div class="table-wrap"><table>
-        <thead><tr><th>Coffee</th><th>Roast Profile</th><th class="num">To Roast</th><th class="num">Orders</th><th>For Shops</th></tr></thead>
+        <thead><tr><th>Coffee</th><th class="num">To Roast</th><th>Breakdown (for fulfillment)</th><th class="num">Orders</th><th>For Shops</th></tr></thead>
         <tbody>${data.batches.map(b => `
           <tr>
             <td style="font-family:var(--serif);font-size:13px;color:var(--ink)">${esc(b.coffee_name)}</td>
-            <td>${roastLabel(b.roast)}</td>
-            <td class="num" style="font-weight:500;color:var(--ink)">${b.lbs} lbs${b.bags ? ` <span style="color:var(--drift);font-size:9px">(${b.bags} bags)</span>` : ''}</td>
+            <td class="num" style="font-weight:500;color:var(--ink);font-size:13px">${b.lbs} lbs</td>
+            <td style="color:var(--drift);font-size:10px">${breakdown(b)}</td>
             <td class="num">${b.orders_count}</td>
             <td style="color:var(--drift);font-size:10px">${b.shops.map(esc).join(', ')}</td>
           </tr>`).join('')}
