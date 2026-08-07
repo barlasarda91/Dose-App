@@ -118,6 +118,7 @@ export default function Settings({ me }) {
   const [hubApiKey, setHubApiKey]     = useState('');
   const [status, setStatus] = useState({ tokenSet: false, tokenSource: null, resendConfigured: false, resendSource: null, hubConfigured: false, authMode: 'local' });
   const [saved, setSaved]   = useState(false);
+  const [hub, setHub] = useState({ loading: true });
   const [pwForm, setPwForm] = useState({ current: '', next: '', confirm: '' });
   const [pwMsg, setPwMsg]   = useState(null);
 
@@ -136,7 +137,12 @@ export default function Settings({ me }) {
       storagePersistent: s.storage_persistent,
     });
   }
-  useEffect(() => { load().catch(() => {}); }, []);
+  async function checkHub() {
+    setHub({ loading: true });
+    try { setHub({ loading: false, ...(await apiJson('/api/hub-status')) }); }
+    catch { setHub({ loading: false, configured: true, ok: false, error: 'Could not verify — try reloading' }); }
+  }
+  useEffect(() => { load().catch(() => {}); checkHub(); }, []);
 
   async function save() {
     const body = { shop_name: shopName };
@@ -149,6 +155,7 @@ export default function Settings({ me }) {
     await apiJson('/api/settings', { method: 'POST', body: JSON.stringify(body) });
     setSquareToken(''); setHubApiKey('');
     await load().catch(() => {});
+    checkHub();
     setSaved(true);
     setTimeout(() => setSaved(false), 2500);
   }
@@ -237,10 +244,11 @@ export default function Settings({ me }) {
             <div className="settings-field">
               <label className="settings-field-lbl">Roastery Hub</label>
               <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginTop: 4, marginBottom: 8 }}>
-                <span className={`conn-status ${status.hubConfigured ? 'ok' : 'fail'}`} style={{ marginTop: 0 }}>
-                  {status.hubConfigured
-                    ? '● Connected — you order from the roastery price list, and sign-ins are verified by the hub'
-                    : '✕ Not connected — orders go by email only'}
+                <span className={`conn-status ${hub.loading ? '' : hub.ok ? 'ok' : 'fail'}`} style={{ marginTop: 0 }}>
+                  {hub.loading ? '… verifying key with the hub'
+                    : !hub.configured ? '✕ Not connected — enter the API key from the roastery'
+                    : hub.ok ? `● Key verified — the hub recognizes this shop as “${hub.shop_name || 'unnamed shop'}” · ${hub.items} coffee${hub.items === 1 ? '' : 's'} on your price list`
+                    : `✕ Key saved but not working: ${hub.error}`}
                 </span>
               </div>
               <div style={{ display: 'flex', flexDirection: 'column', gap: 10, maxWidth: 420 }}>

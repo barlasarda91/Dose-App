@@ -378,7 +378,7 @@ function shopCatalog(shopId) {
 app.get('/api/ingest/catalog', (req, res) => {
   const shop = shopFromBearer(req);
   if (!shop) return res.status(401).json({ error: 'Invalid shop API key' });
-  res.json({ currency: CURRENCY, items: shopCatalog(shop.id) });
+  res.json({ currency: CURRENCY, shop_name: shop.name, items: shopCatalog(shop.id) });
 });
 
 app.post('/api/ingest/orders', async (req, res) => {
