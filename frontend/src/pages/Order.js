@@ -35,7 +35,21 @@ const itemQty = i => i.roast === 'retail' ? `${i.bags} × 12oz` : `${i.lbs} lbs`
 
 const FREQ_LABELS = { weekly: 'Weekly', biweekly: 'Every 2 weeks', monthly: 'Monthly' };
 
+// Same page, two layouts: below 700px the price-list table becomes a card
+// per coffee with tap steppers, and the send button pins to the bottom.
+function useIsMobile() {
+  const [mobile, setMobile] = useState(() => window.matchMedia('(max-width: 700px)').matches);
+  useEffect(() => {
+    const mq = window.matchMedia('(max-width: 700px)');
+    const onChange = e => setMobile(e.matches);
+    mq.addEventListener('change', onChange);
+    return () => mq.removeEventListener('change', onChange);
+  }, []);
+  return mobile;
+}
+
 export default function Order() {
+  const isMobile = useIsMobile();
   const [catalog, setCatalog]   = useState(null); // { configured, currency, items, error }
   const [orders, setOrders]     = useState([]);
   const [standing, setStanding] = useState([]);
@@ -84,6 +98,19 @@ export default function Order() {
   const summaryQty = [totalLbs > 0 ? `${totalLbs} lbs` : null, totalBags > 0 ? `${totalBags} bags` : null].filter(Boolean).join(' · ') || '—';
 
   const setQ = (id, roast) => e => { setQty(p => ({ ...p, [`${id}:${roast}`]: e.target.value })); setDupNote(null); };
+
+  // Stepper taps: ±5 lbs for wholesale roasts, ±1 bag for retail.
+  const bump = (id, roast, dir) => {
+    const k = `${id}:${roast}`;
+    const inc = roast === 'retail' ? 1 : 5;
+    setQty(p => {
+      const next = Math.max(0, (parseFloat(p[k]) || 0) + dir * inc);
+      const out = { ...p };
+      if (next > 0) out[k] = String(next); else delete out[k];
+      return out;
+    });
+    setDupNote(null);
+  };
 
   // Wholesale ships in 5-lb multiples; retail in whole bags.
   const invalidLines = lines.filter(l => l.roast !== 'retail' && Math.abs(l.lbs / 5 - Math.round(l.lbs / 5)) > 1e-9);
@@ -193,7 +220,48 @@ export default function Order() {
 
       {catalogMode ? (
         <div className="section">
-          <div className="section-title">Coffee List</div>
+          <div className="section-title" style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 10 }}>
+            <span>Coffee List</span>
+            {isMobile && lastCatalogOrder && (
+              <button className="btn btn-secondary btn-sm" onClick={() => fillFromOrder(lastCatalogOrder)}>⟳ Duplicate Last</button>
+            )}
+          </div>
+          {isMobile ? (
+            <div>
+              {items.map(it => {
+                const lineTotal = ((parseFloat(qty[`${it.id}:espresso`]) || 0) + (parseFloat(qty[`${it.id}:filter`]) || 0)) * it.price_per_lb
+                  + (it.retail_price != null ? Math.round(parseFloat(qty[`${it.id}:retail`]) || 0) * it.retail_price : 0);
+                const stepRow = (roast, label, sub) => (
+                  <div className="ocard-row" key={roast}>
+                    <div className="ocard-rowlbl">{label}<small>{sub}</small></div>
+                    <div className="stepper">
+                      <button type="button" aria-label={`Less ${label}`} onClick={() => bump(it.id, roast, -1)}>−</button>
+                      <input type="number" min="0" step={roast === 'retail' ? 1 : 5} inputMode="numeric" placeholder="0"
+                        value={qty[`${it.id}:${roast}`] || ''} onChange={setQ(it.id, roast)} />
+                      <button type="button" aria-label={`More ${label}`} onClick={() => bump(it.id, roast, 1)}>+</button>
+                    </div>
+                  </div>
+                );
+                return (
+                  <div className="ocard" key={it.id}>
+                    <div className="ocard-head">
+                      <div className="ocard-name">
+                        {it.name}
+                        {it.badge && <span className="ocard-badge">{it.badge}</span>}
+                        {it.low_stock && <span className="ocard-badge low">Low stock</span>}
+                      </div>
+                      {it.notes && <div className="ocard-notes">{it.notes}</div>}
+                      <div className="ocard-price">{money(it.price_per_lb)}/lb wholesale</div>
+                    </div>
+                    {stepRow('espresso', 'Espresso Roast', '5-lb bags · ×5 lbs')}
+                    {stepRow('filter', 'Filter Roast', '5-lb bags · ×5 lbs')}
+                    {it.retail_price != null && stepRow('retail', '12oz Retail Bags', `${money(it.retail_price)}/bag`)}
+                    {lineTotal > 0 && <div className="ocard-total"><span>line total</span><b>{money(lineTotal)}</b></div>}
+                  </div>
+                );
+              })}
+            </div>
+          ) : (<>
           <div className="table-wrap">
             <table>
               <thead>
@@ -276,6 +344,7 @@ export default function Order() {
               </button>
             </div>
           </div>
+          </>)}
 
           <div style={{ display: 'flex', gap: 14, flexWrap: 'wrap', alignItems: 'flex-end', marginTop: 18 }}>
             <div className="form-group">
@@ -304,7 +373,28 @@ export default function Order() {
               </button>
               {soMsg && <span className={`conn-status ${soMsg.ok ? 'ok' : 'fail'}`}>{soMsg.text}</span>}
             </div>
-            {standing.length > 0 && (
+            {standing.length > 0 && (isMobile ? (
+              <div style={{ marginTop: 14 }}>
+                {standing.map(s => (
+                  <div className="hcard" key={s.id}>
+                    <div className="hcard-head">
+                      <span>{FREQ_LABELS[s.frequency]}</span>
+                      <span style={{ color: 'var(--olive)' }}>next: {s.next_date}</span>
+                    </div>
+                    <div className="hcard-items">
+                      {s.items.map((i, idx) => {
+                        const c = items.find(x => x.id === parseInt(i.coffee_id, 10));
+                        return <div key={idx}>{roastTag(i.roast)}{c ? c.name : `#${i.coffee_id}`} · {i.roast === 'retail' ? `${i.bags} × 12oz` : `${i.lbs} lbs`}</div>;
+                      })}
+                    </div>
+                    <div className="hcard-foot">
+                      <span>set by {s.created_by || '—'}</span>
+                      <button className="btn btn-danger" onClick={() => cancelStanding(s.id)}>Cancel</button>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            ) : (
               <div className="table-wrap" style={{ marginTop: 14 }}>
                 <table>
                   <thead><tr><th>Rhythm</th><th>Items</th><th>Next Order</th><th>Set By</th><th></th></tr></thead>
@@ -326,7 +416,7 @@ export default function Order() {
                   </tbody>
                 </table>
               </div>
-            )}
+            ))}
           </div>
         </div>
       ) : (
@@ -347,7 +437,40 @@ export default function Order() {
 
       <div className="section">
         <div className="section-title">Order History</div>
-        {orders.length > 0 ? (
+        {orders.length > 0 ? (isMobile ? (
+          <div>
+            {orders.map(o => {
+              const st = statusText(o);
+              const bagCount = (o.items || []).filter(i => i.roast === 'retail').reduce((s, i) => s + (i.bags || 0), 0);
+              const wholesaleLbs = (o.items || []).length
+                ? Math.round((o.items || []).filter(i => i.roast !== 'retail').reduce((s, i) => s + i.lbs, 0) * 10) / 10
+                : (o.total_lbs ?? POOLS.reduce((s, p) => s + (o[p.field] || 0), 0));
+              const qtyStr = [wholesaleLbs > 0 ? `${wholesaleLbs} lbs` : null, bagCount > 0 ? `${bagCount} bags` : null].filter(Boolean).join(' · ') || '—';
+              return (
+                <div className="hcard" key={o.id}>
+                  <div className="hcard-head">
+                    <span>{o.order_date}{o.requested_date ? <span style={{ color: 'var(--drift)' }}> → for {o.requested_date}</span> : null}</span>
+                    <span style={{ color: st.color }}>{st.text}</span>
+                  </div>
+                  <div className="hcard-items">
+                    {o.items && o.items.length
+                      ? o.items.map(i => <div key={i.id}>{roastTag(i.roast)}{i.coffee_name} · {itemQty(i)}</div>)
+                      : POOLS.filter(p => o[p.field] > 0).map(p => <div key={p.field}>{p.label}: {o[p.field]} lbs</div>)}
+                    {o.notes && <div style={{ color: 'var(--drift)' }}>✎ {o.notes}</div>}
+                  </div>
+                  <div className="hcard-foot">
+                    <span>{qtyStr}{o.total_cost != null ? ` · ${money(o.total_cost)}` : ''} · by {o.created_by || '—'}</span>
+                    <span style={{ display: 'flex', gap: 6 }}>
+                      {o.items && o.items.length > 0 && catalogMode &&
+                        <button className="btn btn-secondary btn-sm" onClick={() => fillFromOrder(o)}>Duplicate</button>}
+                      <button className="btn btn-danger" onClick={() => delOrder(o.id)}>Delete</button>
+                    </span>
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        ) : (
           <div className="table-wrap">
             <table>
               <thead><tr>
@@ -385,8 +508,22 @@ export default function Order() {
               </tbody>
             </table>
           </div>
-        ) : <div className="empty">No orders yet. Your sent orders will be logged here for one-click reordering.</div>}
+        )) : <div className="empty">No orders yet. Your sent orders will be logged here for one-click reordering.</div>}
       </div>
+
+      {isMobile && catalogMode && hasLines && (
+        <div className="sendbar">
+          <div>
+            <div className="sendbar-main">{summaryQty}{totalCost > 0 ? ` — ${money(totalCost)}` : ''}</div>
+            <div className={`sendbar-sub${incrementError ? ' err' : ''}`}>
+              {incrementError ? '⚠ Wholesale quantities must be multiples of 5 lbs' : 'at current price list'}
+            </div>
+          </div>
+          <button className="btn" onClick={send} disabled={sending || !!incrementError}>
+            {sending ? '…Sending' : 'Send Order'}
+          </button>
+        </div>
+      )}
     </div>
   );
 }
