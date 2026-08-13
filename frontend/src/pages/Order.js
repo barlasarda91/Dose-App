@@ -25,13 +25,16 @@ function statusText(o) {
   return { text: base, color: o.status === 'sent' ? 'var(--olive)' : 'var(--warn)' };
 }
 
+const isRetailRoast = r => r === 'retail' || String(r).startsWith('retail_');
+const ROAST_TAGS = { espresso: 'ESP', filter: 'FLT', retail: 'RTL', retail_espresso: 'RTL·ESP', retail_filter: 'RTL·FLT' };
+
 const roastTag = r => (
-  <span style={{ fontSize: 8, letterSpacing: '.14em', textTransform: 'uppercase', color: 'var(--drift)', border: '1px solid var(--linen)', padding: '1px 4px', marginRight: 6 }}>
-    {r === 'espresso' ? 'ESP' : r === 'retail' ? 'RTL' : 'FLT'}
+  <span style={{ fontSize: 10, letterSpacing: '.14em', textTransform: 'uppercase', color: 'var(--drift)', border: '1px solid var(--linen)', padding: '1px 4px', marginRight: 6 }}>
+    {ROAST_TAGS[r] || r}
   </span>
 );
 
-const itemQty = i => i.roast === 'retail' ? `${i.bags} × 12oz` : `${i.lbs} lbs`;
+const itemQty = i => isRetailRoast(i.roast) ? `${i.bags} × 12oz` : `${i.lbs} lbs`;
 
 const FREQ_LABELS = { weekly: 'Weekly', biweekly: 'Every 2 weeks', monthly: 'Monthly' };
 
@@ -76,6 +79,8 @@ export default function Order() {
   const catalogMode = !!(catalog?.configured && items.length > 0);
   const anyRetail = items.some(it => it.retail_price != null);
 
+  // Retail bags are ordered per roast profile — espresso-roast bags batch
+  // with wholesale espresso at the roastery, filter with filter.
   const lines = useMemo(() => {
     const out = [];
     for (const it of items) {
@@ -83,26 +88,32 @@ export default function Order() {
         const v = parseFloat(qty[`${it.id}:${roast}`]) || 0;
         if (v > 0) out.push({ coffee_id: it.id, coffee_name: it.name, roast, lbs: v, line_total: v * it.price_per_lb });
       }
-      const b = Math.round(parseFloat(qty[`${it.id}:retail`]) || 0);
-      if (b > 0 && it.retail_price != null) {
-        out.push({ coffee_id: it.id, coffee_name: it.name, roast: 'retail', bags: b, line_total: b * it.retail_price });
+      for (const roast of ['retail_espresso', 'retail_filter']) {
+        const b = Math.round(parseFloat(qty[`${it.id}:${roast}`]) || 0);
+        if (b > 0 && it.retail_price != null) {
+          out.push({ coffee_id: it.id, coffee_name: it.name, roast, bags: b, line_total: b * it.retail_price });
+        }
       }
     }
     return out;
   }, [qty, items]);
 
-  const totalLbs = Math.round(lines.filter(l => l.roast !== 'retail').reduce((s, l) => s + l.lbs, 0) * 10) / 10;
-  const totalBags = lines.filter(l => l.roast === 'retail').reduce((s, l) => s + l.bags, 0);
+  const totalLbs = Math.round(lines.filter(l => !isRetailRoast(l.roast)).reduce((s, l) => s + l.lbs, 0) * 10) / 10;
+  const totalBags = lines.filter(l => isRetailRoast(l.roast)).reduce((s, l) => s + l.bags, 0);
   const totalCost = lines.reduce((s, l) => s + l.line_total, 0);
   const hasLines = lines.length > 0;
   const summaryQty = [totalLbs > 0 ? `${totalLbs} lbs` : null, totalBags > 0 ? `${totalBags} bags` : null].filter(Boolean).join(' · ') || '—';
+  // Per-profile roast totals with retail bags folded in (0.75 lb each) —
+  // this mirrors how the roastery batches it.
+  const espRoastLbs = Math.round(lines.reduce((s, l) => s + (l.roast === 'espresso' ? l.lbs : l.roast === 'retail_espresso' ? l.bags * 0.75 : 0), 0) * 100) / 100;
+  const fltRoastLbs = Math.round(lines.reduce((s, l) => s + (l.roast === 'filter' ? l.lbs : l.roast === 'retail_filter' ? l.bags * 0.75 : 0), 0) * 100) / 100;
 
   const setQ = (id, roast) => e => { setQty(p => ({ ...p, [`${id}:${roast}`]: e.target.value })); setDupNote(null); };
 
   // Stepper taps: ±5 lbs for wholesale roasts, ±1 bag for retail.
   const bump = (id, roast, dir) => {
     const k = `${id}:${roast}`;
-    const inc = roast === 'retail' ? 1 : 5;
+    const inc = isRetailRoast(roast) ? 1 : 5;
     setQty(p => {
       const next = Math.max(0, (parseFloat(p[k]) || 0) + dir * inc);
       const out = { ...p };
@@ -112,15 +123,25 @@ export default function Order() {
     setDupNote(null);
   };
 
+  // Shared stepper: −/+ buttons around a typeable value.
+  const Stepper = ({ id, roast, small }) => (
+    <span className={`stepper${small ? ' stepper-sm' : ''}`}>
+      <button type="button" aria-label={`Less ${roast}`} onClick={() => bump(id, roast, -1)}>−</button>
+      <input type="number" min="0" step={isRetailRoast(roast) ? 1 : 5} inputMode="numeric" placeholder="0"
+        value={qty[`${id}:${roast}`] || ''} onChange={setQ(id, roast)} />
+      <button type="button" aria-label={`More ${roast}`} onClick={() => bump(id, roast, 1)}>+</button>
+    </span>
+  );
+
   // Wholesale ships in 5-lb multiples; retail in whole bags.
-  const invalidLines = lines.filter(l => l.roast !== 'retail' && Math.abs(l.lbs / 5 - Math.round(l.lbs / 5)) > 1e-9);
+  const invalidLines = lines.filter(l => !isRetailRoast(l.roast) && Math.abs(l.lbs / 5 - Math.round(l.lbs / 5)) > 1e-9);
   const incrementError = invalidLines.length
     ? `Wholesale quantities must be multiples of 5 lbs — check ${invalidLines.map(l => `${l.coffee_name} (${l.lbs} lbs)`).join(', ')}`
     : null;
 
   const payloadItems = () => lines.map(l =>
-    l.roast === 'retail'
-      ? { coffee_id: l.coffee_id, roast: 'retail', bags: l.bags }
+    isRetailRoast(l.roast)
+      ? { coffee_id: l.coffee_id, roast: l.roast, bags: l.bags }
       : { coffee_id: l.coffee_id, roast: l.roast, lbs: l.lbs });
 
   function fillFromOrder(o) {
@@ -128,14 +149,21 @@ export default function Order() {
     if (o.items && o.items.length) {
       const next = {};
       const missing = [];
+      const legacyRetail = [];
       for (const i of o.items) {
-        const inCatalog = items.some(c => c.id === i.coffee_id && (i.roast !== 'retail' || c.retail_price != null));
-        if (inCatalog) next[`${i.coffee_id}:${i.roast}`] = String(i.roast === 'retail' ? i.bags : i.lbs);
+        // Pre-split retail lines carry no roast profile — can't be re-created faithfully.
+        if (i.roast === 'retail') { legacyRetail.push(i.coffee_name); continue; }
+        const inCatalog = items.some(c => c.id === i.coffee_id && (!isRetailRoast(i.roast) || c.retail_price != null));
+        if (inCatalog) next[`${i.coffee_id}:${i.roast}`] = String(isRetailRoast(i.roast) ? i.bags : i.lbs);
         else missing.push(i.coffee_name);
       }
       setQty(next);
       setNotes(o.notes || '');
-      setDupNote(missing.length ? `Not on the current price list, skipped: ${[...new Set(missing)].join(', ')}` : null);
+      const notes2 = [
+        missing.length ? `Not on the current price list, skipped: ${[...new Set(missing)].join(', ')}` : null,
+        legacyRetail.length ? `Retail bags from before the espresso/filter split need re-adding by hand: ${[...new Set(legacyRetail)].join(', ')}` : null,
+      ].filter(Boolean).join(' · ');
+      setDupNote(notes2 || null);
     }
     window.scrollTo({ top: 0, behavior: 'smooth' });
   }
@@ -230,16 +258,13 @@ export default function Order() {
             <div>
               {items.map(it => {
                 const lineTotal = ((parseFloat(qty[`${it.id}:espresso`]) || 0) + (parseFloat(qty[`${it.id}:filter`]) || 0)) * it.price_per_lb
-                  + (it.retail_price != null ? Math.round(parseFloat(qty[`${it.id}:retail`]) || 0) * it.retail_price : 0);
+                  + (it.retail_price != null
+                    ? (Math.round(parseFloat(qty[`${it.id}:retail_espresso`]) || 0) + Math.round(parseFloat(qty[`${it.id}:retail_filter`]) || 0)) * it.retail_price
+                    : 0);
                 const stepRow = (roast, label, sub) => (
                   <div className="ocard-row" key={roast}>
                     <div className="ocard-rowlbl">{label}<small>{sub}</small></div>
-                    <div className="stepper">
-                      <button type="button" aria-label={`Less ${label}`} onClick={() => bump(it.id, roast, -1)}>−</button>
-                      <input type="number" min="0" step={roast === 'retail' ? 1 : 5} inputMode="numeric" placeholder="0"
-                        value={qty[`${it.id}:${roast}`] || ''} onChange={setQ(it.id, roast)} />
-                      <button type="button" aria-label={`More ${label}`} onClick={() => bump(it.id, roast, 1)}>+</button>
-                    </div>
+                    <Stepper id={it.id} roast={roast} />
                   </div>
                 );
                 return (
@@ -255,7 +280,8 @@ export default function Order() {
                     </div>
                     {stepRow('espresso', 'Espresso Roast', '5-lb bags · ×5 lbs')}
                     {stepRow('filter', 'Filter Roast', '5-lb bags · ×5 lbs')}
-                    {it.retail_price != null && stepRow('retail', '12oz Retail Bags', `${money(it.retail_price)}/bag`)}
+                    {it.retail_price != null && stepRow('retail_espresso', '12oz — Espresso Roast', `${money(it.retail_price)}/bag`)}
+                    {it.retail_price != null && stepRow('retail_filter', '12oz — Filter Roast', `${money(it.retail_price)}/bag`)}
                     {lineTotal > 0 && <div className="ocard-total"><span>line total</span><b>{money(lineTotal)}</b></div>}
                   </div>
                 );
@@ -266,48 +292,48 @@ export default function Order() {
             <table>
               <thead>
                 <tr>
-                  <th style={{ minWidth: 200 }}>Coffee</th>
-                  <th style={{ textAlign: 'right' }}>Price / lb</th>
-                  <th style={{ textAlign: 'right' }}>Espresso Roast (lbs, ×5)</th>
-                  <th style={{ textAlign: 'right' }}>Filter Roast (lbs, ×5)</th>
-                  {anyRetail && <th style={{ textAlign: 'right' }}>12oz Bags</th>}
-                  <th style={{ textAlign: 'right' }}>Line Total</th>
+                  <th rowSpan={2} style={{ minWidth: 200, verticalAlign: 'bottom' }}>Coffee</th>
+                  <th rowSpan={2} style={{ textAlign: 'right', verticalAlign: 'bottom' }}>Price</th>
+                  <th colSpan={2} style={{ textAlign: 'center', color: 'var(--olive)', borderLeft: '1px solid var(--linen)', borderRight: '1px solid var(--linen)' }}>Wholesale — 5 lb bags</th>
+                  {anyRetail && <th colSpan={2} style={{ textAlign: 'center', color: 'var(--olive)', borderRight: '1px solid var(--linen)' }}>12oz Retail Bags</th>}
+                  <th rowSpan={2} style={{ textAlign: 'right', verticalAlign: 'bottom' }}>Line Total</th>
+                </tr>
+                <tr>
+                  <th style={{ textAlign: 'right', borderLeft: '1px solid var(--linen)' }}>Espresso (lbs ×5)</th>
+                  <th style={{ textAlign: 'right', borderRight: '1px solid var(--linen)' }}>Filter (lbs ×5)</th>
+                  {anyRetail && <th style={{ textAlign: 'right' }}>Espresso Roast</th>}
+                  {anyRetail && <th style={{ textAlign: 'right', borderRight: '1px solid var(--linen)' }}>Filter Roast</th>}
                 </tr>
               </thead>
               <tbody>
                 {items.map(it => {
                   const lineTotal = ((parseFloat(qty[`${it.id}:espresso`]) || 0) + (parseFloat(qty[`${it.id}:filter`]) || 0)) * it.price_per_lb
-                    + (it.retail_price != null ? Math.round(parseFloat(qty[`${it.id}:retail`]) || 0) * it.retail_price : 0);
+                    + (it.retail_price != null
+                      ? (Math.round(parseFloat(qty[`${it.id}:retail_espresso`]) || 0) + Math.round(parseFloat(qty[`${it.id}:retail_filter`]) || 0)) * it.retail_price
+                      : 0);
+                  const stepCell = (roast, enabled = true) => (
+                    <td style={{ textAlign: 'right' }}>
+                      {enabled ? <Stepper id={it.id} roast={roast} small /> : <span style={{ color: 'var(--linen)' }}>—</span>}
+                    </td>
+                  );
                   return (
                     <tr key={it.id}>
                       <td>
-                        <div style={{ fontFamily: 'var(--font-serif)', fontSize: 14, color: 'var(--ink)' }}>
+                        <div style={{ fontFamily: 'var(--font-serif)', fontSize: 15, color: 'var(--ink)' }}>
                           {it.name}
-                          {it.badge && <span style={{ fontSize: 8, letterSpacing: '.14em', textTransform: 'uppercase', border: '1px solid var(--olive)', color: 'var(--olive)', padding: '2px 7px', marginLeft: 8, verticalAlign: 'middle' }}>{it.badge}</span>}
-                          {it.low_stock && <span style={{ fontSize: 8, letterSpacing: '.14em', textTransform: 'uppercase', border: '1px solid var(--warn)', color: 'var(--warn)', padding: '2px 7px', marginLeft: 8, verticalAlign: 'middle' }}>Low stock</span>}
+                          {it.badge && <span style={{ fontSize: 10, letterSpacing: '.14em', textTransform: 'uppercase', border: '1px solid var(--olive)', color: 'var(--olive)', padding: '2px 7px', marginLeft: 8, verticalAlign: 'middle' }}>{it.badge}</span>}
+                          {it.low_stock && <span style={{ fontSize: 10, letterSpacing: '.14em', textTransform: 'uppercase', border: '1px solid var(--warn)', color: 'var(--warn)', padding: '2px 7px', marginLeft: 8, verticalAlign: 'middle' }}>Low stock</span>}
                         </div>
-                        {it.notes && <div style={{ fontSize: 9, color: 'var(--drift)', marginTop: 2 }}>{it.notes}</div>}
+                        {it.notes && <div style={{ fontSize: 11, color: 'var(--drift)', marginTop: 2 }}>{it.notes}</div>}
                       </td>
                       <td style={{ textAlign: 'right', whiteSpace: 'nowrap' }}>
                         {money(it.price_per_lb)}
-                        {it.retail_price != null && <div style={{ fontSize: 9, color: 'var(--drift)' }}>{money(it.retail_price)}/bag</div>}
+                        {it.retail_price != null && <div style={{ fontSize: 11, color: 'var(--drift)' }}>{money(it.retail_price)}/bag</div>}
                       </td>
-                      <td style={{ textAlign: 'right' }}>
-                        <input type="number" min="0" step="5" placeholder="0" style={{ width: 72, textAlign: 'right' }}
-                          value={qty[`${it.id}:espresso`] || ''} onChange={setQ(it.id, 'espresso')} />
-                      </td>
-                      <td style={{ textAlign: 'right' }}>
-                        <input type="number" min="0" step="5" placeholder="0" style={{ width: 72, textAlign: 'right' }}
-                          value={qty[`${it.id}:filter`] || ''} onChange={setQ(it.id, 'filter')} />
-                      </td>
-                      {anyRetail && (
-                        <td style={{ textAlign: 'right' }}>
-                          {it.retail_price != null
-                            ? <input type="number" min="0" step="1" placeholder="0" style={{ width: 72, textAlign: 'right' }}
-                                value={qty[`${it.id}:retail`] || ''} onChange={setQ(it.id, 'retail')} />
-                            : <span style={{ color: 'var(--linen)' }}>—</span>}
-                        </td>
-                      )}
+                      {stepCell('espresso')}
+                      {stepCell('filter')}
+                      {anyRetail && stepCell('retail_espresso', it.retail_price != null)}
+                      {anyRetail && stepCell('retail_filter', it.retail_price != null)}
                       <td style={{ textAlign: 'right', whiteSpace: 'nowrap', color: lineTotal > 0 ? 'var(--ink)' : 'var(--linen)' }}>
                         {lineTotal > 0 ? money(lineTotal) : '—'}
                       </td>
@@ -321,16 +347,16 @@ export default function Order() {
           <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', flexWrap: 'wrap', gap: 16, background: 'var(--stone)', border: '1px solid var(--linen)', borderTop: 'none', padding: '16px 20px' }}>
             <div style={{ display: 'flex', gap: 36, flexWrap: 'wrap' }}>
               <div>
-                <div style={{ fontSize: 8, letterSpacing: '.22em', textTransform: 'uppercase', color: 'var(--drift)' }}>Total</div>
+                <div style={{ fontSize: 9, letterSpacing: '.22em', textTransform: 'uppercase', color: 'var(--drift)' }}>Total</div>
                 <div style={{ fontFamily: 'var(--font-serif)', fontSize: 20, color: 'var(--ink)' }}>{summaryQty}</div>
-                <div style={{ fontSize: 9, color: 'var(--drift)' }}>
-                  {Math.round(lines.filter(l => l.roast === 'espresso').reduce((s, l) => s + l.lbs, 0) * 10) / 10} espresso · {Math.round(lines.filter(l => l.roast === 'filter').reduce((s, l) => s + l.lbs, 0) * 10) / 10} filter{totalBags > 0 ? ` · ${totalBags} retail` : ''}
+                <div style={{ fontSize: 11, color: 'var(--drift)' }}>
+                  {espRoastLbs} lbs espresso roast · {fltRoastLbs} lbs filter roast{totalBags > 0 ? ' (retail bags folded in)' : ''}
                 </div>
               </div>
               <div>
-                <div style={{ fontSize: 8, letterSpacing: '.22em', textTransform: 'uppercase', color: 'var(--drift)' }}>Est. Cost</div>
+                <div style={{ fontSize: 9, letterSpacing: '.22em', textTransform: 'uppercase', color: 'var(--drift)' }}>Est. Cost</div>
                 <div style={{ fontFamily: 'var(--font-serif)', fontSize: 20, color: 'var(--ink)' }}>{totalCost > 0 ? money(totalCost) : '—'}</div>
-                <div style={{ fontSize: 9, color: 'var(--drift)' }}>at current price list</div>
+                <div style={{ fontSize: 10, color: 'var(--drift)' }}>at current price list</div>
               </div>
             </div>
             <div style={{ display: 'flex', gap: 10, alignItems: 'center', flexWrap: 'wrap' }}>
@@ -359,7 +385,7 @@ export default function Order() {
 
           <div className="card" style={{ marginTop: 18 }}>
             <div className="card-title">Standing Order</div>
-            <p style={{ fontSize: 11, color: 'var(--drift)', marginBottom: 12, lineHeight: 1.6 }}>
+            <p style={{ fontSize: 12, color: 'var(--drift)', marginBottom: 12, lineHeight: 1.6 }}>
               Fill in the quantities above, pick a rhythm, and Dose places this exact order automatically — prices always taken from the live list on the day it's placed.
             </p>
             <div style={{ display: 'flex', gap: 10, alignItems: 'center', flexWrap: 'wrap' }}>
@@ -384,7 +410,7 @@ export default function Order() {
                     <div className="hcard-items">
                       {s.items.map((i, idx) => {
                         const c = items.find(x => x.id === parseInt(i.coffee_id, 10));
-                        return <div key={idx}>{roastTag(i.roast)}{c ? c.name : `#${i.coffee_id}`} · {i.roast === 'retail' ? `${i.bags} × 12oz` : `${i.lbs} lbs`}</div>;
+                        return <div key={idx}>{roastTag(i.roast)}{c ? c.name : `#${i.coffee_id}`} · {isRetailRoast(i.roast) ? `${i.bags} × 12oz` : `${i.lbs} lbs`}</div>;
                       })}
                     </div>
                     <div className="hcard-foot">
@@ -402,14 +428,14 @@ export default function Order() {
                     {standing.map(s => (
                       <tr key={s.id}>
                         <td>{FREQ_LABELS[s.frequency]}</td>
-                        <td style={{ fontSize: 10, lineHeight: 1.8 }}>
+                        <td style={{ fontSize: 11, lineHeight: 1.8 }}>
                           {s.items.map((i, idx) => {
                             const c = items.find(x => x.id === parseInt(i.coffee_id, 10));
-                            return <div key={idx}>{roastTag(i.roast)}{c ? c.name : `#${i.coffee_id}`} · {i.roast === 'retail' ? `${i.bags} × 12oz` : `${i.lbs} lbs`}</div>;
+                            return <div key={idx}>{roastTag(i.roast)}{c ? c.name : `#${i.coffee_id}`} · {isRetailRoast(i.roast) ? `${i.bags} × 12oz` : `${i.lbs} lbs`}</div>;
                           })}
                         </td>
                         <td>{s.next_date}</td>
-                        <td style={{ color: 'var(--drift)', fontSize: 11 }}>{s.created_by || '—'}</td>
+                        <td style={{ color: 'var(--drift)', fontSize: 12 }}>{s.created_by || '—'}</td>
                         <td><button className="btn btn-danger" onClick={() => cancelStanding(s.id)}>Cancel</button></td>
                       </tr>
                     ))}
@@ -426,7 +452,7 @@ export default function Order() {
             <div style={{ fontFamily: 'var(--font-serif)', fontSize: 20, color: 'var(--ink)', marginBottom: 10 }}>
               Ordering is locked
             </div>
-            <p style={{ fontSize: 12, color: 'var(--drift)', lineHeight: 1.8, maxWidth: 440, margin: '0 auto' }}>
+            <p style={{ fontSize: 13, color: 'var(--drift)', lineHeight: 1.8, maxWidth: 440, margin: '0 auto' }}>
               {catalog?.configured
                 ? 'Connected to the roastery, but their price list is empty — coffees will appear here as soon as the roastery publishes them.'
                 : <>This shop isn't connected to the roastery yet. Enter the API key from the roastery under Settings → Ordering → Roastery Hub, and the live price list will appear here.</>}
@@ -441,7 +467,7 @@ export default function Order() {
           <div>
             {orders.map(o => {
               const st = statusText(o);
-              const bagCount = (o.items || []).filter(i => i.roast === 'retail').reduce((s, i) => s + (i.bags || 0), 0);
+              const bagCount = (o.items || []).filter(i => isRetailRoast(i.roast)).reduce((s, i) => s + (i.bags || 0), 0);
               const wholesaleLbs = (o.items || []).length
                 ? Math.round((o.items || []).filter(i => i.roast !== 'retail').reduce((s, i) => s + i.lbs, 0) * 10) / 10
                 : (o.total_lbs ?? POOLS.reduce((s, p) => s + (o[p.field] || 0), 0));
@@ -480,14 +506,14 @@ export default function Order() {
               <tbody>
                 {orders.map(o => {
                   const st = statusText(o);
-                  const bagCount = (o.items || []).filter(i => i.roast === 'retail').reduce((s, i) => s + (i.bags || 0), 0);
+                  const bagCount = (o.items || []).filter(i => isRetailRoast(i.roast)).reduce((s, i) => s + (i.bags || 0), 0);
                   const wholesaleLbs = (o.items || []).length
                     ? Math.round((o.items || []).filter(i => i.roast !== 'retail').reduce((s, i) => s + i.lbs, 0) * 10) / 10
                     : (o.total_lbs ?? POOLS.reduce((s, p) => s + (o[p.field] || 0), 0));
                   return (
                     <tr key={o.id}>
-                      <td style={{ whiteSpace: 'nowrap' }}>{o.order_date}{o.requested_date ? <div style={{ fontSize: 9, color: 'var(--drift)' }}>for {o.requested_date}</div> : null}</td>
-                      <td style={{ lineHeight: 1.9, fontSize: 10 }}>
+                      <td style={{ whiteSpace: 'nowrap' }}>{o.order_date}{o.requested_date ? <div style={{ fontSize: 10, color: 'var(--drift)' }}>for {o.requested_date}</div> : null}</td>
+                      <td style={{ lineHeight: 1.9, fontSize: 11 }}>
                         {o.items && o.items.length
                           ? o.items.map(i => <div key={i.id} style={{ whiteSpace: 'nowrap' }}>{roastTag(i.roast)}{i.coffee_name} · {itemQty(i)}</div>)
                           : POOLS.filter(p => o[p.field] > 0).map(p => <div key={p.field}>{p.label}: {o[p.field]} lbs</div>)}
@@ -495,8 +521,8 @@ export default function Order() {
                       </td>
                       <td style={{ textAlign: 'right', whiteSpace: 'nowrap' }}>{[wholesaleLbs > 0 ? `${wholesaleLbs} lbs` : null, bagCount > 0 ? `${bagCount} bags` : null].filter(Boolean).join(' · ') || '—'}</td>
                       <td style={{ textAlign: 'right', whiteSpace: 'nowrap' }}>{o.total_cost != null ? money(o.total_cost) : '—'}</td>
-                      <td style={{ color: 'var(--drift)', fontSize: 11 }}>{o.created_by || '—'}</td>
-                      <td style={{ color: st.color, fontSize: 10 }}>{st.text}</td>
+                      <td style={{ color: 'var(--drift)', fontSize: 12 }}>{o.created_by || '—'}</td>
+                      <td style={{ color: st.color, fontSize: 11 }}>{st.text}</td>
                       <td><div style={{ display: 'flex', gap: 6 }}>
                         {o.items && o.items.length > 0 && catalogMode &&
                           <button className="btn btn-secondary btn-sm" onClick={() => fillFromOrder(o)}>Duplicate</button>}

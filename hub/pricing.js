@@ -35,6 +35,12 @@ function effectivePrice(item, shopId, rules) {
 // A 12oz retail bag holds 0.75 lb of roasted coffee (used for roast totals).
 const BAG_LBS = 0.75;
 
+// Retail bags carry their roast profile ('retail_espresso'/'retail_filter')
+// so they batch with the matching wholesale roast. Plain 'retail' is the
+// legacy value from before the split — still accepted on old orders.
+const RETAIL_ROASTS = ['retail', 'retail_espresso', 'retail_filter'];
+const isRetail = r => RETAIL_ROASTS.includes(r);
+
 // The catalog exactly as one shop should see it: visible+active items only,
 // effective prices only — base prices and rules never leave the hub.
 // Retail bag prices are flat (per-shop price rules apply to wholesale /lb
@@ -64,13 +70,13 @@ function priceOrderItems(rawItems, shopCatalog) {
   const items = rawItems.map(raw => {
     const coffee = byId.get(parseInt(raw.coffee_id, 10));
     if (!coffee) throw new Error(`Coffee ${raw.coffee_id} is not available to this shop`);
-    if (raw.roast === 'retail') {
+    if (isRetail(raw.roast)) {
       if (coffee.retail_price == null) throw new Error(`${coffee.name} is not offered as retail bags`);
       const bags = Math.round(parseFloat(raw.bags) || 0);
       if (bags <= 0) throw new Error(`Invalid bag count for ${coffee.name}`);
       const line_total = Math.round(bags * coffee.retail_price * 100) / 100;
       return {
-        coffee_id: coffee.id, coffee_name: coffee.name, roast: 'retail',
+        coffee_id: coffee.id, coffee_name: coffee.name, roast: raw.roast,
         bags, lbs: Math.round(bags * BAG_LBS * 100) / 100,
         price_per_lb: coffee.retail_price, // unit price: per bag for retail lines
         line_total,
@@ -90,4 +96,4 @@ function priceOrderItems(rawItems, shopCatalog) {
   return { items, total_lbs, total_cost };
 }
 
-module.exports = { BAG_LBS, isVisible, effectivePrice, catalogForShop, priceOrderItems };
+module.exports = { BAG_LBS, RETAIL_ROASTS, isRetail, isVisible, effectivePrice, catalogForShop, priceOrderItems };

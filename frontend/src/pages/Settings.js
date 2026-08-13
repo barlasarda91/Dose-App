@@ -67,7 +67,7 @@ function UsersSection() {
                   <tr key={u.id}>
                     <td style={{ fontWeight: 500 }}>{u.username}</td>
                     <td style={{ color: u.role === 'admin' ? 'var(--olive)' : 'var(--drift)' }}>{u.role}</td>
-                    <td style={{ color: 'var(--drift)', fontSize: 11 }}>{(u.created_at || '').slice(0, 10)}</td>
+                    <td style={{ color: 'var(--drift)', fontSize: 12 }}>{(u.created_at || '').slice(0, 10)}</td>
                     <td><div style={{ display: 'flex', gap: 6 }}>
                       <button className="btn btn-secondary btn-sm" onClick={() => resetPassword(u)}>Reset Password</button>
                       <button className="btn btn-danger" onClick={() => deleteUser(u)}>Delete</button>
@@ -112,13 +112,15 @@ export default function Settings({ me }) {
   const isAdmin = me?.role === 'admin';
   const [locationId, setLocationId] = useState('');
   const [shopName, setShopName]     = useState('');
-  const [hubUrl, setHubUrl]         = useState('');
   // Secret inputs are write-only: blank = keep current value
   const [squareToken, setSquareToken] = useState('');
   const [hubApiKey, setHubApiKey]     = useState('');
   const [status, setStatus] = useState({ tokenSet: false, tokenSource: null, resendConfigured: false, resendSource: null, hubConfigured: false, authMode: 'local' });
   const [saved, setSaved]   = useState(false);
   const [hub, setHub] = useState({ loading: true });
+  const [square, setSquare] = useState({ loading: true });
+  const [sqFlash, setSqFlash]   = useState(null);
+  const [hubFlash, setHubFlash] = useState(null);
   const [pwForm, setPwForm] = useState({ current: '', next: '', confirm: '' });
   const [pwMsg, setPwMsg]   = useState(null);
 
@@ -126,7 +128,6 @@ export default function Settings({ me }) {
     const s = await apiJson('/api/settings');
     setLocationId(s.square_location_id || '');
     setShopName(s.shop_name || '');
-    setHubUrl(s.hub_url || '');
     setStatus({
       tokenSet: !!s.square_token_set,
       tokenSource: s.square_token_source,
@@ -142,20 +143,38 @@ export default function Settings({ me }) {
     try { setHub({ loading: false, ...(await apiJson('/api/hub-status')) }); }
     catch { setHub({ loading: false, configured: true, ok: false, error: 'Could not verify — try reloading' }); }
   }
-  useEffect(() => { load().catch(() => {}); checkHub(); }, []);
+  async function checkSquare() {
+    setSquare({ loading: true });
+    try { setSquare({ loading: false, ...(await apiJson('/api/square-status')) }); }
+    catch { setSquare({ loading: false, configured: true, ok: false, error: 'Could not verify — try reloading' }); }
+  }
+  useEffect(() => { load().catch(() => {}); checkHub(); checkSquare(); }, []);
 
-  async function save() {
-    const body = { shop_name: shopName };
-    if (isAdmin) {
-      body.square_location_id = locationId;
-      // Only send secrets the user actually typed — blank means "keep as is"
-      if (squareToken.trim() !== '') body.square_access_token = squareToken.trim();
-      if (hubApiKey.trim()   !== '') body.hub_api_key = hubApiKey.trim();
-    }
-    await apiJson('/api/settings', { method: 'POST', body: JSON.stringify(body) });
-    setSquareToken(''); setHubApiKey('');
+  // Each API key saves on its own button, then re-verifies live so the tile
+  // flips state immediately.
+  async function saveSquareToken() {
+    if (!squareToken.trim()) return;
+    await apiJson('/api/settings', { method: 'POST', body: JSON.stringify({ square_access_token: squareToken.trim() }) });
+    setSquareToken('');
+    setSqFlash('✓ Saved just now');
+    setTimeout(() => setSqFlash(null), 3500);
+    await load().catch(() => {});
+    checkSquare();
+  }
+  async function saveHubKey() {
+    if (!hubApiKey.trim()) return;
+    await apiJson('/api/settings', { method: 'POST', body: JSON.stringify({ hub_api_key: hubApiKey.trim() }) });
+    setHubApiKey('');
+    setHubFlash('✓ Saved just now');
+    setTimeout(() => setHubFlash(null), 3500);
     await load().catch(() => {});
     checkHub();
+  }
+  async function saveShopInfo() {
+    const body = { shop_name: shopName };
+    if (isAdmin) body.square_location_id = locationId;
+    await apiJson('/api/settings', { method: 'POST', body: JSON.stringify(body) });
+    await load().catch(() => {});
     setSaved(true);
     setTimeout(() => setSaved(false), 2500);
   }
@@ -203,24 +222,34 @@ export default function Settings({ me }) {
       {isAdmin && (
         <div className="settings-section">
           <div className="section-title">Square API</div>
-          <div className="settings-card">
-            <div className="settings-field">
-              <label className="settings-field-lbl">Access Token</label>
-              <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginTop: 4, marginBottom: 8 }}>
-                <span className={`conn-status ${status.tokenSet ? 'ok' : 'fail'}`} style={{ marginTop: 0 }}>
-                  {status.tokenSet
-                    ? `● Token configured${sourceNote(status.tokenSource)}`
-                    : '✕ Not set — paste your Square production access token below'}
-                </span>
+          {(() => {
+            const state = square.loading ? 'unset' : !square.configured ? 'unset' : square.ok ? 'ok' : 'bad';
+            const verdict = square.loading ? '… verifying token with Square'
+              : !square.configured ? '✕ Not set — paste your Square production access token'
+              : square.ok ? `● Token verified — Square reports ${square.locations} active location${square.locations === 1 ? '' : 's'}${sourceNote(status.tokenSource)}`
+              : `✕ Token saved but rejected by Square: ${square.error}`;
+            return (
+              <div className={`apitile ${state}`}>
+                <div className="apitile-head">
+                  <span className="apitile-name">Access Token</span>
+                  <span className={`verdict ${state}`}>{verdict}</span>
+                </div>
+                <div className="apirow">
+                  <input type="password" placeholder={status.tokenSet ? '•••••••• (leave blank to keep current)' : 'EAAA…'}
+                    value={squareToken} onChange={e => setSquareToken(e.target.value)} autoComplete="new-password" />
+                  <button className="btn btn-primary" onClick={saveSquareToken} disabled={!squareToken.trim()}>
+                    {status.tokenSet ? 'Replace Token' : 'Save Token'}
+                  </button>
+                  {sqFlash && <span className="conn-status ok" style={{ marginTop: 0 }}>{sqFlash}</span>}
+                </div>
+                <div className="settings-field-hint">
+                  Square Developer dashboard → your application → Production → Access token. Stored in this shop's own database, never shown back once saved.
+                </div>
               </div>
-              <input type="password" placeholder={status.tokenSet ? '•••••••• (leave blank to keep current)' : 'EAAA…'}
-                value={squareToken} onChange={e => setSquareToken(e.target.value)} style={{ maxWidth: 420 }}
-                autoComplete="new-password" />
-              <div className="settings-field-hint">
-                Square Developer dashboard → your application → Production → Access token. Stored in this shop's own database, never shown back once saved.
-              </div>
-            </div>
+            );
+          })()}
 
+          <div className="settings-card">
             <div style={{ display: 'flex', gap: 20, flexWrap: 'wrap' }}>
               <div className="settings-field">
                 <label className="settings-field-lbl">Location ID <span style={{ fontWeight: 300, textTransform: 'none', letterSpacing: 0 }}>(optional)</span></label>
@@ -233,6 +262,10 @@ export default function Settings({ me }) {
                 <div className="settings-field-hint">Identifies this location on orders and reports.</div>
               </div>
             </div>
+            <div style={{ display: 'flex', gap: 10, marginTop: 12, alignItems: 'center' }}>
+              <button className="btn btn-ghost" onClick={saveShopInfo}>Save Shop Info</button>
+              {saved && <span className="conn-status ok" style={{ marginTop: 0 }}>✓ Saved</span>}
+            </div>
           </div>
         </div>
       )}
@@ -240,34 +273,34 @@ export default function Settings({ me }) {
       {isAdmin && (
         <div className="settings-section">
           <div className="section-title">Ordering</div>
-          <div className="settings-card">
-            <div className="settings-field">
-              <label className="settings-field-lbl">Roastery Hub</label>
-              <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginTop: 4, marginBottom: 8 }}>
-                <span className={`conn-status ${hub.loading ? '' : hub.ok ? 'ok' : 'fail'}`} style={{ marginTop: 0 }}>
-                  {hub.loading ? '… verifying key with the hub'
-                    : !hub.configured ? '✕ Not connected — enter the API key from the roastery'
-                    : hub.ok ? `● Key verified — the hub recognizes this shop as “${hub.shop_name || 'unnamed shop'}” · ${hub.items} coffee${hub.items === 1 ? '' : 's'} on your price list`
-                    : `✕ Key saved but not working: ${hub.error}`}
-                </span>
+          {(() => {
+            const state = hub.loading ? 'unset' : !hub.configured ? 'unset' : hub.ok ? 'ok' : 'bad';
+            const verdict = hub.loading ? '… verifying key with the hub'
+              : !hub.configured ? '✕ Not connected — enter the API key from the roastery'
+              : hub.ok ? `● Key verified — the hub recognizes this shop as “${hub.shop_name || 'unnamed shop'}” · ${hub.items} coffee${hub.items === 1 ? '' : 's'} on your price list`
+              : `✕ Key saved but not working: ${hub.error}`;
+            return (
+              <div className={`apitile ${state}`}>
+                <div className="apitile-head">
+                  <span className="apitile-name">Roastery Hub API Key</span>
+                  <span className={`verdict ${state}`}>{verdict}</span>
+                </div>
+                <div className="apirow">
+                  <input type="password" placeholder={status.hubConfigured ? '•••••••• (leave blank to keep current)' : 'dose_… (API key from the roastery)'}
+                    value={hubApiKey} onChange={e => setHubApiKey(e.target.value)} autoComplete="new-password" />
+                  <button className="btn btn-primary" onClick={saveHubKey} disabled={!hubApiKey.trim()}>
+                    {status.hubConfigured ? 'Replace Key' : 'Save Key'}
+                  </button>
+                  {hubFlash && <span className="conn-status ok" style={{ marginTop: 0 }}>{hubFlash}</span>}
+                </div>
+                <div className="settings-field-hint">
+                  The roastery creates this shop in their Dose Hub and gives you this key — it's all you need. Receipts and confirmations are emailed by the hub to your registered address.
+                </div>
               </div>
-              <div style={{ display: 'flex', flexDirection: 'column', gap: 10, maxWidth: 420 }}>
-                <input type="password" placeholder={status.hubConfigured ? '•••••••• (leave blank to keep current)' : 'dose_… (API key from the roastery)'}
-                  value={hubApiKey} onChange={e => setHubApiKey(e.target.value)} autoComplete="new-password" />
-              </div>
-              <div className="settings-field-hint">
-                The roastery creates this shop in their Dose Hub and gives you this key — it's all you need. Receipts and confirmations are emailed by the hub to your registered address.
-              </div>
-            </div>
-
-          </div>
+            );
+          })()}
         </div>
       )}
-
-      <div style={{ display: 'flex', gap: 10, marginTop: 8, marginBottom: 32 }}>
-        <button className="btn btn-primary" onClick={save}>Save</button>
-        {saved && <span className="conn-status ok" style={{ marginTop: 0 }}>✓ Saved</span>}
-      </div>
 
       {isAdmin && status.authMode !== 'hub' && <UsersSection />}
 

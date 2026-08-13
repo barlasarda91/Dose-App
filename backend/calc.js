@@ -93,22 +93,28 @@ function suggestOrderLbs({ usedGrams, days, expectedRemainingGrams, horizonDays 
 // A 12oz retail bag holds 0.75 lb of roasted coffee.
 const BAG_LBS = 0.75;
 
+// Retail bags carry their roast profile ('retail_espresso' / 'retail_filter')
+// so the roastery can batch them with the matching wholesale roast. Plain
+// 'retail' is the legacy value from before the split — still accepted.
+const RETAIL_ROASTS = ['retail', 'retail_espresso', 'retail_filter'];
+const isRetail = r => RETAIL_ROASTS.includes(r);
+
 // Price an order's line items against the catalog fetched from the hub.
 // The hub recomputes prices on ingest with the same rules — this keeps the
 // locally stored copy identical to what the roastery bills. Lines are either
-// wholesale (roast espresso/filter, lbs) or retail (roast 'retail', 12oz bags).
+// wholesale (roast espresso/filter, lbs) or retail (12oz bags, per profile).
 function priceItemsFromCatalog(rawItems, catalogItems) {
   if (!Array.isArray(rawItems) || rawItems.length === 0) throw new Error('Order has no items');
   const byId = new Map(catalogItems.map(i => [i.id, i]));
   const items = rawItems.map(raw => {
     const coffee = byId.get(parseInt(raw.coffee_id, 10));
     if (!coffee) throw new Error(`Coffee ${raw.coffee_id} is not on your price list`);
-    if (raw.roast === 'retail') {
+    if (isRetail(raw.roast)) {
       if (coffee.retail_price == null) throw new Error(`${coffee.name} is not offered as retail bags`);
       const bags = Math.round(parseFloat(raw.bags) || 0);
       if (bags <= 0) throw new Error(`Invalid bag count for ${coffee.name}`);
       return {
-        coffee_id: coffee.id, coffee_name: coffee.name, roast: 'retail',
+        coffee_id: coffee.id, coffee_name: coffee.name, roast: raw.roast,
         bags, lbs: Math.round(bags * BAG_LBS * 100) / 100,
         price_per_lb: coffee.retail_price, // unit price: per bag for retail lines
         line_total: Math.round(bags * coffee.retail_price * 100) / 100,
@@ -130,4 +136,4 @@ function priceItemsFromCatalog(rawItems, catalogItems) {
   };
 }
 
-module.exports = { LBS_TO_GRAMS, GALLONS_TO_ML, BAG_LBS, aggregateOrders, calcCoffeeStock, calcEfficiency, suggestOrderLbs, priceItemsFromCatalog };
+module.exports = { LBS_TO_GRAMS, GALLONS_TO_ML, BAG_LBS, RETAIL_ROASTS, isRetail, aggregateOrders, calcCoffeeStock, calcEfficiency, suggestOrderLbs, priceItemsFromCatalog };

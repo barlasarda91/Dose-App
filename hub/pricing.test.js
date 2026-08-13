@@ -85,6 +85,21 @@ test('retail bag lines: priced per bag, 0.75 lb each, only when offered', () => 
   assert.throws(() => priceOrderItems([{ coffee_id: 10, roast: 'retail', bags: 0 }], cat), /bag count/);
 });
 
+test('retail bags carry their roast profile; legacy plain retail still accepted', () => {
+  const cat = catalogForShop([
+    { id: 30, name: 'Split Blend', notes: '', badge: null, low_stock: 0, price_per_lb: 12, retail_price: 14, visibility: 'standard', active: 1 },
+  ], 1, [], []);
+  const { items, total_lbs } = priceOrderItems([
+    { coffee_id: 30, roast: 'retail_espresso', bags: 2 },
+    { coffee_id: 30, roast: 'retail_filter', bags: 4 },
+    { coffee_id: 30, roast: 'retail', bags: 1 }, // legacy standing orders
+  ], cat);
+  assert.deepEqual(items.map(i => i.roast), ['retail_espresso', 'retail_filter', 'retail']);
+  assert.equal(items[0].line_total, 28.00);
+  assert.equal(total_lbs, 5.25); // 7 bags × 0.75
+  assert.throws(() => priceOrderItems([{ coffee_id: 30, roast: 'retail_dark', bags: 1 }], cat), /roast/);
+});
+
 test('wholesale quantities must be multiples of 5 lbs; retail bags are free', () => {
   const cat = catalogForShop([
     { id: 20, name: 'Inc Blend', notes: '', badge: null, low_stock: 0, price_per_lb: 12, retail_price: 14, visibility: 'standard', active: 1 },

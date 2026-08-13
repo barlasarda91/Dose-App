@@ -134,3 +134,15 @@ test('priceItemsFromCatalog enforces 5-lb wholesale increments', () => {
   const ok = priceItemsFromCatalog([{ coffee_id: 1, roast: 'filter', lbs: 10 }, { coffee_id: 1, roast: 'retail', bags: 2 }], catalog);
   assert.equal(ok.total_lbs, 11.5);
 });
+
+test('retail bags carry their roast profile; plain retail stays for legacy', () => {
+  const catalog = [{ id: 1, name: 'Blend', price_per_lb: 12, retail_price: 14 }];
+  const r = priceItemsFromCatalog([
+    { coffee_id: 1, roast: 'retail_espresso', bags: 3 },
+    { coffee_id: 1, roast: 'retail_filter', bags: 1 },
+  ], catalog);
+  assert.deepEqual(r.items.map(i => i.roast), ['retail_espresso', 'retail_filter']);
+  assert.equal(r.total_lbs, 3); // 4 bags × 0.75
+  assert.equal(r.total_cost, 56.00);
+  assert.throws(() => priceItemsFromCatalog([{ coffee_id: 1, roast: 'retail_dark', bags: 1 }], catalog), /roast/);
+});
