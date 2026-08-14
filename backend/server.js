@@ -110,7 +110,7 @@ db.exec(`
     order_id INTEGER NOT NULL REFERENCES coffee_orders(id),
     coffee_id INTEGER,
     coffee_name TEXT NOT NULL,
-    roast TEXT NOT NULL CHECK(roast IN ('espresso','filter','retail')),
+    roast TEXT NOT NULL CHECK(roast IN ('espresso','filter','retail','retail_espresso','retail_filter')),
     lbs REAL NOT NULL,
     bags INTEGER,
     price_per_lb REAL NOT NULL,
@@ -222,16 +222,17 @@ try { db.exec("ALTER TABLE users ADD COLUMN source TEXT DEFAULT 'local'"); } cat
 try { db.exec('ALTER TABLE order_items ADD COLUMN bags INTEGER'); } catch { /* already present */ }
 
 // Widen the roast CHECK from earlier versions (SQLite requires a rebuild).
+// Two generations: pre-retail, and pre-profile-split ('retail_espresso').
 {
   const row = db.prepare("SELECT sql FROM sqlite_master WHERE type='table' AND name='order_items'").get();
-  if (row && !row.sql.includes("'retail'")) {
+  if (row && !row.sql.includes("'retail_espresso'")) {
     db.exec('ALTER TABLE order_items RENAME TO order_items_migr');
     db.exec(`CREATE TABLE order_items (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       order_id INTEGER NOT NULL REFERENCES coffee_orders(id),
       coffee_id INTEGER,
       coffee_name TEXT NOT NULL,
-      roast TEXT NOT NULL CHECK(roast IN ('espresso','filter','retail')),
+      roast TEXT NOT NULL CHECK(roast IN ('espresso','filter','retail','retail_espresso','retail_filter')),
       lbs REAL NOT NULL,
       bags INTEGER,
       price_per_lb REAL NOT NULL,
@@ -669,6 +670,18 @@ async function getLocations() {
   return cachedLocations;
 }
 
+// Live verdict for the Settings tile: is the saved Square token actually
+// accepted by Square? (Mirrors /api/hub-status for the hub key.)
+app.get('/api/square-status', async (req, res) => {
+  if (!getSecret('square_access_token', 'SQUARE_ACCESS_TOKEN')) return res.json({ configured: false, ok: false });
+  try {
+    const locs = await getLocations();
+    res.json({ configured: true, ok: true, locations: locs.length });
+  } catch (err) {
+    res.json({ configured: true, ok: false, error: err.message });
+  }
+});
+
 // The shop's IANA timezone from its Square location, so "a day" means the
 // shop's day rather than a UTC day.
 async function getShopTimezone(locationId) {
@@ -944,11 +957,15 @@ const ORDER_POOLS = [
 ];
 
 function orderEmailHtml(order, shopName, items = []) {
+  const roastLabel = r =>
+    r === 'espresso' ? 'Espresso Roast' : r === 'filter' ? 'Filter Roast'
+    : r === 'retail_espresso' ? '12oz Bags — Espresso Roast'
+    : r === 'retail_filter' ? '12oz Bags — Filter Roast' : '12oz Retail Bags';
   const rows = items.length
     ? items.map(i =>
       `<tr>
-        <td style="padding:10px 14px;border-bottom:1px solid #DDD6CC;font-family:monospace;font-size:13px;color:#3D3A34;">${i.coffee_name} — ${i.roast === 'espresso' ? 'Espresso' : 'Filter'} Roast</td>
-        <td style="padding:10px 14px;border-bottom:1px solid #DDD6CC;font-family:monospace;font-size:13px;color:#1A1916;text-align:right;">${i.lbs} lbs</td>
+        <td style="padding:10px 14px;border-bottom:1px solid #DDD6CC;font-family:monospace;font-size:13px;color:#3D3A34;">${i.coffee_name} — ${roastLabel(i.roast)}</td>
+        <td style="padding:10px 14px;border-bottom:1px solid #DDD6CC;font-family:monospace;font-size:13px;color:#1A1916;text-align:right;">${i.bags ? `${i.bags} bags` : `${i.lbs} lbs`}</td>
       </tr>`).join('')
     : ORDER_POOLS
       .filter(([field]) => order[field] > 0)

@@ -96,7 +96,7 @@ export default function Recipes() {
                         <td><input type="checkbox" checked={selected.has(r.id)} onChange={() => toggleSelect(r.id)} /></td>
                         <td style={{ fontWeight: 500 }}>{r.square_item_name}</td>
                         <td style={{ fontFamily: 'DM Mono' }}>{r.coffee_grams}g</td>
-                        <td style={{ color: 'var(--steam)', fontSize: 11 }}>{r.notes || '—'}</td>
+                        <td style={{ color: 'var(--steam)', fontSize: 12 }}>{r.notes || '—'}</td>
                         <td><div style={{ display: 'flex', gap: 6 }}>
                           <button className="btn btn-secondary btn-sm" onClick={() => { setEditItem(r); setForm({ ...r }); setShowModal(true); }}>Edit</button>
                           <button className="btn btn-danger" onClick={() => del(r.id)}>Delete</button>

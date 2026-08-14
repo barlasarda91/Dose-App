@@ -76,7 +76,7 @@ function Gate({ mode }) {
         )}
 
         {isSetup && (
-          <p style={{ fontFamily: 'var(--font-mono)', fontSize: 10, color: 'var(--graphite)', lineHeight: 1.7, marginBottom: 14 }}>
+          <p style={{ fontFamily: 'var(--font-mono)', fontSize: 11, color: 'var(--graphite)', lineHeight: 1.7, marginBottom: 14 }}>
             {isHubSetup
               ? <>Connect this shop to the roastery's Dose Hub. You need this shop's API key (from the roastery), plus the setup code from this server's logs.</>
               : <>Run this shop without a roastery hub: create a local <strong>admin</strong> account. You need the setup code from the server logs.</>}

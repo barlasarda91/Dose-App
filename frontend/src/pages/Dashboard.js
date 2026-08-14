@@ -316,7 +316,7 @@ export default function Dashboard() {
                 </tbody>
                 <tfoot>
                   <tr style={{ borderTop: '2px solid var(--linen)' }}>
-                    <td style={{ fontWeight: 600, fontFamily: 'var(--font-mono)', fontSize: 12 }}>Total</td>
+                    <td style={{ fontWeight: 600, fontFamily: 'var(--font-mono)', fontSize: 13 }}>Total</td>
                     <td style={{ fontWeight: 700, fontFamily: 'var(--font-mono)' }}>{totalTracked}</td>
                   </tr>
                 </tfoot>

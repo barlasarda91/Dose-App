@@ -48,6 +48,22 @@ export default function Stock() {
 
   const setC = k => e => setCForm(p => ({ ...p, [k]: e.target.value }));
 
+  // Dose steppers: received moves in 5-lb bags, on-hand by 1 lb. Typing still
+  // works for scale readings like 4.2.
+  const bump = (k, inc, dir) => setCForm(p => {
+    const next = Math.max(0, Math.round(((parseFloat(p[k]) || 0) + dir * inc) * 10) / 10);
+    return { ...p, [k]: next > 0 ? String(next) : '' };
+  });
+
+  const Stepper = ({ k, inc }) => (
+    <span className="stepper">
+      <button type="button" aria-label={`Less ${k}`} onClick={() => bump(k, inc, -1)}>−</button>
+      <input type="number" min="0" step="0.1" inputMode="decimal" placeholder="0"
+        value={cForm[k]} onChange={setC(k)} />
+      <button type="button" aria-label={`More ${k}`} onClick={() => bump(k, inc, 1)}>+</button>
+    </span>
+  );
+
   return (
     <div className="page">
       <div className="page-eyebrow">Inventory</div>
@@ -59,7 +75,7 @@ export default function Stock() {
         <div className="section-title">Coffee Deliveries</div>
         <div className="card" style={{ marginBottom: 16 }}>
           <div className="card-title">Log New Delivery</div>
-          <p style={{ fontSize: 11, color: 'var(--drift)', marginBottom: 14, lineHeight: 1.6 }}>
+          <p style={{ fontSize: 12, color: 'var(--drift)', marginBottom: 14, lineHeight: 1.6 }}>
             Enter lbs on hand before this delivery, and lbs received. Opening stock for a period = on hand + received at the first delivery.
           </p>
           <div style={{ marginBottom: 14 }}>
@@ -75,20 +91,20 @@ export default function Stock() {
             { label: 'Pour-Over',rec: 'pourover_lbs_received', oh: 'pourover_lbs_onhand' },
           ].map(({ label, rec, oh }) => (
             <div key={label} style={{ display: 'grid', gridTemplateColumns: '120px 1fr 1fr 1fr', gap: 10, alignItems: 'end', marginBottom: 10 }}>
-              <div style={{ fontFamily: 'var(--font-mono)', fontSize: 11, color: 'var(--drift)', paddingBottom: 10 }}>{label}</div>
+              <div style={{ fontFamily: 'var(--font-mono)', fontSize: 13, color: 'var(--drift)', paddingBottom: 10 }}>{label}</div>
               <div className="form-group">
-                {label === 'Espresso' && <label className="form-lbl">On Hand (lbs)</label>}
-                <input type="number" className="form-input" placeholder="0" step="0.1" value={cForm[oh]} onChange={setC(oh)} />
+                {label === 'Espresso' && <label className="form-lbl">On Hand (lbs) · ±1</label>}
+                <Stepper k={oh} inc={1} />
               </div>
               <div className="form-group">
-                {label === 'Espresso' && <label className="form-lbl">Received (lbs)</label>}
-                <input type="number" className="form-input" placeholder="0" step="0.1" value={cForm[rec]} onChange={setC(rec)} />
+                {label === 'Espresso' && <label className="form-lbl">Received (lbs) · ±5 (one bag)</label>}
+                <Stepper k={rec} inc={5} />
               </div>
               <div className="form-group">
                 {label === 'Espresso' && <label className="form-lbl">Total (lbs)</label>}
                 <div style={{ fontFamily: 'var(--font-mono)', fontSize: 13, color: 'var(--graphite)', paddingTop: 10, paddingBottom: 10 }}>
                   {((parseFloat(cForm[oh]) || 0) + (parseFloat(cForm[rec]) || 0)).toFixed(1)} lbs
-                  <span style={{ color: 'var(--drift)', fontSize: 10, marginLeft: 6 }}>
+                  <span style={{ color: 'var(--drift)', fontSize: 11, marginLeft: 6 }}>
                     = {(((parseFloat(cForm[oh]) || 0) + (parseFloat(cForm[rec]) || 0)) * LBS_TO_G / 1000).toFixed(2)}kg
                   </span>
                 </div>
@@ -114,17 +130,17 @@ export default function Stock() {
             </tr></thead>
             <tbody>{coffeeDeliveries.map(d => (
               <tr key={d.id}>
-                <td style={{ fontFamily: 'var(--font-mono)', fontSize: 11 }}>{d.delivery_date}</td>
-                <td style={{ fontFamily: 'var(--font-mono)', fontSize: 11 }}>{d.espresso_lbs_onhand > 0 ? `${d.espresso_lbs_onhand}lb` : '—'}</td>
-                <td style={{ fontFamily: 'var(--font-mono)', fontSize: 11, color: 'var(--warn)' }}>{d.espresso_lbs_received > 0 ? `+${d.espresso_lbs_received}lb` : '—'}</td>
-                <td style={{ fontFamily: 'var(--font-mono)', fontSize: 11 }}>{d.drip_lbs_onhand > 0 ? `${d.drip_lbs_onhand}lb` : '—'}</td>
-                <td style={{ fontFamily: 'var(--font-mono)', fontSize: 11, color: 'var(--warn)' }}>{d.drip_lbs_received > 0 ? `+${d.drip_lbs_received}lb` : '—'}</td>
-                <td style={{ fontFamily: 'var(--font-mono)', fontSize: 11 }}>{d.coldbrew_lbs_onhand > 0 ? `${d.coldbrew_lbs_onhand}lb` : '—'}</td>
-                <td style={{ fontFamily: 'var(--font-mono)', fontSize: 11, color: 'var(--warn)' }}>{d.coldbrew_lbs_received > 0 ? `+${d.coldbrew_lbs_received}lb` : '—'}</td>
-                <td style={{ fontFamily: 'var(--font-mono)', fontSize: 11 }}>{d.pourover_lbs_onhand > 0 ? `${d.pourover_lbs_onhand}lb` : '—'}</td>
-                <td style={{ fontFamily: 'var(--font-mono)', fontSize: 11, color: 'var(--warn)' }}>{d.pourover_lbs_received > 0 ? `+${d.pourover_lbs_received}lb` : '—'}</td>
-                <td style={{ color: 'var(--drift)', fontSize: 11 }}>{d.created_by || '—'}</td>
-                <td style={{ color: 'var(--drift)', fontSize: 11 }}>{d.notes || '—'}</td>
+                <td style={{ fontFamily: 'var(--font-mono)', fontSize: 12 }}>{d.delivery_date}</td>
+                <td style={{ fontFamily: 'var(--font-mono)', fontSize: 12 }}>{d.espresso_lbs_onhand > 0 ? `${d.espresso_lbs_onhand}lb` : '—'}</td>
+                <td style={{ fontFamily: 'var(--font-mono)', fontSize: 12, color: 'var(--warn)' }}>{d.espresso_lbs_received > 0 ? `+${d.espresso_lbs_received}lb` : '—'}</td>
+                <td style={{ fontFamily: 'var(--font-mono)', fontSize: 12 }}>{d.drip_lbs_onhand > 0 ? `${d.drip_lbs_onhand}lb` : '—'}</td>
+                <td style={{ fontFamily: 'var(--font-mono)', fontSize: 12, color: 'var(--warn)' }}>{d.drip_lbs_received > 0 ? `+${d.drip_lbs_received}lb` : '—'}</td>
+                <td style={{ fontFamily: 'var(--font-mono)', fontSize: 12 }}>{d.coldbrew_lbs_onhand > 0 ? `${d.coldbrew_lbs_onhand}lb` : '—'}</td>
+                <td style={{ fontFamily: 'var(--font-mono)', fontSize: 12, color: 'var(--warn)' }}>{d.coldbrew_lbs_received > 0 ? `+${d.coldbrew_lbs_received}lb` : '—'}</td>
+                <td style={{ fontFamily: 'var(--font-mono)', fontSize: 12 }}>{d.pourover_lbs_onhand > 0 ? `${d.pourover_lbs_onhand}lb` : '—'}</td>
+                <td style={{ fontFamily: 'var(--font-mono)', fontSize: 12, color: 'var(--warn)' }}>{d.pourover_lbs_received > 0 ? `+${d.pourover_lbs_received}lb` : '—'}</td>
+                <td style={{ color: 'var(--drift)', fontSize: 12 }}>{d.created_by || '—'}</td>
+                <td style={{ color: 'var(--drift)', fontSize: 12 }}>{d.notes || '—'}</td>
                 <td><button className="btn btn-danger" onClick={() => delRow(d.id)}>Delete</button></td>
               </tr>
             ))}</tbody>

@@ -7,7 +7,7 @@ const express = require('express');
 const crypto = require('crypto');
 const Database = require('better-sqlite3');
 const path = require('path');
-const { BAG_LBS, catalogForShop, priceOrderItems } = require('./pricing');
+const { BAG_LBS, isRetail, catalogForShop, priceOrderItems } = require('./pricing');
 
 const app = express();
 app.set('trust proxy', 1); // Railway proxy — needed for req.protocol/req.ip
@@ -96,7 +96,7 @@ db.exec(`
     order_id INTEGER NOT NULL REFERENCES orders(id),
     coffee_id INTEGER,
     coffee_name TEXT NOT NULL,
-    roast TEXT NOT NULL CHECK(roast IN ('espresso','filter','retail')),
+    roast TEXT NOT NULL CHECK(roast IN ('espresso','filter','retail','retail_espresso','retail_filter')),
     lbs REAL NOT NULL,
     bags INTEGER,
     price_per_lb REAL NOT NULL,
@@ -105,6 +105,30 @@ db.exec(`
     roasted_at TEXT,
     packed INTEGER DEFAULT 0,
     packed_at TEXT
+  );
+
+  -- What one roast batch is, per roast profile: green weight in, roasted
+  -- weight out. coffee_id 0 holds the roastery-wide defaults; other rows are
+  -- per-coffee overrides.
+  CREATE TABLE IF NOT EXISTS roast_math (
+    coffee_id INTEGER NOT NULL DEFAULT 0,
+    profile TEXT NOT NULL CHECK(profile IN ('espresso','filter')),
+    green_in REAL NOT NULL,
+    roasted_out REAL NOT NULL,
+    PRIMARY KEY (coffee_id, profile)
+  );
+
+  -- Roasted coffee sitting at the roastery ("On Hand"), as a movements
+  -- ledger: batches add, order fills and manual adjustments subtract.
+  -- Current stock per coffee x profile = SUM(delta_lbs).
+  CREATE TABLE IF NOT EXISTS stock_moves (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    coffee_id INTEGER NOT NULL,
+    coffee_name TEXT NOT NULL,
+    profile TEXT NOT NULL CHECK(profile IN ('espresso','filter')),
+    delta_lbs REAL NOT NULL,
+    reason TEXT NOT NULL,
+    created_at TEXT DEFAULT (datetime('now'))
   );
 
   CREATE TABLE IF NOT EXISTS sessions (
@@ -149,12 +173,12 @@ rebuildTable('orders', "'shipped'", `CREATE TABLE orders (
   received_at TEXT DEFAULT (datetime('now'))
 )`, 'id, shop_id, order_date, requested_date, espresso_lbs, drip_lbs, coldbrew_lbs, pourover_lbs, total_lbs, total_cost, notes, placed_by, source_order_id, status, received_at');
 db.exec('CREATE UNIQUE INDEX IF NOT EXISTS idx_orders_dedupe ON orders(shop_id, source_order_id)');
-rebuildTable('order_items', "'retail'", `CREATE TABLE order_items (
+rebuildTable('order_items', "'retail_espresso'", `CREATE TABLE order_items (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   order_id INTEGER NOT NULL REFERENCES orders(id),
   coffee_id INTEGER,
   coffee_name TEXT NOT NULL,
-  roast TEXT NOT NULL CHECK(roast IN ('espresso','filter','retail')),
+  roast TEXT NOT NULL CHECK(roast IN ('espresso','filter','retail','retail_espresso','retail_filter')),
   lbs REAL NOT NULL,
   bags INTEGER,
   price_per_lb REAL NOT NULL,
@@ -164,6 +188,10 @@ rebuildTable('order_items', "'retail'", `CREATE TABLE order_items (
   packed INTEGER DEFAULT 0,
   packed_at TEXT
 )`, 'id, order_id, coffee_id, coffee_name, roast, lbs, bags, price_per_lb, line_total, roasted, roasted_at, packed, packed_at');
+
+// Seed the roastery-wide batch defaults once (55 lbs green → ~47.5/48 out).
+db.prepare("INSERT OR IGNORE INTO roast_math (coffee_id, profile, green_in, roasted_out) VALUES (0,'espresso',55,47.5)").run();
+db.prepare("INSERT OR IGNORE INTO roast_math (coffee_id, profile, green_in, roasted_out) VALUES (0,'filter',55,48)").run();
 
 const sha256 = s => crypto.createHash('sha256').update(String(s)).digest('hex');
 const SESSION_DAYS = 30;
@@ -329,9 +357,12 @@ async function sendEmail(to, subject, html) {
 const esc = s => String(s ?? '').replace(/[<>&"]/g, c => ({ '<': '&lt;', '>': '&gt;', '&': '&amp;', '"': '&quot;' }[c]));
 
 function orderEmailHtml(order, items, shop, headline, sub) {
-  const roastLabel = r => r === 'espresso' ? 'Espresso Roast' : r === 'retail' ? '12oz Retail Bags' : 'Filter Roast';
-  const qtyLabel = i => i.roast === 'retail' ? `${i.bags} bags` : `${i.lbs} lbs`;
-  const unitLabel = i => i.roast === 'retail' ? `${money(i.price_per_lb)}/bag` : `${money(i.price_per_lb)}/lb`;
+  const roastLabel = r =>
+    r === 'espresso' ? 'Espresso Roast' : r === 'filter' ? 'Filter Roast'
+    : r === 'retail_espresso' ? '12oz Bags — Espresso Roast'
+    : r === 'retail_filter' ? '12oz Bags — Filter Roast' : '12oz Retail Bags';
+  const qtyLabel = i => isRetail(i.roast) ? `${i.bags} bags` : `${i.lbs} lbs`;
+  const unitLabel = i => isRetail(i.roast) ? `${money(i.price_per_lb)}/bag` : `${money(i.price_per_lb)}/lb`;
   const rows = items.length
     ? items.map(i =>
       `<tr>
@@ -817,7 +848,7 @@ app.put('/api/orders/:id/items', async (req, res) => {
     for (const item of items) {
       const e = edits.get(item.id);
       if (!e) continue;
-      if (item.roast === 'retail') {
+      if (isRetail(item.roast)) {
         const bags = Math.max(0, Math.round(parseFloat(e.bags ?? e.qty) || 0));
         if (bags === 0) { del.run(item.id); continue; }
         upd.run(Math.round(bags * BAG_LBS * 100) / 100, bags, Math.round(bags * item.price_per_lb * 100) / 100, item.id);
@@ -846,89 +877,245 @@ app.put('/api/orders/:id/items', async (req, res) => {
 });
 
 // ─── Roast Program ────────────────────────────────────────────────────────────
-// Confirmed orders' UNROASTED items, aggregated PER COFFEE — everything gets
-// roasted together, so retail bag weight folds into the roast total. Marking a
-// coffee roasted moves its quantities into the fulfillment buckets; when that
-// completes an order's roasting, the shop gets the "Roasted" email.
-app.get('/api/roast-program', (req, res) => {
+// Confirmed orders' UNROASTED items, aggregated per COFFEE × ROAST PROFILE.
+// Retail bags batch with their matching wholesale roast (that's why they
+// carry a profile). A batch is a batch — the program consults the On Hand
+// shelf first, then counts WHOLE batches for what's still short; whatever a
+// batch produces beyond the orders goes back on the shelf.
+const r2 = v => Math.round(v * 100) / 100;
+
+// roast IN (...) per profile. Legacy 'retail' rows predate the profile split
+// and get their own bucket with no batch math.
+const PROFILE_ROASTS = {
+  espresso: ['espresso', 'retail_espresso'],
+  filter: ['filter', 'retail_filter'],
+  legacy_retail: ['retail'],
+};
+
+function batchFor(coffeeId, profile) {
+  if (profile === 'legacy_retail') return null;
+  const own = db.prepare('SELECT * FROM roast_math WHERE coffee_id=? AND profile=?').get(coffeeId || -1, profile);
+  const def = db.prepare('SELECT * FROM roast_math WHERE coffee_id=0 AND profile=?').get(profile);
+  const b = own || def;
+  return { green_in: b.green_in, roasted_out: b.roasted_out, own: !!own };
+}
+
+function stockLbs(coffeeId, profile) {
+  return r2(db.prepare('SELECT COALESCE(SUM(delta_lbs),0) s FROM stock_moves WHERE coffee_id=? AND profile=?')
+    .get(coffeeId || -1, profile).s);
+}
+
+// Unroasted demand grouped by coffee × profile.
+function roastDemand() {
   const rows = db.prepare(
-    `SELECT oi.coffee_name, oi.roast, SUM(oi.lbs) lbs, SUM(COALESCE(oi.bags,0)) bags,
-            GROUP_CONCAT(DISTINCT o.id) order_ids,
-            GROUP_CONCAT(DISTINCT s.name) shop_names
+    `SELECT oi.coffee_id, oi.coffee_name, oi.roast, SUM(oi.lbs) lbs, SUM(COALESCE(oi.bags,0)) bags,
+            GROUP_CONCAT(DISTINCT o.id) order_ids, GROUP_CONCAT(DISTINCT s.name) shop_names
      FROM order_items oi
      JOIN orders o ON o.id = oi.order_id
      JOIN shops s ON s.id = o.shop_id
      WHERE o.status = 'confirmed' AND COALESCE(oi.roasted, 0) = 0
-     GROUP BY oi.coffee_name, oi.roast`
+     GROUP BY oi.coffee_id, oi.coffee_name, oi.roast`
   ).all();
-  const r2 = v => Math.round(v * 100) / 100;
-  const byCoffee = new Map();
+  const byKey = new Map();
   for (const r of rows) {
-    const c = byCoffee.get(r.coffee_name) || {
-      coffee_name: r.coffee_name, lbs: 0,
-      espresso_lbs: 0, filter_lbs: 0, retail_lbs: 0, retail_bags: 0,
+    const profile = r.roast === 'retail' ? 'legacy_retail'
+      : PROFILE_ROASTS.espresso.includes(r.roast) ? 'espresso' : 'filter';
+    const key = `${r.coffee_id}:${profile}`;
+    const c = byKey.get(key) || {
+      coffee_id: r.coffee_id, coffee_name: r.coffee_name, profile,
+      wholesale_lbs: 0, retail_bags: 0, retail_lbs: 0,
       orderIds: new Set(), shops: new Set(),
     };
-    c.lbs += r.lbs;
-    if (r.roast === 'espresso') c.espresso_lbs += r.lbs;
-    else if (r.roast === 'filter') c.filter_lbs += r.lbs;
+    if (r.roast === 'espresso' || r.roast === 'filter') c.wholesale_lbs += r.lbs;
     else { c.retail_lbs += r.lbs; c.retail_bags += r.bags; }
     String(r.order_ids || '').split(',').filter(Boolean).forEach(id => c.orderIds.add(id));
     String(r.shop_names || '').split(',').filter(Boolean).forEach(s => c.shops.add(s));
-    byCoffee.set(r.coffee_name, c);
+    byKey.set(key, c);
   }
-  const batches = [...byCoffee.values()]
-    .map(c => ({
-      coffee_name: c.coffee_name,
-      lbs: r2(c.lbs),
-      espresso_lbs: r2(c.espresso_lbs), filter_lbs: r2(c.filter_lbs),
-      retail_lbs: r2(c.retail_lbs), retail_bags: c.retail_bags,
-      orders_count: c.orderIds.size,
-      shops: [...c.shops],
+  return [...byKey.values()];
+}
+
+// One line's plan: owed → stock coverage → whole batches → leftover.
+// mode 'stock' draws the shelf first; 'fresh' leaves it alone.
+function planLine(d, mode) {
+  const owed = r2(d.wholesale_lbs + d.retail_lbs);
+  if (d.profile === 'legacy_retail') {
+    return { owed_lbs: owed, stock_lbs: 0, from_stock: 0, short_lbs: owed, batches: null, green_in_lbs: null, expected_out_lbs: null, leftover_lbs: null };
+  }
+  const b = batchFor(d.coffee_id, d.profile);
+  const stock = stockLbs(d.coffee_id, d.profile);
+  const fromStock = mode === 'fresh' ? 0 : r2(Math.min(Math.max(0, stock), owed));
+  const short = r2(Math.max(0, owed - fromStock));
+  const batches = short > 0 ? Math.ceil(short / b.roasted_out - 1e-9) : 0;
+  const greenIn = r2(batches * b.green_in);
+  const expectedOut = r2(batches * b.roasted_out);
+  return {
+    owed_lbs: owed, stock_lbs: stock, from_stock: fromStock, short_lbs: short,
+    batches, green_in_lbs: greenIn, expected_out_lbs: expectedOut,
+    leftover_lbs: r2(stock + expectedOut - owed),
+    batch_green_in: b.green_in, batch_roasted_out: b.roasted_out, own_math: b.own,
+  };
+}
+
+app.get('/api/roast-program', (req, res) => {
+  const lines = roastDemand()
+    .map(d => ({
+      coffee_id: d.coffee_id, coffee_name: d.coffee_name, profile: d.profile,
+      wholesale_lbs: r2(d.wholesale_lbs), retail_bags: d.retail_bags, retail_lbs: r2(d.retail_lbs),
+      orders_count: d.orderIds.size, shops: [...d.shops],
+      ...planLine(d, 'stock'),
+      fresh: planLine(d, 'fresh'),
     }))
-    .sort((a, b) => a.coffee_name.localeCompare(b.coffee_name));
+    .sort((a, b) => a.coffee_name.localeCompare(b.coffee_name) || a.profile.localeCompare(b.profile));
   const legacy = db.prepare("SELECT COUNT(*) n FROM orders WHERE status='confirmed' AND id NOT IN (SELECT DISTINCT order_id FROM order_items)").get().n;
   res.json({
-    batches,
-    total_lbs: r2(batches.reduce((s, b) => s + b.lbs, 0)),
+    lines,
+    totals: {
+      owed_lbs: r2(lines.reduce((s, l) => s + l.owed_lbs, 0)),
+      from_stock: r2(lines.reduce((s, l) => s + l.from_stock, 0)),
+      batches: lines.reduce((s, l) => s + (l.batches || 0), 0),
+      green_in_lbs: r2(lines.reduce((s, l) => s + (l.green_in_lbs || 0), 0)),
+      leftover_lbs: r2(lines.reduce((s, l) => s + Math.max(0, l.leftover_lbs || 0), 0)),
+    },
     legacy_orders_excluded: legacy,
   });
 });
 
-// Mark every unroasted line of a coffee (across confirmed orders) as roasted.
-// Orders whose entire contents are now roasted trigger the "Roasted" email.
-app.post('/api/roast-program/mark-roasted', async (req, res) => {
+// Fill one coffee × profile line: from stock, a fresh roast, or both.
+// Marks the matching items roasted (full-roasted orders get the "Roasted"
+// email), logs the batch output and the order fill on the stock ledger.
+app.post('/api/roast-program/fill', async (req, res) => {
   try {
-    const coffeeName = String((req.body && req.body.coffee_name) || '').trim();
-    if (!coffeeName) return res.status(400).json({ error: 'coffee_name required' });
+    const coffeeId = parseInt((req.body || {}).coffee_id, 10);
+    const profile = String((req.body || {}).profile || '');
+    const mode = (req.body || {}).mode === 'fresh' ? 'fresh' : 'stock';
+    if (!Number.isFinite(coffeeId) || !PROFILE_ROASTS[profile])
+      return res.status(400).json({ error: 'coffee_id and profile (espresso | filter | legacy_retail) required' });
+
+    const d = roastDemand().find(x => x.coffee_id === coffeeId && x.profile === profile);
+    if (!d) return res.status(404).json({ error: 'No unroasted items for that coffee and profile' });
+    const plan = planLine(d, mode);
+
+    if (profile !== 'legacy_retail') {
+      let actual = 0;
+      if (plan.batches > 0) {
+        actual = parseFloat((req.body || {}).actual_out_lbs);
+        if (!Number.isFinite(actual) || actual <= 0) actual = plan.expected_out_lbs;
+        db.prepare('INSERT INTO stock_moves (coffee_id, coffee_name, profile, delta_lbs, reason) VALUES (?,?,?,?,?)')
+          .run(coffeeId, d.coffee_name, profile, r2(actual),
+            `Roasted ${plan.batches} batch${plan.batches === 1 ? '' : 'es'}${mode === 'fresh' ? ' (fresh — stock left alone)' : ''}`);
+      }
+      db.prepare('INSERT INTO stock_moves (coffee_id, coffee_name, profile, delta_lbs, reason) VALUES (?,?,?,?,?)')
+        .run(coffeeId, d.coffee_name, profile, -plan.owed_lbs,
+          `Filled ${d.orderIds.size} order${d.orderIds.size === 1 ? '' : 's'}${plan.batches ? '' : ' from stock'}`);
+    }
+
+    const roasts = PROFILE_ROASTS[profile];
     const items = db.prepare(
       `SELECT oi.id, oi.order_id FROM order_items oi JOIN orders o ON o.id = oi.order_id
-       WHERE o.status = 'confirmed' AND oi.coffee_name = ? AND COALESCE(oi.roasted, 0) = 0`
-    ).all(coffeeName);
-    if (!items.length) return res.status(404).json({ error: `No unroasted items for "${coffeeName}"` });
+       WHERE o.status='confirmed' AND oi.coffee_id=? AND oi.roast IN (${roasts.map(() => '?').join(',')})
+         AND COALESCE(oi.roasted,0)=0`
+    ).all(coffeeId, ...roasts);
     const upd = db.prepare("UPDATE order_items SET roasted=1, roasted_at=datetime('now') WHERE id=?");
     for (const i of items) upd.run(i.id);
 
     const orderIds = [...new Set(items.map(i => i.order_id))];
-    const shopNames = new Set();
     const emails = [];
     for (const oid of orderIds) {
-      const order = db.prepare('SELECT * FROM orders WHERE id=?').get(oid);
-      const shop = db.prepare('SELECT * FROM shops WHERE id=?').get(order.shop_id);
-      shopNames.add(shop.name);
       const left = db.prepare('SELECT COUNT(*) n FROM order_items WHERE order_id=? AND COALESCE(roasted,0)=0').get(oid).n;
       if (left > 0) continue;
+      const order = db.prepare('SELECT * FROM orders WHERE id=?').get(oid);
+      const shop = db.prepare('SELECT * FROM shops WHERE id=?').get(order.shop_id);
       const its = db.prepare('SELECT * FROM order_items WHERE order_id=?').all(oid);
       const email = await sendEmail(shop.email, `Order roasted — ${shop.name} — ${order.order_date}`,
         orderEmailHtml(order, its, shop, 'Order Roasted',
           'Your coffee has been roasted. Packing is next — you will get another email when your order ships.'));
       emails.push({ order_id: oid, shop_name: shop.name, ...email });
     }
-    res.json({ ok: true, items_roasted: items.length, orders_affected: orderIds.length, shops: [...shopNames], roasted_emails: emails });
+    res.json({
+      ok: true, mode, items_roasted: items.length, orders_affected: orderIds.length,
+      shops: [...d.shops], batches: plan.batches, roasted_emails: emails,
+      on_hand_now: profile === 'legacy_retail' ? null : stockLbs(coffeeId, profile),
+    });
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: err.message });
   }
+});
+
+// ─── Roast Math (batch sizes & drop weights) ─────────────────────────────────
+app.get('/api/roast-math', (req, res) => {
+  const all = db.prepare('SELECT * FROM roast_math').all();
+  const pick = (cid, p) => all.find(r => r.coffee_id === cid && r.profile === p) || null;
+  const strip = r => r ? { green_in: r.green_in, roasted_out: r.roasted_out } : null;
+  res.json({
+    defaults: { espresso: strip(pick(0, 'espresso')), filter: strip(pick(0, 'filter')) },
+    coffees: db.prepare('SELECT id, name, badge FROM catalog WHERE active=1 ORDER BY name').all()
+      .map(c => ({ coffee_id: c.id, name: c.name, badge: c.badge, espresso: strip(pick(c.id, 'espresso')), filter: strip(pick(c.id, 'filter')) })),
+  });
+});
+
+// Replace-all semantics: defaults always present; overrides only for coffees
+// that differ. green in must exceed roasted out (roasting loses weight).
+app.put('/api/roast-math', (req, res) => {
+  const { defaults, overrides } = req.body || {};
+  const valid = b => b && Number.isFinite(parseFloat(b.green_in)) && Number.isFinite(parseFloat(b.roasted_out))
+    && parseFloat(b.green_in) > 0 && parseFloat(b.roasted_out) > 0 && parseFloat(b.roasted_out) < parseFloat(b.green_in);
+  for (const p of ['espresso', 'filter']) {
+    if (!valid(defaults && defaults[p]))
+      return res.status(400).json({ error: `Default ${p} batch needs green in > roasted out > 0` });
+  }
+  const put = db.prepare('INSERT OR REPLACE INTO roast_math (coffee_id, profile, green_in, roasted_out) VALUES (?,?,?,?)');
+  for (const p of ['espresso', 'filter']) put.run(0, p, parseFloat(defaults[p].green_in), parseFloat(defaults[p].roasted_out));
+  db.prepare('DELETE FROM roast_math WHERE coffee_id != 0').run();
+  for (const o of (Array.isArray(overrides) ? overrides : [])) {
+    const cid = parseInt(o.coffee_id, 10);
+    if (!Number.isFinite(cid) || cid <= 0 || !['espresso', 'filter'].includes(o.profile)) continue;
+    if (!valid(o)) return res.status(400).json({ error: `Override for coffee ${cid} (${o.profile}) needs green in > roasted out > 0` });
+    put.run(cid, o.profile, parseFloat(o.green_in), parseFloat(o.roasted_out));
+  }
+  res.json({ ok: true });
+});
+
+// ─── On Hand (roasted coffee at the roastery) ────────────────────────────────
+app.get('/api/on-hand', (req, res) => {
+  const stock = db.prepare(
+    `SELECT coffee_id, profile, MAX(coffee_name) coffee_name, ROUND(SUM(delta_lbs), 2) lbs,
+            MAX(CASE WHEN delta_lbs > 0 THEN created_at END) last_roast_at
+     FROM stock_moves GROUP BY coffee_id, profile
+     HAVING ABS(SUM(delta_lbs)) > 0.001 OR MAX(created_at) > datetime('now','-60 days')`
+  ).all();
+  // Committed = what confirmed unroasted demand would draw from each pile.
+  const demand = roastDemand();
+  const rows = stock.map(s => {
+    const d = demand.find(x => x.coffee_id === s.coffee_id && x.profile === s.profile);
+    const owed = d ? r2(d.wholesale_lbs + d.retail_lbs) : 0;
+    const committed = r2(Math.min(Math.max(0, s.lbs), owed));
+    return { ...s, committed_lbs: committed, free_lbs: r2(s.lbs - committed) };
+  }).sort((a, b) => a.coffee_name.localeCompare(b.coffee_name) || a.profile.localeCompare(b.profile));
+  res.json({
+    rows,
+    total_lbs: r2(rows.reduce((s, r) => s + r.lbs, 0)),
+    free_lbs: r2(rows.reduce((s, r) => s + r.free_lbs, 0)),
+    moves: db.prepare('SELECT * FROM stock_moves ORDER BY id DESC LIMIT 40').all(),
+  });
+});
+
+// Manual correction: samples, staff coffee, spillage, recounts.
+app.post('/api/on-hand/adjust', (req, res) => {
+  const coffeeId = parseInt((req.body || {}).coffee_id, 10);
+  const profile = String((req.body || {}).profile || '');
+  const delta = parseFloat((req.body || {}).delta_lbs);
+  if (!Number.isFinite(coffeeId) || !['espresso', 'filter'].includes(profile) || !Number.isFinite(delta) || delta === 0)
+    return res.status(400).json({ error: 'coffee_id, profile (espresso|filter) and a non-zero delta_lbs required' });
+  const coffee = db.prepare('SELECT * FROM catalog WHERE id=?').get(coffeeId);
+  const name = coffee ? coffee.name
+    : (db.prepare('SELECT coffee_name FROM stock_moves WHERE coffee_id=? LIMIT 1').get(coffeeId) || {}).coffee_name;
+  if (!name) return res.status(404).json({ error: 'Unknown coffee' });
+  const note = String((req.body || {}).note || '').slice(0, 200);
+  db.prepare('INSERT INTO stock_moves (coffee_id, coffee_name, profile, delta_lbs, reason) VALUES (?,?,?,?,?)')
+    .run(coffeeId, name, profile, r2(delta), `Manual adjustment${note ? ` — ${note}` : ''}`);
+  res.json({ ok: true, on_hand_now: stockLbs(coffeeId, profile) });
 });
 
 // Fulfillment pack tracking: tick items off as they are physically packed.
@@ -983,10 +1170,11 @@ app.get('/api/analytics', (req, res) => {
       `SELECT COUNT(*) orders_count, COALESCE(SUM(total_lbs),0) lbs, COALESCE(SUM(total_cost),0) cost,
               MIN(order_date) first_order, MAX(order_date) last_order
        FROM orders WHERE shop_id=?`).get(s.id);
-    // Roast mix: items carry it directly; legacy pool orders map espresso→espresso, rest→filter
+    // Roast mix: items carry it directly (retail bags count with their
+    // profile); legacy pool orders map espresso→espresso, rest→filter
     const mix = db.prepare(
-      `SELECT COALESCE(SUM(CASE WHEN roast='espresso' THEN lbs END),0) esp,
-              COALESCE(SUM(CASE WHEN roast='filter' THEN lbs END),0) flt
+      `SELECT COALESCE(SUM(CASE WHEN roast IN ('espresso','retail_espresso') THEN lbs END),0) esp,
+              COALESCE(SUM(CASE WHEN roast IN ('filter','retail_filter') THEN lbs END),0) flt
        FROM order_items oi JOIN orders o ON o.id=oi.order_id WHERE o.shop_id=?`).get(s.id);
     const legacy = db.prepare(
       `SELECT COALESCE(SUM(espresso_lbs),0) esp, COALESCE(SUM(drip_lbs + coldbrew_lbs + pourover_lbs),0) flt
@@ -1020,6 +1208,49 @@ app.get('/api/analytics', (req, res) => {
     };
   });
   res.json({ currency: CURRENCY, shops: out });
+});
+
+// Full account breakdown for the Patterns drill-in: lifetime stats, roast
+// mix, every coffee they buy, 12-week volume, and recent orders.
+app.get('/api/analytics/shop/:id', (req, res) => {
+  const s = db.prepare('SELECT * FROM shops WHERE id=?').get(req.params.id);
+  if (!s) return res.status(404).json({ error: 'Shop not found' });
+  const totals = db.prepare(
+    `SELECT COUNT(*) orders_count, COALESCE(SUM(total_lbs),0) lbs, COALESCE(SUM(total_cost),0) cost,
+            MIN(order_date) first_order, MAX(order_date) last_order
+     FROM orders WHERE shop_id=?`).get(s.id);
+  const mix = db.prepare(
+    `SELECT COALESCE(SUM(CASE WHEN roast IN ('espresso','retail_espresso') THEN lbs END),0) esp,
+            COALESCE(SUM(CASE WHEN roast IN ('filter','retail_filter') THEN lbs END),0) flt
+     FROM order_items oi JOIN orders o ON o.id=oi.order_id WHERE o.shop_id=?`).get(s.id);
+  const coffees = db.prepare(
+    `SELECT coffee_name, ROUND(SUM(lbs),1) lbs, ROUND(SUM(line_total),2) cost
+     FROM order_items oi JOIN orders o ON o.id=oi.order_id
+     WHERE o.shop_id=? GROUP BY coffee_name ORDER BY lbs DESC`).all(s.id);
+  const weekly = db.prepare(
+    `SELECT strftime('%Y-%W', order_date) week, COALESCE(SUM(total_lbs),0) lbs
+     FROM orders WHERE shop_id=? AND order_date >= date('now', '-84 days')
+     GROUP BY week ORDER BY week`).all(s.id);
+  const recent = db.prepare(
+    `SELECT id, order_date, requested_date, total_lbs, total_cost, status, placed_by
+     FROM orders WHERE shop_id=? ORDER BY received_at DESC, id DESC LIMIT 10`).all(s.id);
+  const dates = db.prepare('SELECT DISTINCT order_date FROM orders WHERE shop_id=? ORDER BY order_date').all(s.id).map(r => r.order_date);
+  let avgInterval = null;
+  if (dates.length >= 2) {
+    const spanDays = (new Date(dates[dates.length - 1]) - new Date(dates[0])) / 86400000;
+    avgInterval = Math.round(spanDays / (dates.length - 1) * 10) / 10;
+  }
+  res.json({
+    currency: CURRENCY,
+    shop: { id: s.id, name: s.name, email: s.email, created_at: s.created_at },
+    orders_count: totals.orders_count,
+    total_lbs: Math.round(totals.lbs * 10) / 10,
+    total_cost: Math.round(totals.cost * 100) / 100,
+    first_order: totals.first_order, last_order: totals.last_order,
+    avg_interval_days: avgInterval,
+    roast_mix: { espresso: Math.round(mix.esp * 10) / 10, filter: Math.round(mix.flt * 10) / 10 },
+    coffees, weekly, recent,
+  });
 });
 
 // ─── Static dashboard ────────────────────────────────────────────────────────
