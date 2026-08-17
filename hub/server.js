@@ -833,6 +833,18 @@ app.patch('/api/orders/:id', async (req, res) => {
   res.json({ ...updated, email });
 });
 
+// Delete an order outright — for trial/test orders that shouldn't become
+// history. Removes the order and its line items; stock-ledger movements from
+// already-filled lines are kept (the coffee was really roasted). The shop's
+// own local log keeps its copy.
+app.delete('/api/orders/:id', (req, res) => {
+  const order = db.prepare('SELECT * FROM orders WHERE id=?').get(req.params.id);
+  if (!order) return res.status(404).json({ error: 'Order not found' });
+  db.prepare('DELETE FROM order_items WHERE order_id=?').run(order.id);
+  db.prepare('DELETE FROM orders WHERE id=?').run(order.id);
+  res.json({ ok: true });
+});
+
 // Roaster edits an order's quantities; the shop is notified by email.
 app.put('/api/orders/:id/items', async (req, res) => {
   try {
@@ -1138,6 +1150,9 @@ app.patch('/api/order-items/:id', (req, res) => {
 function generateRoastReports() {
   for (const [type, fmt] of [['week', '%Y-W%W'], ['month', '%Y-%m']]) {
     const current = db.prepare(`SELECT strftime('${fmt}', 'now') p`).get().p;
+    // Reports are purely derived from orders — rebuild closed periods from
+    // scratch so deleted (trial) orders drop out instead of lingering.
+    db.prepare('DELETE FROM roast_reports WHERE period_type=? AND period < ?').run(type, current);
     const rows = db.prepare(
       `SELECT strftime('${fmt}', o.order_date) period, o.shop_id, s.name shop_name,
               oi.coffee_name, oi.roast, SUM(oi.lbs) lbs, SUM(oi.line_total) cost
