@@ -65,6 +65,15 @@
   const roastTag = r => `<span class="roast-lbl">${ROAST_TAGS[r] || r}</span>`;
   const qtyText = i => isRetail(i.roast) ? `${i.bags} × 12oz` : `${i.lbs} lbs`;
   const kg = lbs => (lbs * 0.453592).toFixed(1);
+  // Hub timestamps are stored in UTC; the roastery runs on Los Angeles time.
+  // Keep in sync with HUB_TZ on the server.
+  const HUB_TZ = 'America/Los_Angeles';
+  const fmtLA = ts => {
+    if (!ts) return '—';
+    const d = new Date(String(ts).replace(' ', 'T') + 'Z');
+    if (isNaN(d)) return String(ts).slice(0, 16);
+    return d.toLocaleString('en-US', { timeZone: HUB_TZ, month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' });
+  };
   const PROFILE_NAMES = { espresso: 'Espresso', filter: 'Filter', legacy_retail: 'Retail (legacy)' };
 
   // Generic modal
@@ -110,7 +119,7 @@
         <div class="no-head">
           <div>
             <div class="no-shop">${esc(o.shop_name)}</div>
-            <div class="no-meta">#${o.id} · received ${esc((o.received_at || '').slice(0, 16))}${o.placed_by ? ` by ${esc(o.placed_by)}` : ''} · ${o.requested_date ? `<b>requested ${esc(o.requested_date)}</b>` : 'no requested date'}</div>
+            <div class="no-meta">#${o.id} · received ${esc(fmtLA(o.received_at))}${o.placed_by ? ` by ${esc(o.placed_by)}` : ''} · ${o.requested_date ? `<b>requested ${esc(o.requested_date)}</b>` : 'no requested date'}</div>
           </div>
           <span class="pill">New</span>
         </div>
@@ -161,7 +170,7 @@
             <thead><tr><th>Received</th><th>Shop</th><th>Requested</th><th>Items</th><th class="num">Lbs</th><th class="num">Total</th><th>By</th><th>Status</th><th></th></tr></thead>
             <tbody>${rows.map(o => `
               <tr>
-                <td>${esc((o.received_at || '').slice(0, 16))}</td>
+                <td>${esc(fmtLA(o.received_at))}</td>
                 <td style="font-weight:500">${esc(o.shop_name)}</td>
                 <td>${esc(o.requested_date || o.order_date)}</td>
                 <td style="line-height:1.9;font-size:11px">
@@ -405,7 +414,7 @@
             <td class="num" style="color:var(--ink);font-size:13px">${r.lbs} lbs<div style="font-size:10px;color:var(--drift)">${kg(r.lbs)} kg</div></td>
             <td class="num">${r.committed_lbs > 0 ? `<span style="color:var(--warn)">${r.committed_lbs} lbs</span>` : '<span style="color:var(--linen)">—</span>'}</td>
             <td class="num">${r.free_lbs} lbs</td>
-            <td style="color:var(--drift);font-size:11px">${r.last_roast_at ? esc(r.last_roast_at.slice(0, 16)) : '—'}</td>
+            <td style="color:var(--drift);font-size:11px">${esc(fmtLA(r.last_roast_at))}</td>
             <td class="num"><div style="display:flex;gap:6px;justify-content:flex-end">
               <button class="btn-sm btn" data-adj="${idx}" data-d="-1">−1</button>
               <button class="btn-sm btn" data-adj="${idx}" data-d="1">+1</button>
@@ -418,7 +427,7 @@
         <thead><tr><th>When</th><th>Coffee</th><th>Profile</th><th>What Happened</th><th class="num">Change</th></tr></thead>
         <tbody>${data.moves.map(m => `
           <tr>
-            <td style="font-size:11px">${esc((m.created_at || '').slice(0, 16))}</td>
+            <td style="font-size:11px">${esc(fmtLA(m.created_at))}</td>
             <td>${esc(m.coffee_name)}</td>
             <td><span class="profile ${m.profile}">${PROFILE_NAMES[m.profile]}</span></td>
             <td>${esc(m.reason)}</td>
