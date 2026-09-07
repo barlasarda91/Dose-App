@@ -1342,26 +1342,9 @@ app.post('/api/report', async (req, res) => {
   }
 });
 
-// ─── Seed recipes if empty ────────────────────────────────────────────────────
-if (db.prepare('SELECT COUNT(*) as n FROM drink_recipes').get().n === 0) {
-  const ins = db.prepare('INSERT INTO drink_recipes (square_item_name,category,coffee_grams,milk_whole_ml,notes) VALUES (?,?,?,?,?)');
-  [
-    ['Americano','espresso',18,0,'single'],
-    ['Caffe Latte','espresso',18,240,'12oz'],
-    ['Cappuccino','espresso',18,120,'6oz'],
-    ['Cortado','espresso',18,60,''],
-    ['Espresso','espresso',18,0,'all variations'],
-    ['Espresso Macchiato','espresso',18,0,''],
-    ['Extra Shot','espresso',18,0,''],
-    ['Flat White','espresso',18,150,''],
-    ['Batch Brew','drip',24.4,0,'110g / 4.5 cups'],
-    ['Cafe Au Lait','drip',24.4,0,'pulls from batch brew stock'],
-    ['Cold Brew','coldbrew',26.2,0,'4kg / 20x1.8L bottles, 8oz serve'],
-    ['Pour Over','pourover',19,0,'single brew — all bean variations'],
-    ['Turkish Coffee','pourover',7.5,0,'deducted from pour-over pool'],
-  ].forEach(r => ins.run(...r));
-  console.log('Seeded default recipes');
-}
+// Recipes are NOT seeded — every shop configures its own menu from an empty
+// Recipes screen. (Boxx's own menu used to be pre-loaded here, which would
+// have leaked into every new client install.)
 
 // ─── Serve frontend ───────────────────────────────────────────────────────────
 if (process.env.NODE_ENV === 'production') {
