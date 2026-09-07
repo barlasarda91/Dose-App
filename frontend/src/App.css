@@ -2,8 +2,8 @@
 
 :root {
   --ink:      #1A1916;
-  --graphite: #3D3A34;
-  --drift:    #7A7268;
+  --graphite: #33302A;
+  --drift:    #655D50;
   --linen:    #B8AFA3;
   --stone:    #DDD6CC;
   --parch:    #F5EFE3;
@@ -65,14 +65,23 @@ body {
 .btn-danger { background: transparent; color: var(--red); border: 1px solid var(--linen); font-size:9px; padding: 5px 10px; }
 .btn-danger:hover { border-color: var(--red); }
 
-/* Inputs */
-input[type="text"], input[type="number"], input[type="date"], input[type="password"], select, textarea {
+/* Inputs — bare `input` included so nothing falls back to browser defaults */
+input, select, textarea {
   font-family: var(--font-mono); font-size:12px; font-weight: 300; color: var(--ink);
   background: var(--parch); border: 1px solid var(--linen); padding: 8px 12px;
   outline: none; border-radius: 0; letter-spacing: 0.04em; transition: border-color 0.15s ease;
 }
 input:focus, select:focus, textarea:focus { border-color: var(--drift); outline: 2px solid var(--olive); outline-offset: 2px; }
 input::placeholder, textarea::placeholder { color: var(--linen); opacity: 1; }
+input[type="checkbox"], input[type="radio"] { padding: 0; border: none; accent-color: var(--olive); }
+/* Chrome autofill paints its own blue box and font — repaint it in brand */
+input:-webkit-autofill, input:-webkit-autofill:hover, input:-webkit-autofill:focus {
+  -webkit-box-shadow: 0 0 0 100px var(--parch) inset;
+  -webkit-text-fill-color: var(--ink);
+  font-family: var(--font-mono);
+  caret-color: var(--ink);
+  transition: background-color 99999s ease-out;
+}
 
 /* Date row */
 .date-row { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin-bottom: 24px; }
@@ -113,7 +122,8 @@ input::placeholder, textarea::placeholder { color: var(--linen); opacity: 1; }
 /* Flags / status tags */
 .flag { display: inline-block; font-family: var(--font-mono); font-size:9px; font-weight: 300; letter-spacing: 0.18em; text-transform: uppercase; border: 1px solid var(--linen); padding: 3px 8px; margin-top: 10px; border-radius: 0; color: var(--drift); }
 .flag-over    { color: var(--red);   border-color: var(--red); }
-.flag-waste   { color: var(--warn);  border-color: var(--warn); }
+/* Above-threshold waste pops: solid red chip instead of a quiet outline */
+.flag-waste   { background: var(--red); color: var(--parch); border-color: var(--red); font-weight: 400; }
 .flag-nostock { color: var(--drift); border-color: var(--linen); }
 
 /* Modifier box */
