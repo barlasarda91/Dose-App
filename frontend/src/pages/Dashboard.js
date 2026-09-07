@@ -35,8 +35,14 @@ function EffCard({ label, e, unit = 'g', note, displayUnit, scale = 1 }) {
               {fmt(e.actual_remaining)}{u} actual remaining
             </div>
           )}
-          {!cycleOpen && e.waste !== null && e.waste > 0 && (
-            <div className="eff-sub" style={{ color: 'var(--red)' }}>{fmt(e.waste)}{u} unaccounted</div>
+          {!cycleOpen && e.waste !== null && (
+            // Waste is always shown; only above the 5%-of-opening-stock
+            // threshold does it turn red (and earn the WASTE flag below).
+            <div className="eff-sub" style={{ color: isWaste ? 'var(--red)' : 'var(--drift)' }}>
+              {e.waste > 0
+                ? <>{fmt(e.waste)}{u} unaccounted ({e.stocked > 0 ? Math.round(e.waste / e.stocked * 1000) / 10 : 0}% of opening)</>
+                : 'no waste — counted at or above expected'}
+            </div>
           )}
         </>
       ) : (
