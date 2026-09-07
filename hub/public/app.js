@@ -124,7 +124,8 @@
             ${editing === o.id
               ? `<button class="btn-sm btn" data-save-edit="${o.id}">Save & Notify</button>
                  <button class="btn-sm btn" data-cancel-edit="1">Cancel</button>`
-              : `${o.items && o.items.length ? `<button class="btn-sm btn" data-start-edit="${o.id}">Edit Quantities</button>` : ''}
+              : `<button class="btn-danger btn" data-del="${o.id}">Delete</button>
+                 ${o.items && o.items.length ? `<button class="btn-sm btn" data-start-edit="${o.id}">Edit Quantities</button>` : ''}
                  <button class="btn btn-olive" data-adv="${o.id}" data-to="confirmed">Confirm Order</button>`}
           </span>
         </div>
@@ -176,7 +177,8 @@
                     ? `<button class="btn-sm btn" data-save-edit="${o.id}">Save & Notify</button>
                        <button class="btn-sm btn" data-cancel-edit="1">Cancel</button>`
                     : `${nextAction(o)}
-                       ${o.status === 'confirmed' && o.items && o.items.length ? `<button class="btn-sm btn" data-start-edit="${o.id}">Edit</button>` : ''}`}
+                       ${o.status === 'confirmed' && o.items && o.items.length ? `<button class="btn-sm btn" data-start-edit="${o.id}">Edit</button>` : ''}
+                       <button class="btn-danger btn" data-del="${o.id}">Delete</button>`}
                 </div></td>
               </tr>`).join('')}
             </tbody></table></div>` : '<div class="empty">No orders match those filters.</div>'}` : ''}`;
@@ -200,6 +202,17 @@
           draw();
           if (updated.email) flash(updated.email.sent ? `✓ ${updated.status === 'shipped' ? 'Shipped' : 'Confirmation'} email sent to ${updated.email.to}` : `⚠ Status updated, but email not sent: ${updated.email.reason}`);
         } catch (e) { alert(e.message); }
+      });
+      listEl.querySelectorAll('[data-del]').forEach(btn => btn.onclick = async () => {
+        const o = orders.find(x => String(x.id) === btn.dataset.del);
+        if (!window.confirm(`Delete order #${o.id} from ${o.shop_name}? It disappears from the hub permanently — roast program, patterns and reports stop counting it. The shop's own order log keeps its copy.`)) return;
+        btn.disabled = true;
+        try {
+          await api(`/api/orders/${o.id}`, { method: 'DELETE' });
+          orders = orders.filter(x => x.id !== o.id);
+          draw();
+          flash(`✓ Order #${o.id} deleted`);
+        } catch (e) { alert(e.message); btn.disabled = false; }
       });
       listEl.querySelectorAll('[data-start-edit]').forEach(btn => btn.onclick = () => { editing = parseInt(btn.dataset.startEdit, 10); draw(); });
       listEl.querySelectorAll('[data-cancel-edit]').forEach(btn => btn.onclick = () => { editing = null; draw(); });

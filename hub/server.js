@@ -255,6 +255,7 @@ const configReport = () => ({
   email_configured: !!RESEND_KEY,
   email_key_length: RESEND_KEY.length, // Resend keys are ~36 chars — a short value means a truncated paste
   email_from_set: !!cleanEnv(process.env.HUB_EMAIL_FROM),
+  reply_to_set: !!cleanEnv(process.env.HUB_REPLY_TO),
   notify_email_set: !!cleanEnv(process.env.HUB_NOTIFY_EMAIL),
   password_set: !!process.env.HUB_PASSWORD,
   currency: CURRENCY,
@@ -340,11 +341,15 @@ async function sendEmail(to, subject, html) {
   if (!apiKey) return { sent: false, reason: 'RESEND_API_KEY not set on the hub' };
   if (!to) return { sent: false, reason: 'No recipient email registered for this shop' };
   const from = cleanEnv(process.env.HUB_EMAIL_FROM) || 'Dose Hub <onboarding@resend.dev>';
+  // The from-address must live on the verified sending domain (e.g.
+  // order@send.boxxcoffee.com), which usually isn't a real inbox — replies
+  // route to HUB_REPLY_TO (e.g. order@boxxcoffee.com) when set.
+  const replyTo = cleanEnv(process.env.HUB_REPLY_TO);
   try {
     const res = await fetch('https://api.resend.com/emails', {
       method: 'POST',
       headers: { 'Authorization': `Bearer ${apiKey}`, 'Content-Type': 'application/json' },
-      body: JSON.stringify({ from, to: [to], subject, html }),
+      body: JSON.stringify({ from, to: [to], subject, html, ...(replyTo ? { reply_to: [replyTo] } : {}) }),
     });
     const data = await res.json().catch(() => ({}));
     if (!res.ok) return { sent: false, reason: data.message || `Email provider error (${res.status})` };
@@ -833,6 +838,18 @@ app.patch('/api/orders/:id', async (req, res) => {
   res.json({ ...updated, email });
 });
 
+// Delete an order outright — for trial/test orders that shouldn't become
+// history. Removes the order and its line items; stock-ledger movements from
+// already-filled lines are kept (the coffee was really roasted). The shop's
+// own local log keeps its copy.
+app.delete('/api/orders/:id', (req, res) => {
+  const order = db.prepare('SELECT * FROM orders WHERE id=?').get(req.params.id);
+  if (!order) return res.status(404).json({ error: 'Order not found' });
+  db.prepare('DELETE FROM order_items WHERE order_id=?').run(order.id);
+  db.prepare('DELETE FROM orders WHERE id=?').run(order.id);
+  res.json({ ok: true });
+});
+
 // Roaster edits an order's quantities; the shop is notified by email.
 app.put('/api/orders/:id/items', async (req, res) => {
   try {
@@ -1138,6 +1155,9 @@ app.patch('/api/order-items/:id', (req, res) => {
 function generateRoastReports() {
   for (const [type, fmt] of [['week', '%Y-W%W'], ['month', '%Y-%m']]) {
     const current = db.prepare(`SELECT strftime('${fmt}', 'now') p`).get().p;
+    // Reports are purely derived from orders — rebuild closed periods from
+    // scratch so deleted (trial) orders drop out instead of lingering.
+    db.prepare('DELETE FROM roast_reports WHERE period_type=? AND period < ?').run(type, current);
     const rows = db.prepare(
       `SELECT strftime('${fmt}', o.order_date) period, o.shop_id, s.name shop_name,
               oi.coffee_name, oi.roast, SUM(oi.lbs) lbs, SUM(oi.line_total) cost
