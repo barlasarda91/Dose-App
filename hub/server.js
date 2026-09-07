@@ -255,6 +255,7 @@ const configReport = () => ({
   email_configured: !!RESEND_KEY,
   email_key_length: RESEND_KEY.length, // Resend keys are ~36 chars — a short value means a truncated paste
   email_from_set: !!cleanEnv(process.env.HUB_EMAIL_FROM),
+  reply_to_set: !!cleanEnv(process.env.HUB_REPLY_TO),
   notify_email_set: !!cleanEnv(process.env.HUB_NOTIFY_EMAIL),
   password_set: !!process.env.HUB_PASSWORD,
   currency: CURRENCY,
@@ -340,11 +341,15 @@ async function sendEmail(to, subject, html) {
   if (!apiKey) return { sent: false, reason: 'RESEND_API_KEY not set on the hub' };
   if (!to) return { sent: false, reason: 'No recipient email registered for this shop' };
   const from = cleanEnv(process.env.HUB_EMAIL_FROM) || 'Dose Hub <onboarding@resend.dev>';
+  // The from-address must live on the verified sending domain (e.g.
+  // order@send.boxxcoffee.com), which usually isn't a real inbox — replies
+  // route to HUB_REPLY_TO (e.g. order@boxxcoffee.com) when set.
+  const replyTo = cleanEnv(process.env.HUB_REPLY_TO);
   try {
     const res = await fetch('https://api.resend.com/emails', {
       method: 'POST',
       headers: { 'Authorization': `Bearer ${apiKey}`, 'Content-Type': 'application/json' },
-      body: JSON.stringify({ from, to: [to], subject, html }),
+      body: JSON.stringify({ from, to: [to], subject, html, ...(replyTo ? { reply_to: [replyTo] } : {}) }),
     });
     const data = await res.json().catch(() => ({}));
     if (!res.ok) return { sent: false, reason: data.message || `Email provider error (${res.status})` };

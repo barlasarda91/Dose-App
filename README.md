@@ -94,7 +94,7 @@ The `hub/` directory contains a separate service for the roastery:
 - **Shops** — create a shop with its registered email to mint its API key (shown once, stored hashed); edit, rotate keys.
 - **Patterns** — per shop: volume, spend, espresso/filter roast mix, top coffees, cadence, 12-week trend.
 
-**Hub environment variables:** `HUB_PASSWORD` (roastery login, required), `HUB_DB_PATH=/app/data/hub.db`, `RESEND_API_KEY` + `HUB_EMAIL_FROM` (receipt/confirmation emails), `HUB_NOTIFY_EMAIL` (your copy of new orders), `HUB_CURRENCY` (default `$`).
+**Hub environment variables:** `HUB_PASSWORD` (roastery login, required), `HUB_DB_PATH=/app/data/hub.db`, `RESEND_API_KEY` + `HUB_EMAIL_FROM` (sender — must be on the Resend-verified domain, e.g. `Dose Hub <order@send.boxxcoffee.com>`), `HUB_REPLY_TO` (where shop replies land, e.g. `order@boxxcoffee.com`), `HUB_NOTIFY_EMAIL` (your copy of new orders), `HUB_CURRENCY` (default `$`).
 
 **Deploy** (own Railway service, same repo): New service → same GitHub repo → **Root Directory `/hub`** → variables above → volume at `/app/data`.
 
