@@ -38,6 +38,19 @@ const itemQty = i => isRetailRoast(i.roast) ? `${i.bags} × 12oz` : `${i.lbs} lb
 
 const FREQ_LABELS = { weekly: 'Weekly', biweekly: 'Every 2 weeks', monthly: 'Monthly' };
 
+// Tasting notes display as "Buttery. Chocolate. Marzipan. Cherry." no matter
+// how the roastery typed them (commas, dots, middots, any capitalization).
+// Display-only — the stored text is untouched.
+export function formatNotes(raw) {
+  if (!raw) return '';
+  const notes = String(raw)
+    .split(/[.,;·|/]+/)
+    .map(s => s.trim())
+    .filter(Boolean)
+    .map(n => n.split(/\s+/).map(w => w.charAt(0).toUpperCase() + w.slice(1).toLowerCase()).join(' '));
+  return notes.length ? notes.join('. ') + '.' : '';
+}
+
 // Same page, two layouts: below 700px the price-list table becomes a card
 // per coffee with tap steppers, and the send button pins to the bottom.
 function useIsMobile() {
@@ -275,7 +288,7 @@ export default function Order() {
                         {it.badge && <span className="ocard-badge">{it.badge}</span>}
                         {it.low_stock && <span className="ocard-badge low">Low stock</span>}
                       </div>
-                      {it.notes && <div className="ocard-notes">{it.notes}</div>}
+                      {it.notes && <div className="ocard-notes">{formatNotes(it.notes)}</div>}
                       <div className="ocard-price">{money(it.price_per_lb)}/lb wholesale</div>
                     </div>
                     {stepRow('espresso', 'Espresso Roast', '5-lb bags · ×5 lbs')}
@@ -324,7 +337,7 @@ export default function Order() {
                           {it.badge && <span style={{ fontSize: 10, letterSpacing: '.14em', textTransform: 'uppercase', border: '1px solid var(--olive)', color: 'var(--olive)', padding: '2px 7px', marginLeft: 8, verticalAlign: 'middle' }}>{it.badge}</span>}
                           {it.low_stock && <span style={{ fontSize: 10, letterSpacing: '.14em', textTransform: 'uppercase', border: '1px solid var(--warn)', color: 'var(--warn)', padding: '2px 7px', marginLeft: 8, verticalAlign: 'middle' }}>Low stock</span>}
                         </div>
-                        {it.notes && <div style={{ fontSize: 11, color: 'var(--drift)', marginTop: 2 }}>{it.notes}</div>}
+                        {it.notes && <div style={{ fontSize: 11, color: 'var(--drift)', marginTop: 2 }}>{formatNotes(it.notes)}</div>}
                       </td>
                       <td style={{ textAlign: 'right', whiteSpace: 'nowrap' }}>
                         {money(it.price_per_lb)}

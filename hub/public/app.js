@@ -64,6 +64,14 @@
   const isRetail = r => r === 'retail' || String(r).startsWith('retail_');
   const roastTag = r => `<span class="roast-lbl">${ROAST_TAGS[r] || r}</span>`;
   const qtyText = i => isRetail(i.roast) ? `${i.bags} × 12oz` : `${i.lbs} lbs`;
+  // Tasting notes render as "Buttery. Chocolate. Cherry." regardless of how
+  // they were typed — display-only, the stored text is untouched.
+  const fmtNotes = raw => {
+    if (!raw) return '';
+    const notes = String(raw).split(/[.,;·|/]+/).map(s => s.trim()).filter(Boolean)
+      .map(n => n.split(/\s+/).map(w => w.charAt(0).toUpperCase() + w.slice(1).toLowerCase()).join(' '));
+    return notes.length ? notes.join('. ') + '.' : '';
+  };
   const kg = lbs => (lbs * 0.453592).toFixed(1);
   // Hub timestamps are stored in UTC; the roastery runs on Los Angeles time.
   // Keep in sync with HUB_TZ on the server.
@@ -801,7 +809,7 @@
         <tbody>${items.map(i => `
           <tr style="${i.active ? '' : 'opacity:.55'}">
             <td><span style="font-family:var(--serif);font-size:13px;color:var(--ink)">${esc(i.name)}</span>${badge(i)}
-              <div style="font-size:10px;color:var(--drift)">${esc(i.notes || '')}</div></td>
+              <div style="font-size:10px;color:var(--drift)">${esc(fmtNotes(i.notes))}</div></td>
             <td class="num">${money(i.price_per_lb)}</td>
             <td class="num">${i.retail_price != null ? money(i.retail_price) : '—'}</td>
             <td style="font-size:11px;color:var(--drift)">${i.visibility === 'exclusive'
