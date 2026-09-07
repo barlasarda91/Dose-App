@@ -1154,7 +1154,10 @@ app.patch('/api/order-items/:id', (req, res) => {
 // Patterns and audits.
 function generateRoastReports() {
   for (const [type, fmt] of [['week', '%Y-W%W'], ['month', '%Y-%m']]) {
-    const current = db.prepare(`SELECT strftime('${fmt}', 'now') p`).get().p;
+    // Periods close on the roastery's calendar (HUB_TZ, default Los Angeles),
+    // not UTC — otherwise a week would roll over at 4/5pm local time.
+    const laToday = new Date().toLocaleDateString('en-CA', { timeZone: process.env.HUB_TZ || 'America/Los_Angeles' });
+    const current = db.prepare(`SELECT strftime('${fmt}', ?) p`).get(laToday).p;
     // Reports are purely derived from orders — rebuild closed periods from
     // scratch so deleted (trial) orders drop out instead of lingering.
     db.prepare('DELETE FROM roast_reports WHERE period_type=? AND period < ?').run(type, current);
