@@ -146,3 +146,31 @@ test('retail bags carry their roast profile; plain retail stays for legacy', () 
   assert.equal(r.total_cost, 56.00);
   assert.throws(() => priceItemsFromCatalog([{ coffee_id: 1, roast: 'retail_dark', bags: 1 }], catalog), /roast/);
 });
+
+// ─── batchDoseGrams ───────────────────────────────────────────────────────────
+
+const { batchDoseGrams, METHOD_ROAST } = require('./calc');
+
+test('batchDoseGrams: cups mode divides coffee by cups served', () => {
+  assert.equal(batchDoseGrams({ batch_grams: 900, yield_mode: 'cups', yield_cups: 37 }), 24.3);
+  assert.equal(batchDoseGrams({ batch_grams: 900, yield_mode: 'cups', yield_cups: 40 }), 22.5);
+});
+
+test('batchDoseGrams: volume mode converts liters + serving oz to cups', () => {
+  // 19L at 8oz servings ≈ 80.3 cups → 1800/80.3 ≈ 22.4 g/cup
+  assert.equal(batchDoseGrams({ batch_grams: 1800, yield_mode: 'vol', yield_liters: 19, serving_oz: 8 }), 22.4);
+});
+
+test('batchDoseGrams: rejects missing or zero inputs with clear messages', () => {
+  assert.throws(() => batchDoseGrams({ batch_grams: 0, yield_mode: 'cups', yield_cups: 10 }), /per batch/);
+  assert.throws(() => batchDoseGrams({ batch_grams: 900, yield_mode: 'cups', yield_cups: 0 }), /Cups served/);
+  assert.throws(() => batchDoseGrams({ batch_grams: 900, yield_mode: 'vol', yield_liters: 36 }), /Serving size/);
+  assert.throws(() => batchDoseGrams({ batch_grams: 900, yield_mode: 'vol', serving_oz: 12 }), /volume in liters/);
+});
+
+test('METHOD_ROAST: espresso machine pulls espresso roast, the rest filter', () => {
+  assert.equal(METHOD_ROAST.espresso, 'espresso');
+  assert.equal(METHOD_ROAST.batch, 'filter');
+  assert.equal(METHOD_ROAST.coldbrew, 'filter');
+  assert.equal(METHOD_ROAST.pourover, 'filter');
+});

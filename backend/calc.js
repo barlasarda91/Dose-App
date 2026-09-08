@@ -93,6 +93,34 @@ function suggestOrderLbs({ usedGrams, days, expectedRemainingGrams, horizonDays 
 // A 12oz retail bag holds 0.75 lb of roasted coffee.
 const BAG_LBS = 0.75;
 
+// ─── Brew methods ────────────────────────────────────────────────────────────
+// How a drink is brewed determines which ROAST it draws from — espresso
+// machine drinks pull espresso roast, everything else pulls filter roast.
+// Stock and efficiency are tracked per roast; the method is kept so usage can
+// still be broken down (batch vs cold brew vs pour-over).
+const METHODS = ['espresso', 'batch', 'coldbrew', 'pourover'];
+const METHOD_ROAST = { espresso: 'espresso', batch: 'filter', coldbrew: 'filter', pourover: 'filter' };
+const OZ_PER_LITER = 33.814;
+
+// Per-cup dose for batch-brewed methods (batch brew, cold brew): coffee in
+// per batch ÷ cups out. Yield comes as cups served directly, or as brewed
+// volume + serving size.
+function batchDoseGrams({ batch_grams, yield_mode, yield_cups, yield_liters, serving_oz }) {
+  const g = parseFloat(batch_grams);
+  if (!Number.isFinite(g) || g <= 0) throw new Error('Coffee per batch must be a positive number of grams');
+  let cups;
+  if (yield_mode === 'vol') {
+    const l = parseFloat(yield_liters), oz = parseFloat(serving_oz);
+    if (!Number.isFinite(l) || l <= 0) throw new Error('Batch volume in liters is required');
+    if (!Number.isFinite(oz) || oz <= 0) throw new Error('Serving size in oz is required to turn volume into cups');
+    cups = (l * OZ_PER_LITER) / oz;
+  } else {
+    cups = parseFloat(yield_cups);
+    if (!Number.isFinite(cups) || cups <= 0) throw new Error('Cups served per batch is required');
+  }
+  return Math.round((g / cups) * 10) / 10;
+}
+
 // Retail bags carry their roast profile ('retail_espresso' / 'retail_filter')
 // so the roastery can batch them with the matching wholesale roast. Plain
 // 'retail' is the legacy value from before the split — still accepted.
@@ -136,4 +164,4 @@ function priceItemsFromCatalog(rawItems, catalogItems) {
   };
 }
 
-module.exports = { LBS_TO_GRAMS, GALLONS_TO_ML, BAG_LBS, RETAIL_ROASTS, isRetail, aggregateOrders, calcCoffeeStock, calcEfficiency, suggestOrderLbs, priceItemsFromCatalog };
+module.exports = { LBS_TO_GRAMS, GALLONS_TO_ML, BAG_LBS, RETAIL_ROASTS, isRetail, METHODS, METHOD_ROAST, OZ_PER_LITER, batchDoseGrams, aggregateOrders, calcCoffeeStock, calcEfficiency, suggestOrderLbs, priceItemsFromCatalog };
