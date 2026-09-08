@@ -205,6 +205,12 @@ export default function Order() {
     }
   }
 
+  const lastRun = s => s.last_result ? (
+    <div style={{ fontSize: 11, marginTop: 4, color: s.last_result.startsWith('FAILED') ? 'var(--red)' : 'var(--drift)' }}>
+      last run{s.last_run_at ? ` ${String(s.last_run_at).slice(0, 10)}` : ''}: {s.last_result}
+    </div>
+  ) : null;
+
   async function cancelStanding(id) {
     if (!window.confirm('Cancel this standing order? No further automatic orders will be placed.')) return;
     await apiJson(`/api/standing-orders/${id}`, { method: 'DELETE' }).catch(() => {});
@@ -410,6 +416,7 @@ export default function Order() {
                         return <div key={idx}>{roastTag(i.roast)}{c ? c.name : `#${i.coffee_id}`} · {isRetailRoast(i.roast) ? `${i.bags} × 12oz` : `${i.lbs} lbs`}</div>;
                       })}
                     </div>
+                    {lastRun(s)}
                     <div className="hcard-foot">
                       <span>set by {s.created_by || '—'}</span>
                       <button className="btn btn-danger" onClick={() => cancelStanding(s.id)}>Cancel</button>
@@ -431,7 +438,7 @@ export default function Order() {
                             return <div key={idx}>{roastTag(i.roast)}{c ? c.name : `#${i.coffee_id}`} · {isRetailRoast(i.roast) ? `${i.bags} × 12oz` : `${i.lbs} lbs`}</div>;
                           })}
                         </td>
-                        <td>{s.next_date}</td>
+                        <td>{s.next_date}{lastRun(s)}</td>
                         <td style={{ color: 'var(--drift)', fontSize: 12 }}>{s.created_by || '—'}</td>
                         <td><button className="btn btn-danger" onClick={() => cancelStanding(s.id)}>Cancel</button></td>
                       </tr>

@@ -215,6 +215,9 @@ for (const t of ['coffee_deliveries', 'milk_deliveries', 'coffee_orders', 'drink
   try { db.exec(`ALTER TABLE ${t} ADD COLUMN created_by TEXT`); } catch { /* already present */ }
 }
 try { db.exec('ALTER TABLE coffee_orders ADD COLUMN hub_status TEXT'); } catch { /* already present */ }
+for (const col of ['last_run_at TEXT', 'last_result TEXT']) {
+  try { db.exec(`ALTER TABLE standing_orders ADD COLUMN ${col}`); } catch { /* present */ }
+}
 for (const col of ['requested_date TEXT', 'total_lbs REAL', 'total_cost REAL']) {
   try { db.exec(`ALTER TABLE coffee_orders ADD COLUMN ${col}`); } catch { /* already present */ }
 }
@@ -1429,6 +1432,7 @@ function advanceDate(dateStr, frequency) {
 const standingOrderPublic = s => ({
   id: s.id, frequency: s.frequency, items: JSON.parse(s.items_json), notes: s.notes,
   next_date: s.next_date, active: !!s.active, created_by: s.created_by, created_at: s.created_at,
+  last_run_at: s.last_run_at, last_result: s.last_result,
 });
 
 app.get('/api/standing-orders', (req, res) =>
@@ -1465,23 +1469,35 @@ async function runStandingOrders() {
   const today = new Date().toISOString().slice(0, 10);
   const due = db.prepare('SELECT * FROM standing_orders WHERE active=1 AND next_date <= ?').all(today);
   for (const so of due) {
+    let result;
     try {
-      await placeCatalogOrder({
+      const placed = await placeCatalogOrder({
         order_date: today,
         requested_date: null,
         notes: so.notes ? `${so.notes} (standing order)` : 'standing order',
         rawItems: JSON.parse(so.items_json),
         username: `${so.created_by || 'standing'} ⟳`,
       });
-      console.log(`Standing order #${so.id} placed`);
+      result = placed.hub.pushed ? `placed order #${placed.order.id}`
+        : `placed order #${placed.order.id}, but hub push failed: ${placed.hub.reason}`;
+      console.log(`Standing order #${so.id}: ${result}`);
     } catch (err) {
-      console.error(`Standing order #${so.id} failed: ${err.message}`);
+      // The failure must be visible on the Order page, not only in the logs.
+      result = `FAILED: ${err.message}`;
+      console.error(`Standing order #${so.id} ${result}`);
     }
-    db.prepare('UPDATE standing_orders SET next_date=? WHERE id=?').run(advanceDate(so.next_date, so.frequency), so.id);
+    db.prepare("UPDATE standing_orders SET next_date=?, last_run_at=datetime('now'), last_result=? WHERE id=?")
+      .run(advanceDate(so.next_date, so.frequency), result, so.id);
   }
 }
 setTimeout(runStandingOrders, 15_000);
 setInterval(runStandingOrders, 60 * 60 * 1000).unref();
+
+// Run due standing orders now (admin) — used by tests and for catch-up.
+app.post('/api/standing-orders/run', requireAdmin, asyncRoute(async (req, res) => {
+  await runStandingOrders();
+  res.json(db.prepare('SELECT * FROM standing_orders ORDER BY id').all().map(standingOrderPublic));
+}));
 
 // Suggested order quantities from the current open cycle's burn rate.
 app.get('/api/order-suggestion', async (req, res) => {
