@@ -300,6 +300,33 @@ tbody tr.selected td, tr.selected td { background: rgba(107,110,74,0.12); }
 
 /* ── Mobile layout (the same webpage below 700px — desktop untouched) ── */
 
+/* ─── Coffee info sheet ────────────────────────────────────────────────────── */
+.isheet-link { display: inline-block; margin-top: 4px; font-size: 10px; letter-spacing: 0.14em; text-transform: uppercase; color: var(--olive); text-decoration: underline; cursor: pointer; }
+.isheet-bg { position: fixed; inset: 0; z-index: 500; background: rgba(26,25,22,0.55); display: flex; align-items: flex-start; justify-content: center; padding: 30px 16px; overflow-y: auto; }
+.isheet { width: 600px; max-width: 100%; background: var(--parch); border: 1px solid var(--ink); box-shadow: 6px 6px 0 rgba(26,25,22,0.35); }
+.isheet-head { background: var(--ink); color: var(--parch); padding: 20px 26px; }
+.isheet-eyebrow { font-size: 9px; letter-spacing: 0.3em; text-transform: uppercase; color: #B8AFA3; }
+.isheet-name { font-family: var(--font-serif); font-size: 24px; margin-top: 4px; }
+.isheet-notes { font-size: 11px; letter-spacing: 0.12em; text-transform: uppercase; color: #CBBF9E; margin-top: 6px; }
+.isheet-facts { display: grid; grid-template-columns: 1fr 1fr 1fr; border-bottom: 1px solid var(--stone); }
+.isheet-fact { padding: 11px 16px; border-right: 1px solid var(--stone); border-bottom: 1px solid var(--stone); }
+.isheet-fact:nth-child(3n) { border-right: none; }
+.isheet-fact-lbl { font-size: 8px; letter-spacing: 0.22em; text-transform: uppercase; color: var(--drift); }
+.isheet-fact-val { font-size: 12px; color: var(--ink); margin-top: 2px; }
+.isheet-body { padding: 16px 26px 20px; font-size: 12px; color: var(--graphite); line-height: 1.85; }
+.isheet-sec { font-size: 9px; letter-spacing: 0.22em; text-transform: uppercase; color: var(--olive); margin: 14px 0 4px; }
+.isheet-text { white-space: pre-wrap; }
+.isheet-brew { display: grid; grid-template-columns: 1fr 1fr; gap: 1px; background: var(--stone); border: 1px solid var(--stone); margin-top: 4px; }
+.isheet-brewcell { background: #FCF8EE; padding: 10px 14px; white-space: pre-wrap; }
+.isheet-brew-lbl { font-size: 8px; letter-spacing: 0.22em; text-transform: uppercase; color: var(--drift); margin-bottom: 3px; }
+.isheet-foot { display: flex; justify-content: space-between; align-items: center; gap: 12px; margin-top: 18px; padding-top: 12px; border-top: 1px solid var(--stone); font-size: 10px; color: var(--drift); }
+.isheet-actions { display: flex; gap: 10px; }
+@media print {
+  body.print-sheet .nav, body.print-sheet .page, body.print-sheet .isheet-actions { display: none !important; }
+  body.print-sheet .isheet-bg { position: static; background: none; padding: 0; overflow: visible; }
+  body.print-sheet .isheet { border: none; box-shadow: none; width: 100%; }
+}
+
 /* ─── Guided tour ──────────────────────────────────────────────────────────── */
 .tour-layer { position: fixed; inset: 0; z-index: 1000; }
 .tour-dim { position: absolute; inset: 0; background: rgba(26,25,22,0.55); }
@@ -350,5 +377,7 @@ tbody tr.selected td, tr.selected td { background: rgba(107,110,74,0.12); }
   .btn { padding: 12px 18px; }
   .btn-danger, .btn-sm { padding: 9px 12px; }
   .modal { max-height: 90vh; overflow-y: auto; }
+  .isheet-facts { grid-template-columns: 1fr 1fr; }
+  .isheet-brew { grid-template-columns: 1fr; }
   .tour-card, .tour-card-center { left: 10px !important; right: 10px; bottom: 12px; top: auto !important; width: auto; transform: none !important; }
 }

@@ -1,6 +1,7 @@
 import React, { useState, useEffect, useMemo } from 'react';
 import { apiJson } from '../api';
 import DateField from '../DateField';
+import InfoSheet from '../InfoSheet';
 
 const TODAY = new Date().toISOString().slice(0, 10);
 
@@ -56,6 +57,7 @@ export default function Order() {
   const [catalog, setCatalog]   = useState(null); // { configured, currency, items, error }
   const [orders, setOrders]     = useState([]);
   const [standing, setStanding] = useState([]);
+  const [sheetItem, setSheetItem] = useState(null); // coffee whose info sheet is open
   // quantities keyed by `${coffeeId}:${roast}` — roast: espresso | filter | retail (bags)
   const [qty, setQty]           = useState({});
   const [reqDate, setReqDate]   = useState('');
@@ -280,6 +282,7 @@ export default function Order() {
                       </div>
                       {it.notes && <div className="ocard-notes">{it.notes}</div>}
                       <div className="ocard-price">{money(it.price_per_lb)}/lb wholesale</div>
+                      {it.info_sheet && <span className="isheet-link" onClick={() => setSheetItem(it)}>ⓘ Info Sheet</span>}
                     </div>
                     {stepRow('espresso', 'Espresso Roast', '5-lb bags · ×5 lbs')}
                     {stepRow('filter', 'Filter Roast', '5-lb bags · ×5 lbs')}
@@ -328,6 +331,7 @@ export default function Order() {
                           {it.low_stock && <span style={{ fontSize: 10, letterSpacing: '.14em', textTransform: 'uppercase', border: '1px solid var(--warn)', color: 'var(--warn)', padding: '2px 7px', marginLeft: 8, verticalAlign: 'middle' }}>Low stock</span>}
                         </div>
                         {it.notes && <div style={{ fontSize: 11, color: 'var(--drift)', marginTop: 2 }}>{it.notes}</div>}
+                        {it.info_sheet && <span className="isheet-link" onClick={() => setSheetItem(it)}>ⓘ Info Sheet</span>}
                       </td>
                       <td style={{ textAlign: 'right', whiteSpace: 'nowrap' }}>
                         {money(it.price_per_lb)}
@@ -554,6 +558,7 @@ export default function Order() {
           </button>
         </div>
       )}
+      {sheetItem && <InfoSheet item={sheetItem} onClose={() => setSheetItem(null)} />}
     </div>
   );
 }
