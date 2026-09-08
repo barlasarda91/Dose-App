@@ -119,8 +119,19 @@ Both services snapshot their SQLite database **nightly** (one per Los Angeles ca
 ## Development
 
 ```bash
-npm run install:all          # install backend + frontend deps
-npm --prefix backend test    # unit tests for the efficiency / cycle / order math (backend/calc.js)
+npm run install:all          # install backend + frontend + hub deps
 npm --prefix backend run dev # backend on :3001
 npm --prefix frontend start  # frontend dev server on :3000 (proxies /api)
 ```
+
+## Testing
+
+```bash
+npm test            # everything below, in order
+npm run test:unit   # backend/calc.test.js — pure math (doses, cycles, pricing)
+npm run test:shop   # tests/shop.test.js — real backend vs mock Square + mock hub
+npm run test:hub    # tests/hub.test.js — real hub, full roastery lifecycle
+npm run test:ui     # tests/hub-ui.test.js — hub dashboard in a real browser
+```
+
+The pressure suites (`tests/`) boot the actual servers on throwaway databases and attack the seams: LA DST-spanning cycles (asserting the exact offsets sent to Square), same-day and retroactive deliveries, standing-order failure visibility, ingest dedup on retried pushes, roast-fill idempotency and On Hand ledger math, role walls, and the login/bootstrap/forced-password-change flows in a browser. The UI suite needs Playwright + a Chromium (`PW_CHROMIUM` env to point at one) and skips cleanly when absent. No network access is required — Square and the hub are mocked locally.

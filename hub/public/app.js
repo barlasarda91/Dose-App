@@ -14,7 +14,12 @@
     if (opts.body) headers['Content-Type'] = 'application/json';
     if (getToken()) headers['x-hub-key'] = getToken();
     const res = await fetch(path, { ...opts, headers });
-    if (res.status === 401) { localStorage.removeItem('hub_key'); renderLogin(); throw new Error('Unauthorized'); }
+    // A 401 means the session died — except on the login/bootstrap calls
+    // themselves, where it's just wrong credentials and the form must stay
+    // put with its error (re-rendering here wiped the typed username).
+    if (res.status === 401 && path !== '/api/login' && path !== '/api/setup-owner') {
+      localStorage.removeItem('hub_key'); renderLogin(); throw new Error('Unauthorized');
+    }
     const data = await res.json().catch(() => ({}));
     if (res.status === 403 && data.must_change_password) { renderChangePassword(); throw new Error('Set your own password first'); }
     if (!res.ok) throw new Error(data.error || `Request failed (${res.status})`);
