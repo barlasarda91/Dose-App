@@ -6,7 +6,7 @@ const fetch = require('node-fetch');
 const Database = require('better-sqlite3');
 const path = require('path');
 const { generateReport } = require('./report');
-const { LBS_TO_GRAMS, GALLONS_TO_ML, aggregateOrders, calcCoffeeStock, calcEfficiency, suggestOrderLbs, priceItemsFromCatalog } = require('./calc');
+const { LBS_TO_GRAMS, GALLONS_TO_ML, METHODS, METHOD_ROAST, batchDoseGrams, aggregateOrders, calcCoffeeStock, calcEfficiency, suggestOrderLbs, priceItemsFromCatalog } = require('./calc');
 
 const app = express();
 // Same-origin in production (frontend is served by this server) — CORS headers
@@ -220,6 +220,21 @@ for (const col of ['requested_date TEXT', 'total_lbs REAL', 'total_cost REAL']) 
 }
 try { db.exec("ALTER TABLE users ADD COLUMN source TEXT DEFAULT 'local'"); } catch { /* already present */ }
 try { db.exec('ALTER TABLE order_items ADD COLUMN bags INTEGER'); } catch { /* already present */ }
+
+// Recipes: brew method (which roast a drink pulls from is derived from it)
+// plus the batch inputs for batch-brewed methods. `category` remains as a
+// legacy column, kept in sync for anything that still reads it.
+for (const col of ['method TEXT', 'batch_grams REAL', 'yield_mode TEXT', 'yield_cups REAL', 'yield_liters REAL', 'serving_oz REAL']) {
+  try { db.exec(`ALTER TABLE drink_recipes ADD COLUMN ${col}`); } catch { /* already present */ }
+}
+// Backfill method from the old category on databases from before the change.
+db.exec(`UPDATE drink_recipes SET method = CASE category
+  WHEN 'espresso' THEN 'espresso' WHEN 'drip' THEN 'batch'
+  WHEN 'coldbrew' THEN 'coldbrew' ELSE 'pourover' END
+  WHERE method IS NULL`);
+
+// Square items deliberately excluded from usage tracking (no coffee in them).
+db.exec('CREATE TABLE IF NOT EXISTS ignored_square_items (name TEXT PRIMARY KEY)');
 
 // Widen the roast CHECK from earlier versions (SQLite requires a rebuild).
 // Two generations: pre-retail, and pre-profile-split ('retail_espresso').
@@ -651,6 +666,8 @@ app.post('/api/settings', (req, res) => {
 });
 
 // ─── Square helpers ───────────────────────────────────────────────────────────
+// Overridable so integration tests can point the app at a mock Square server.
+const SQUARE_BASE = process.env.SQUARE_BASE_URL || 'https://connect.squareup.com';
 let cachedLocations = null;
 
 function getSquareToken() {
@@ -661,7 +678,7 @@ function getSquareToken() {
 
 async function getLocations() {
   if (cachedLocations) return cachedLocations;
-  const res = await fetch('https://connect.squareup.com/v2/locations', {
+  const res = await fetch(`${SQUARE_BASE}/v2/locations`, {
     headers: { 'Authorization': `Bearer ${getSquareToken()}`, 'Square-Version': '2024-01-17' }
   });
   const data = await res.json();
@@ -710,7 +727,7 @@ function utcOffset(dateStr, timeZone) {
 
 async function squarePost(endpoint, body) {
   const token = getSquareToken();
-  const res = await fetch(`https://connect.squareup.com/v2${endpoint}`, {
+  const res = await fetch(`${SQUARE_BASE}/v2${endpoint}`, {
     method: 'POST',
     headers: { 'Authorization': `Bearer ${token}`, 'Content-Type': 'application/json', 'Square-Version': '2024-01-17' },
     body: JSON.stringify(body),
@@ -780,22 +797,33 @@ async function computeAnalytics(start_date, end_date) {
   const rawOrders = await fetchAllOrders(start_date, end_date, locationIds);
   const { orders: itemList, modifiers } = aggregateOrders(rawOrders);
 
-  // Recipe matching
+  // Recipe matching. Usage is tallied per brew METHOD, then rolled up to the
+  // two ROASTS that stock is actually held in (espresso machine → espresso
+  // roast; batch/cold brew/pour-over → filter roast). Legacy recipes without
+  // a method fall back to their old category.
   const recipes = db.prepare('SELECT * FROM drink_recipes').all();
   const recipeMap = {};
   for (const r of recipes) recipeMap[r.square_item_name.toLowerCase().trim()] = r;
+  const legacyMethod = { espresso: 'espresso', drip: 'batch', coldbrew: 'coldbrew', pourover: 'pourover' };
+  const methodOf = r => r.method || legacyMethod[r.category] || 'espresso';
 
-  const coffeeUsed = { espresso: 0, drip: 0, coldbrew: 0, pourover: 0 };
+  const methodUsed = { espresso: { grams: 0, drinks: 0 }, batch: { grams: 0, drinks: 0 }, coldbrew: { grams: 0, drinks: 0 }, pourover: { grams: 0, drinks: 0 } };
   const matched = {}, unmatched = {};
   for (const { name, qty, milk } of itemList) {
     const r = recipeMap[name.toLowerCase().trim()];
     if (r) {
-      coffeeUsed[r.category] += r.coffee_grams * qty;
+      const m = methodOf(r);
+      methodUsed[m].grams += r.coffee_grams * qty;
+      methodUsed[m].drinks += qty;
       matched[name] = { qty: (matched[name]?.qty || 0) + qty, milk };
     } else {
       unmatched[name] = (unmatched[name] || 0) + qty;
     }
   }
+  const coffeeUsed = {
+    espresso: methodUsed.espresso.grams,
+    filter: methodUsed.batch.grams + methodUsed.coldbrew.grams + methodUsed.pourover.grams,
+  };
 
   // Milk used from modifiers
   const milkUsed = {
@@ -818,11 +846,13 @@ async function computeAnalytics(start_date, end_date) {
     'SELECT * FROM milk_deliveries WHERE delivery_date > ? ORDER BY delivery_date ASC LIMIT 1'
   ).get(end_date);
 
+  // Stock is held per ROAST. New deliveries write filter roast into the drip
+  // columns; older four-pool history folds drip+coldbrew+pourover together.
   const stock = {
     espresso: calcCoffeeStock(coffeeDels, 'espresso_lbs_received', 'espresso_lbs_onhand'),
-    drip:     calcCoffeeStock(coffeeDels, 'drip_lbs_received',     'drip_lbs_onhand'),
-    coldbrew: calcCoffeeStock(coffeeDels, 'coldbrew_lbs_received', 'coldbrew_lbs_onhand'),
-    pourover: calcCoffeeStock(coffeeDels, 'pourover_lbs_received', 'pourover_lbs_onhand'),
+    filter: calcCoffeeStock(coffeeDels, 'drip_lbs_received', 'drip_lbs_onhand')
+      + calcCoffeeStock(coffeeDels, 'coldbrew_lbs_received', 'coldbrew_lbs_onhand')
+      + calcCoffeeStock(coffeeDels, 'pourover_lbs_received', 'pourover_lbs_onhand'),
   };
 
   // Whole milk stock (gallons → ml)
@@ -844,9 +874,9 @@ async function computeAnalytics(start_date, end_date) {
   // Actual remaining from closing delivery on_hand (null if cycle still open)
   const actualRemaining = {
     espresso: closingCoffeeDel ? closingCoffeeDel.espresso_lbs_onhand * LBS_TO_GRAMS : null,
-    drip:     closingCoffeeDel ? closingCoffeeDel.drip_lbs_onhand     * LBS_TO_GRAMS : null,
-    coldbrew: closingCoffeeDel ? closingCoffeeDel.coldbrew_lbs_onhand * LBS_TO_GRAMS : null,
-    pourover: closingCoffeeDel ? closingCoffeeDel.pourover_lbs_onhand * LBS_TO_GRAMS : null,
+    filter: closingCoffeeDel
+      ? (closingCoffeeDel.drip_lbs_onhand + closingCoffeeDel.coldbrew_lbs_onhand + closingCoffeeDel.pourover_lbs_onhand) * LBS_TO_GRAMS
+      : null,
     milk_whole: closingMilkDel ? closingMilkDel.whole_bottles_onhand * GALLONS_TO_ML : null,
   };
 
@@ -869,14 +899,15 @@ async function computeAnalytics(start_date, end_date) {
     },
     cycle_open: cycleOpen,
     closing_delivery_date: closingCoffeeDel?.delivery_date || null,
+    // Usage per brew method (grams + drink counts) — the filter roast's
+    // breakdown into batch / cold brew / pour-over, no extra logging needed.
+    method_usage: methodUsed,
     eff: {
-      espresso:    eff(stock.espresso,    coffeeUsed.espresso,  actualRemaining.espresso),
-      drip:        eff(stock.drip,        coffeeUsed.drip,      actualRemaining.drip),
-      coldbrew:    eff(stock.coldbrew,    coffeeUsed.coldbrew,  actualRemaining.coldbrew),
-      pourover:    eff(stock.pourover,    coffeeUsed.pourover,  actualRemaining.pourover),
-      milk_whole:  eff(milkWholeStock,    milkUsed.whole,       actualRemaining.milk_whole),
-      milk_oat:    eff(milkOatStock,      milkUsed.oat,         null),
-      milk_almond: eff(milkAlmondStock,   milkUsed.almond,      null),
+      espresso:    eff(stock.espresso, coffeeUsed.espresso, actualRemaining.espresso),
+      filter:      eff(stock.filter,   coffeeUsed.filter,   actualRemaining.filter),
+      milk_whole:  eff(milkWholeStock,  milkUsed.whole,     actualRemaining.milk_whole),
+      milk_oat:    eff(milkOatStock,    milkUsed.oat,       null),
+      milk_almond: eff(milkAlmondStock, milkUsed.almond,    null),
     },
   };
 }
@@ -893,34 +924,139 @@ app.post('/api/analytics', async (req, res) => {
 });
 
 // ─── Recipes CRUD ─────────────────────────────────────────────────────────────
-app.get('/api/recipes', (req, res) => res.json(db.prepare('SELECT * FROM drink_recipes ORDER BY category, square_item_name').all()));
+// A recipe ties one Square item to a brew method and a dose. The method
+// decides the roast (espresso machine → espresso roast, everything else →
+// filter roast); batch-brewed methods take batch inputs and the per-cup dose
+// is computed here, server-side, with the same math the form previews.
+const METHOD_CATEGORY = { espresso: 'espresso', batch: 'drip', coldbrew: 'coldbrew', pourover: 'pourover' };
+
+function recipeFromBody(b) {
+  const name = String(b.square_item_name || '').trim();
+  if (!name) throw new Error('Square item name required');
+  // Accept legacy category payloads from any old client.
+  const method = METHODS.includes(b.method) ? b.method
+    : b.category === 'drip' ? 'batch'
+    : METHODS.includes(b.category) ? b.category : null;
+  if (!method) throw new Error('Brew method must be espresso, batch, coldbrew, or pourover');
+  const isBatch = method === 'batch' || method === 'coldbrew';
+  let grams, batch = { batch_grams: null, yield_mode: null, yield_cups: null, yield_liters: null, serving_oz: null };
+  if (isBatch && b.batch_grams != null) {
+    grams = batchDoseGrams(b);
+    batch = {
+      batch_grams: parseFloat(b.batch_grams),
+      yield_mode: b.yield_mode === 'vol' ? 'vol' : 'cups',
+      yield_cups: b.yield_mode === 'vol' ? null : parseFloat(b.yield_cups),
+      yield_liters: b.yield_mode === 'vol' ? parseFloat(b.yield_liters) : null,
+      serving_oz: b.yield_mode === 'vol' ? parseFloat(b.serving_oz) : null,
+    };
+  } else {
+    grams = parseFloat(b.coffee_grams);
+    if (!Number.isFinite(grams) || grams <= 0) throw new Error('Coffee grams must be a positive number');
+  }
+  return {
+    name, method, category: METHOD_CATEGORY[method], grams,
+    ...batch, notes: b.notes ? String(b.notes).slice(0, 200) : null,
+  };
+}
+
+app.get('/api/recipes', (req, res) => res.json(db.prepare('SELECT * FROM drink_recipes ORDER BY method, square_item_name').all()));
 
 app.post('/api/recipes', (req, res) => {
-  const { square_item_name, category, coffee_grams, milk_whole_ml, notes } = req.body;
-  const r = db.prepare('INSERT INTO drink_recipes (square_item_name,category,coffee_grams,milk_whole_ml,notes,created_by) VALUES (?,?,?,?,?,?)')
-    .run(square_item_name, category, coffee_grams, milk_whole_ml || 0, notes || null, req.user.username);
-  res.json(db.prepare('SELECT * FROM drink_recipes WHERE id=?').get(r.lastInsertRowid));
+  try {
+    const v = recipeFromBody(req.body || {});
+    const r = db.prepare(`INSERT INTO drink_recipes
+      (square_item_name, category, method, coffee_grams, batch_grams, yield_mode, yield_cups, yield_liters, serving_oz, milk_whole_ml, notes, created_by)
+      VALUES (?,?,?,?,?,?,?,?,?,0,?,?)`)
+      .run(v.name, v.category, v.method, v.grams, v.batch_grams, v.yield_mode, v.yield_cups, v.yield_liters, v.serving_oz, v.notes, req.user.username);
+    res.json(db.prepare('SELECT * FROM drink_recipes WHERE id=?').get(r.lastInsertRowid));
+  } catch (err) { res.status(400).json({ error: err.message }); }
 });
 
 app.put('/api/recipes/:id', (req, res) => {
-  const { square_item_name, category, coffee_grams, milk_whole_ml, notes } = req.body;
-  db.prepare(`UPDATE drink_recipes SET square_item_name=?,category=?,coffee_grams=?,milk_whole_ml=?,notes=?,updated_at=datetime('now') WHERE id=?`)
-    .run(square_item_name, category, coffee_grams, milk_whole_ml || 0, notes || null, req.params.id);
-  res.json(db.prepare('SELECT * FROM drink_recipes WHERE id=?').get(req.params.id));
+  try {
+    const v = recipeFromBody(req.body || {});
+    db.prepare(`UPDATE drink_recipes SET square_item_name=?, category=?, method=?, coffee_grams=?,
+      batch_grams=?, yield_mode=?, yield_cups=?, yield_liters=?, serving_oz=?, notes=?, updated_at=datetime('now') WHERE id=?`)
+      .run(v.name, v.category, v.method, v.grams, v.batch_grams, v.yield_mode, v.yield_cups, v.yield_liters, v.serving_oz, v.notes, req.params.id);
+    res.json(db.prepare('SELECT * FROM drink_recipes WHERE id=?').get(req.params.id));
+  } catch (err) { res.status(400).json({ error: err.message }); }
 });
 
 app.delete('/api/recipes/:id', (req, res) => { db.prepare('DELETE FROM drink_recipes WHERE id=?').run(req.params.id); res.json({ success: true }); });
+
+// ─── Square catalog items (for the recipe picker) ─────────────────────────────
+// The shop's real Square menu, so recipes are picked rather than typed. Sales
+// counts for the last 30 days are best-effort; the item list is the contract.
+async function fetchSquareCatalogItems() {
+  const token = getSquareToken();
+  const names = new Set();
+  let cursor;
+  do {
+    const url = new URL(`${SQUARE_BASE}/v2/catalog/list`);
+    url.searchParams.set('types', 'ITEM');
+    if (cursor) url.searchParams.set('cursor', cursor);
+    const r = await fetch(url, { headers: { 'Authorization': `Bearer ${token}`, 'Square-Version': '2024-01-17' } });
+    const data = await r.json();
+    if (data.errors) throw new Error(data.errors[0]?.detail || 'Failed to fetch Square catalog');
+    for (const o of (data.objects || [])) if (o.item_data?.name) names.add(o.item_data.name);
+    cursor = data.cursor;
+  } while (cursor);
+  return [...names];
+}
+
+app.get('/api/square-items', async (req, res) => {
+  const ignored = db.prepare('SELECT name FROM ignored_square_items ORDER BY name').all().map(r => r.name);
+  if (!getSecret('square_access_token', 'SQUARE_ACCESS_TOKEN')) return res.json({ configured: false, items: [], ignored });
+  try {
+    const names = await fetchSquareCatalogItems();
+    const sold = {};
+    try {
+      const cfg = getSettings();
+      const end = new Date().toISOString().slice(0, 10);
+      const start = new Date(Date.now() - 29 * 86400000).toISOString().slice(0, 10);
+      const raw = await fetchAllOrders(start, end, cfg.square_location_id ? [cfg.square_location_id] : []);
+      for (const o of aggregateOrders(raw).orders) sold[o.name.toLowerCase().trim()] = o.qty;
+    } catch { /* sales counts are optional garnish */ }
+    res.json({
+      configured: true, ignored,
+      items: names
+        .map(n => ({ name: n, sold_30d: sold[n.toLowerCase().trim()] ?? null }))
+        .sort((a, b) => (b.sold_30d || 0) - (a.sold_30d || 0) || a.name.localeCompare(b.name)),
+    });
+  } catch (err) {
+    res.json({ configured: true, error: err.message, items: [], ignored });
+  }
+});
+
+app.post('/api/square-items/ignore', (req, res) => {
+  const name = String((req.body || {}).name || '').trim();
+  if (!name) return res.status(400).json({ error: 'name required' });
+  db.prepare('INSERT OR IGNORE INTO ignored_square_items (name) VALUES (?)').run(name);
+  res.json({ ok: true });
+});
+
+app.post('/api/square-items/unignore', (req, res) => {
+  const name = String((req.body || {}).name || '').trim();
+  db.prepare('DELETE FROM ignored_square_items WHERE name=?').run(name);
+  res.json({ ok: true });
+});
 
 // ─── Coffee Deliveries CRUD ───────────────────────────────────────────────────
 app.get('/api/coffee-deliveries', (req, res) => res.json(db.prepare('SELECT * FROM coffee_deliveries ORDER BY delivery_date DESC').all()));
 
 app.post('/api/coffee-deliveries', (req, res) => {
-  const { delivery_date,
+  let { delivery_date,
     espresso_lbs_received, espresso_lbs_onhand,
     drip_lbs_received,     drip_lbs_onhand,
     coldbrew_lbs_received, coldbrew_lbs_onhand,
     pourover_lbs_received, pourover_lbs_onhand,
     notes } = req.body;
+  // Stock is logged per roast now: "filter roast" lands in the drip columns
+  // (the coldbrew/pourover columns only carry pre-roast-era history).
+  if (req.body.filter_lbs_received !== undefined || req.body.filter_lbs_onhand !== undefined) {
+    drip_lbs_received = req.body.filter_lbs_received;
+    drip_lbs_onhand   = req.body.filter_lbs_onhand;
+  }
   const r = db.prepare(`INSERT INTO coffee_deliveries
     (delivery_date, espresso_lbs_received, espresso_lbs_onhand, drip_lbs_received, drip_lbs_onhand,
      coldbrew_lbs_received, coldbrew_lbs_onhand, pourover_lbs_received, pourover_lbs_onhand, notes, created_by)
@@ -1295,13 +1431,17 @@ app.get('/api/order-suggestion', async (req, res) => {
     const a = await computeAnalytics(last.delivery_date, today);
     const horizonDays = 7;
     const pools = {};
-    for (const p of ['espresso', 'drip', 'coldbrew', 'pourover']) {
+    for (const p of ['espresso', 'filter']) {
       const e = a.eff[p];
       const days = Math.max(1, a.period.days);
+      const burnPerDay = e.used / days;
       pools[p] = {
         used_g: e.used,
-        burn_g_per_day: Math.round(e.used / days),
+        burn_g_per_day: Math.round(burnPerDay),
         expected_remaining_g: e.theoretical_remaining,
+        // How long the expected remaining lasts at the current pace.
+        days_left: burnPerDay > 0 && e.theoretical_remaining != null
+          ? Math.max(0, Math.round(e.theoretical_remaining / burnPerDay * 10) / 10) : null,
         suggested_lbs: suggestOrderLbs({
           usedGrams: e.used, days,
           expectedRemainingGrams: e.theoretical_remaining, horizonDays,

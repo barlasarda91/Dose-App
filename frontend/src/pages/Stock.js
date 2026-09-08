@@ -8,12 +8,12 @@ const LBS_TO_G = 453.592;
 export default function Stock() {
   const [coffeeDeliveries, setCoffeeDeliveries] = useState([]);
 
+  // Stock is held per ROAST — espresso and filter — matching what the shop
+  // actually buys. (Filter is stored in the legacy drip columns server-side.)
   const [cForm, setCForm] = useState({
     delivery_date: TODAY,
     espresso_lbs_received: '', espresso_lbs_onhand: '',
-    drip_lbs_received: '',     drip_lbs_onhand: '',
-    coldbrew_lbs_received: '', coldbrew_lbs_onhand: '',
-    pourover_lbs_received: '', pourover_lbs_onhand: '',
+    filter_lbs_received: '',   filter_lbs_onhand: '',
     notes: '',
   });
 
@@ -26,18 +26,14 @@ export default function Stock() {
       delivery_date: cForm.delivery_date,
       espresso_lbs_received: parseFloat(cForm.espresso_lbs_received) || 0,
       espresso_lbs_onhand:   parseFloat(cForm.espresso_lbs_onhand)   || 0,
-      drip_lbs_received:     parseFloat(cForm.drip_lbs_received)     || 0,
-      drip_lbs_onhand:       parseFloat(cForm.drip_lbs_onhand)       || 0,
-      coldbrew_lbs_received: parseFloat(cForm.coldbrew_lbs_received) || 0,
-      coldbrew_lbs_onhand:   parseFloat(cForm.coldbrew_lbs_onhand)   || 0,
-      pourover_lbs_received: parseFloat(cForm.pourover_lbs_received) || 0,
-      pourover_lbs_onhand:   parseFloat(cForm.pourover_lbs_onhand)   || 0,
+      filter_lbs_received:   parseFloat(cForm.filter_lbs_received)   || 0,
+      filter_lbs_onhand:     parseFloat(cForm.filter_lbs_onhand)     || 0,
       notes: cForm.notes,
     };
     const r = await api('/api/coffee-deliveries', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
     const d = await r.json();
     setCoffeeDeliveries(x => [d, ...x]);
-    setCForm({ delivery_date: TODAY, espresso_lbs_received: '', espresso_lbs_onhand: '', drip_lbs_received: '', drip_lbs_onhand: '', coldbrew_lbs_received: '', coldbrew_lbs_onhand: '', pourover_lbs_received: '', pourover_lbs_onhand: '', notes: '' });
+    setCForm({ delivery_date: TODAY, espresso_lbs_received: '', espresso_lbs_onhand: '', filter_lbs_received: '', filter_lbs_onhand: '', notes: '' });
   }
 
   async function delRow(id) {
@@ -85,23 +81,21 @@ export default function Stock() {
             </div>
           </div>
           {[
-            { label: 'Espresso', rec: 'espresso_lbs_received', oh: 'espresso_lbs_onhand' },
-            { label: 'Drip',     rec: 'drip_lbs_received',     oh: 'drip_lbs_onhand' },
-            { label: 'Cold Brew',rec: 'coldbrew_lbs_received', oh: 'coldbrew_lbs_onhand' },
-            { label: 'Pour-Over',rec: 'pourover_lbs_received', oh: 'pourover_lbs_onhand' },
+            { label: 'Espresso Roast', rec: 'espresso_lbs_received', oh: 'espresso_lbs_onhand' },
+            { label: 'Filter Roast',   rec: 'filter_lbs_received',   oh: 'filter_lbs_onhand' },
           ].map(({ label, rec, oh }) => (
             <div key={label} style={{ display: 'grid', gridTemplateColumns: '120px 1fr 1fr 1fr', gap: 10, alignItems: 'end', marginBottom: 10 }}>
               <div style={{ fontFamily: 'var(--font-mono)', fontSize: 13, color: 'var(--drift)', paddingBottom: 10 }}>{label}</div>
               <div className="form-group">
-                {label === 'Espresso' && <label className="form-lbl">On Hand (lbs) · ±1</label>}
+                {label === 'Espresso Roast' && <label className="form-lbl">On Hand (lbs) · ±1</label>}
                 <Stepper k={oh} inc={1} />
               </div>
               <div className="form-group">
-                {label === 'Espresso' && <label className="form-lbl">Received (lbs) · ±5 (one bag)</label>}
+                {label === 'Espresso Roast' && <label className="form-lbl">Received (lbs) · ±5 (one bag)</label>}
                 <Stepper k={rec} inc={5} />
               </div>
               <div className="form-group">
-                {label === 'Espresso' && <label className="form-lbl">Total (lbs)</label>}
+                {label === 'Espresso Roast' && <label className="form-lbl">Total (lbs)</label>}
                 <div style={{ fontFamily: 'var(--font-mono)', fontSize: 13, color: 'var(--graphite)', paddingTop: 10, paddingBottom: 10 }}>
                   {((parseFloat(cForm[oh]) || 0) + (parseFloat(cForm[rec]) || 0)).toFixed(1)} lbs
                   <span style={{ color: 'var(--drift)', fontSize: 11, marginLeft: 6 }}>
@@ -122,28 +116,26 @@ export default function Stock() {
           <div className="table-wrap"><table>
             <thead><tr>
               <th>Date</th>
-              <th>Espresso</th><th style={{color:'var(--warn)'}}>+rcvd</th>
-              <th>Drip</th><th style={{color:'var(--warn)'}}>+rcvd</th>
-              <th>Cold Brew</th><th style={{color:'var(--warn)'}}>+rcvd</th>
-              <th>Pour-Over</th><th style={{color:'var(--warn)'}}>+rcvd</th>
+              <th>Espresso Roast</th><th style={{color:'var(--warn)'}}>+rcvd</th>
+              <th>Filter Roast</th><th style={{color:'var(--warn)'}}>+rcvd</th>
               <th>By</th><th>Notes</th><th></th>
             </tr></thead>
-            <tbody>{coffeeDeliveries.map(d => (
+            <tbody>{coffeeDeliveries.map(d => {
+              // Old four-pool rows fold into filter roast for display.
+              const fOh  = Math.round((d.drip_lbs_onhand + d.coldbrew_lbs_onhand + d.pourover_lbs_onhand) * 10) / 10;
+              const fRec = Math.round((d.drip_lbs_received + d.coldbrew_lbs_received + d.pourover_lbs_received) * 10) / 10;
+              return (
               <tr key={d.id}>
                 <td style={{ fontFamily: 'var(--font-mono)', fontSize: 12 }}>{d.delivery_date}</td>
                 <td style={{ fontFamily: 'var(--font-mono)', fontSize: 12 }}>{d.espresso_lbs_onhand > 0 ? `${d.espresso_lbs_onhand}lb` : '—'}</td>
                 <td style={{ fontFamily: 'var(--font-mono)', fontSize: 12, color: 'var(--warn)' }}>{d.espresso_lbs_received > 0 ? `+${d.espresso_lbs_received}lb` : '—'}</td>
-                <td style={{ fontFamily: 'var(--font-mono)', fontSize: 12 }}>{d.drip_lbs_onhand > 0 ? `${d.drip_lbs_onhand}lb` : '—'}</td>
-                <td style={{ fontFamily: 'var(--font-mono)', fontSize: 12, color: 'var(--warn)' }}>{d.drip_lbs_received > 0 ? `+${d.drip_lbs_received}lb` : '—'}</td>
-                <td style={{ fontFamily: 'var(--font-mono)', fontSize: 12 }}>{d.coldbrew_lbs_onhand > 0 ? `${d.coldbrew_lbs_onhand}lb` : '—'}</td>
-                <td style={{ fontFamily: 'var(--font-mono)', fontSize: 12, color: 'var(--warn)' }}>{d.coldbrew_lbs_received > 0 ? `+${d.coldbrew_lbs_received}lb` : '—'}</td>
-                <td style={{ fontFamily: 'var(--font-mono)', fontSize: 12 }}>{d.pourover_lbs_onhand > 0 ? `${d.pourover_lbs_onhand}lb` : '—'}</td>
-                <td style={{ fontFamily: 'var(--font-mono)', fontSize: 12, color: 'var(--warn)' }}>{d.pourover_lbs_received > 0 ? `+${d.pourover_lbs_received}lb` : '—'}</td>
+                <td style={{ fontFamily: 'var(--font-mono)', fontSize: 12 }}>{fOh > 0 ? `${fOh}lb` : '—'}</td>
+                <td style={{ fontFamily: 'var(--font-mono)', fontSize: 12, color: 'var(--warn)' }}>{fRec > 0 ? `+${fRec}lb` : '—'}</td>
                 <td style={{ color: 'var(--drift)', fontSize: 12 }}>{d.created_by || '—'}</td>
                 <td style={{ color: 'var(--drift)', fontSize: 12 }}>{d.notes || '—'}</td>
                 <td><button className="btn btn-danger" onClick={() => delRow(d.id)}>Delete</button></td>
               </tr>
-            ))}</tbody>
+            );})}</tbody>
           </table></div>
         ) : <div className="empty">No coffee deliveries logged yet.</div>}
       </div>

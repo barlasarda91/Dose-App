@@ -109,6 +109,7 @@ input:-webkit-autofill, input:-webkit-autofill:hover, input:-webkit-autofill:foc
 /* Efficiency grid */
 .eff-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 1px; background: var(--linen); border: 1px solid var(--linen); }
 .eff-grid-3 { display: grid; grid-template-columns: repeat(3, 1fr); gap: 1px; background: var(--linen); border: 1px solid var(--linen); }
+.eff-grid-2 { display: grid; grid-template-columns: 1fr 1fr; gap: 1px; background: var(--linen); border: 1px solid var(--linen); }
 .eff-card { background: var(--parch); padding: 20px 18px 18px; }
 .eff-label { font-family: var(--font-mono); font-size:9px; font-weight: 400; letter-spacing: 0.22em; text-transform: uppercase; color: var(--drift); margin-bottom: 6px; }
 .eff-note { font-family: var(--font-mono); font-size:9px; font-weight: 300; color: var(--linen); margin-bottom: 8px; letter-spacing: 0.02em; line-height: 1.5; }
@@ -310,6 +311,7 @@ tbody tr.selected td, tr.selected td { background: rgba(107,110,74,0.12); }
   .page-title { font-size: 24px; }
   .stats-row { grid-template-columns: repeat(2, 1fr); }
   .eff-grid, .eff-grid-3 { grid-template-columns: 1fr 1fr; }
+  .eff-grid-2 { grid-template-columns: 1fr; }
   .snapshot-pct { font-size: 40px; }
   .modifier-row { flex-wrap: wrap; gap: 20px; }
   .settings-lbl { min-width: 100%; }

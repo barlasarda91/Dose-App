@@ -46,10 +46,10 @@ Track coffee and milk efficiency for your coffee shop by comparing Square POS sa
 
 ## How it works
 
-- **Dashboard** — opens on the current delivery cycle automatically with a snapshot of how much of the stock on hand has been consumed, pool by pool. Select any cycle or date range to re-run. Drinks sold that don't match a recipe are called out rather than silently dropped.
-- **Stock Log** — log coffee deliveries (per pool) and milk deliveries / Numilk rates
+- **Dashboard** — opens on the current delivery cycle automatically. The live cycle shows only what's knowable without a stock count: kg used per roast, burn rate (lbs/day), ~days left with a depletion bar, the suggested next order, and where the filter roast goes by brew method (batch / cold brew / pour-over). Waste settles **cycle to cycle**: a Closed Cycles section tables the last three closed cycles per roast (stocked / used / counted / waste with % of opening, red WASTE chip above 5%). Drinks sold that don't match a recipe are called out rather than silently dropped.
+- **Stock Log** — log coffee deliveries per roast (Espresso Roast / Filter Roast) and milk deliveries / Numilk rates
 - **Order** — place a coffee order with the roastery, emailed to the configured address (default `hello@boxxcoffee.com`). Includes a suggested order computed from the current cycle's burn rate, a one-click **Duplicate Last Order**, and a full order history.
-- **Drink Recipes** — maps Square item names to coffee pool and gram dose. Pre-seeded with your menu on first run.
+- **Drink Recipes** — each recipe is **picked from the shop's live Square catalog** (with 30-day sold counts), never typed, so names always match sales data. The editor asks *how is it brewed* — Espresso Machine, Batch Brew, Cold Brew, or Pour-Over — and the method decides the roast. Batch methods take batch inputs (coffee per batch + yield as cups served, or liters + serving oz) and the per-cup dose is computed server-side; espresso and pour-over keep a per-drink dose. Square items with no recipe are surfaced with **Map It** or **No coffee — ignore**. Starts empty — nothing is pre-seeded.
 - **Settings** — Square access token + Location ID, ordering config, and user management (all admin-only), plus own-password change for everyone. Secret fields are write-only: they show configured/not-configured, never the value.
 
 ## Delivery cycles
@@ -65,19 +65,20 @@ Square order timestamps are filtered in the shop's own timezone (read from the S
 ## Milk tracking (deferred)
 Milk/syrup tracking is currently hidden from the UI while the shop → hub → order cycle is the focus; the data model remains and the feature returns in the efficiency-precision phase.
 
-## Coffee pools
-| Pool | Items |
+## Roast pools
+
+Stock is held per **roast** — the thing the shop actually buys — not per brew method:
+
+| Roast | Brew methods that draw from it |
 |---|---|
-| Espresso | All espresso-based drinks |
-| Drip | Batch Brew, Cafe Au Lait |
-| Cold Brew | Cold Brew |
-| Pour-Over | Pour Over (all beans), Turkish Coffee |
+| Espresso Roast | Espresso Machine |
+| Filter Roast | Batch Brew, Cold Brew, Pour-Over |
+
+Usage is still tallied per method (that's the dashboard's "where the filter roast goes" split), then rolled up to the two roasts for stock, efficiency, and order suggestions. Older four-pool delivery history folds drip + cold brew + pour-over into filter automatically.
 
 ## Dose calculations
-- **Drip**: 24.4g per cup (110g ÷ 4.5 cups per batch)
-- **Cold Brew**: 26.2g per serve (4kg ÷ 152.5 serves from 20×1.8L bottles)
-- **Pour-Over**: 19g per single brew
-- **Turkish**: 7.5g, deducted from pour-over pool
+
+Doses are recipe-driven, per shop — nothing is hard-coded. Batch-brewed methods compute the per-cup dose from real batch numbers (e.g. 900g per batch ÷ 40 cups served = 22.5g/cup; or 1800g into 19L at 8oz servings = 22.4g/cup); espresso and pour-over are set per drink.
 
 ## Dose Hub (roastery side)
 
