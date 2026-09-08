@@ -350,7 +350,7 @@ export default function Dashboard() {
           {a.cycle_open ? (
             <div className="section">
               <div className="section-title">Current Cycle — efficiency &amp; waste settle at your next delivery count</div>
-              <div className="eff-grid-3" style={{ gridTemplateColumns: '1fr 1fr' }}>
+              <div className="eff-grid-2">
                 <BurnCard label="Espresso Roast" e={a.eff?.espresso} sug={suggestion ? { ...suggestion.pools?.espresso, horizon_days: suggestion.horizon_days } : null} />
                 <BurnCard label="Filter Roast" e={a.eff?.filter} sug={suggestion ? { ...suggestion.pools?.filter, horizon_days: suggestion.horizon_days } : null} methodSplit={methodSplit} />
               </div>
@@ -358,7 +358,7 @@ export default function Dashboard() {
           ) : (
             <div className="section">
               <div className="section-title">This Cycle — closed on {a.closing_delivery_date}</div>
-              <div className="eff-grid-3" style={{ gridTemplateColumns: '1fr 1fr' }}>
+              <div className="eff-grid-2">
                 <EffCard label="Espresso Roast" e={a.eff?.espresso} />
                 <EffCard label="Filter Roast" e={a.eff?.filter} />
               </div>
