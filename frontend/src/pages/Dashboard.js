@@ -283,7 +283,6 @@ export default function Dashboard() {
     <div className="page">
       <div className="page-eyebrow">Efficiency Tracking</div>
       <h1 className="page-title">Dashboard</h1>
-      <p className="page-sub">Live burn per roast; waste settles when a delivery closes the cycle.</p>
       <hr className="page-rule" />
 
       {cycles.length > 0 && (

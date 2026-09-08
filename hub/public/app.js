@@ -58,7 +58,7 @@
   }
 
   const header = (eyebrow, title, sub) =>
-    `<div class="eyebrow">${eyebrow}</div><h1 class="title">${title}</h1><p class="sub">${sub}</p><hr class="rule">`;
+    `<div class="eyebrow">${eyebrow}</div><h1 class="title">${title}</h1><hr class="rule">`;
 
   const ROAST_TAGS = { espresso: 'ESP', filter: 'FLT', retail: 'RTL', retail_espresso: 'RTL·ESP', retail_filter: 'RTL·FLT' };
   const isRetail = r => r === 'retail' || String(r).startsWith('retail_');

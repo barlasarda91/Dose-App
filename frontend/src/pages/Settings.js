@@ -203,9 +203,6 @@ export default function Settings({ me }) {
     <div className="page">
       <div className="page-eyebrow">Configuration</div>
       <h1 className="page-title">Settings</h1>
-      <p className="page-sub">
-        {isAdmin ? 'Square API, ordering, users, security, and dose reference.' : 'Shop info, your password, and dose reference.'}
-      </p>
       <hr className="page-rule" />
 
       {status.storagePersistent === false && (

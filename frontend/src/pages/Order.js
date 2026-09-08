@@ -225,9 +225,6 @@ export default function Order() {
     <div className="page">
       <div className="page-eyebrow">Ordering</div>
       <h1 className="page-title">Place Order</h1>
-      <p className="page-sub">
-        {catalogMode ? 'Order from the roastery price list — goes straight to the roastery hub.' : 'Order coffee from the roastery.'}
-      </p>
       <hr className="page-rule" />
 
       {catalog?.error && (

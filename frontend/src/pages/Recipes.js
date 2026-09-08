@@ -121,7 +121,6 @@ export default function Recipes() {
       <div className="page">
         <div className="page-eyebrow">Setup</div>
         <h1 className="page-title">Recipes</h1>
-        <p className="page-sub">Tell Dose what's in your drinks, and sales turn into coffee usage automatically.</p>
         <hr className="page-rule" />
         <div style={{ border: '1px solid var(--linen)', background: '#FCF8EE', padding: '70px 30px', textAlign: 'center' }}>
           <div style={{ fontFamily: 'var(--font-serif)', fontSize: 22, marginBottom: 10 }}>Start with your best seller</div>
@@ -288,7 +287,6 @@ export default function Recipes() {
     <div className="page">
       <div className="page-eyebrow">Setup</div>
       <h1 className="page-title">Recipes</h1>
-      <p className="page-sub">Tie each Square item to a brew method and a dose — sales turn into coffee usage automatically.</p>
       <hr className="page-rule" />
 
       {square.configured && unmapped.length > 0 && (
