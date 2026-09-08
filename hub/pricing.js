@@ -49,15 +49,26 @@ function catalogForShop(items, shopId, exclusiveGrants, rules) {
   return items
     .filter(i => i.active)
     .filter(i => isVisible(i, shopId, exclusiveGrants))
-    .map(i => ({
-      id: i.id,
-      name: i.name,
-      notes: i.notes,
-      badge: i.badge || null,
-      low_stock: !!i.low_stock,
-      price_per_lb: effectivePrice(i, shopId, rules),
-      retail_price: i.retail_price != null && i.retail_price > 0 ? Math.round(i.retail_price * 100) / 100 : null,
-    }));
+    .map(i => {
+      let sections = [];
+      try { sections = i.info_sections ? (Array.isArray(i.info_sections) ? i.info_sections : JSON.parse(i.info_sections)) : []; } catch { sections = []; }
+      const sheet = {
+        country: i.info_country || null, region: i.info_region || null, producer: i.info_producer || null,
+        variety: i.info_variety || null, process: i.info_process || null, altitude: i.info_altitude || null,
+        brew_filter: i.brew_filter || null, brew_espresso: i.brew_espresso || null, sections,
+      };
+      const hasSheet = Object.values(sheet).some(v => Array.isArray(v) ? v.length : v);
+      return {
+        id: i.id,
+        name: i.name,
+        notes: i.notes,
+        badge: i.badge || null,
+        low_stock: !!i.low_stock,
+        price_per_lb: effectivePrice(i, shopId, rules),
+        retail_price: i.retail_price != null && i.retail_price > 0 ? Math.round(i.retail_price * 100) / 100 : null,
+        info_sheet: hasSheet ? sheet : null,
+      };
+    });
 }
 
 // Validate and price an incoming order's line items against the shop's own

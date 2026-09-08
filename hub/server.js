@@ -160,6 +160,11 @@ db.exec(`
 try { db.exec('ALTER TABLE shops ADD COLUMN email TEXT'); } catch { /* present */ }
 // Sessions predate named accounts — old tokens carry no user and stop working.
 try { db.exec('ALTER TABLE sessions ADD COLUMN user_id INTEGER'); } catch { /* present */ }
+// Coffee info sheets: label facts + free-form sections + brew notes per roast.
+for (const col of ['info_country TEXT', 'info_region TEXT', 'info_producer TEXT', 'info_variety TEXT',
+                   'info_process TEXT', 'info_altitude TEXT', 'brew_filter TEXT', 'brew_espresso TEXT', 'info_sections TEXT']) {
+  try { db.exec(`ALTER TABLE catalog ADD COLUMN ${col}`); } catch { /* present */ }
+}
 try { db.exec('ALTER TABLE hub_users ADD COLUMN email TEXT'); } catch { /* present */ }
 try { db.exec('ALTER TABLE stock_moves ADD COLUMN created_by TEXT'); } catch { /* present */ }
 for (const col of ['confirmed_by TEXT', 'confirmed_at TEXT', 'shipped_by TEXT', 'shipped_at TEXT']) {
@@ -920,8 +925,31 @@ function catalogItemFull(id) {
   const item = db.prepare('SELECT * FROM catalog WHERE id=?').get(id);
   if (!item) return null;
   item.exclusive_shop_ids = db.prepare('SELECT shop_id FROM catalog_visibility WHERE coffee_id=?').all(id).map(r => r.shop_id);
+  try { item.info_sections = item.info_sections ? JSON.parse(item.info_sections) : []; } catch { item.info_sections = []; }
   return item;
 }
+
+// The info sheet is edited on its own — the story lives apart from pricing.
+const SHEET_FACTS = ['info_country', 'info_region', 'info_producer', 'info_variety', 'info_process', 'info_altitude'];
+app.put('/api/catalog/:id/sheet', requireOwner, (req, res) => {
+  const item = db.prepare('SELECT * FROM catalog WHERE id=?').get(req.params.id);
+  if (!item) return res.status(404).json({ error: 'Not found' });
+  const b = req.body || {};
+  const facts = {};
+  for (const k of SHEET_FACTS) facts[k] = b[k] ? String(b[k]).slice(0, 160).trim() || null : null;
+  const brewFilter = b.brew_filter ? String(b.brew_filter).slice(0, 1000).trim() || null : null;
+  const brewEspresso = b.brew_espresso ? String(b.brew_espresso).slice(0, 1000).trim() || null : null;
+  const raw = Array.isArray(b.info_sections) ? b.info_sections.slice(0, 12) : [];
+  const sections = raw
+    .map(x => ({ title: String((x || {}).title || '').slice(0, 120).trim(), body: String((x || {}).body || '').slice(0, 8000).trim() }))
+    .filter(x => x.title || x.body);
+  db.prepare(`UPDATE catalog SET info_country=?, info_region=?, info_producer=?, info_variety=?, info_process=?, info_altitude=?,
+    brew_filter=?, brew_espresso=?, info_sections=? WHERE id=?`)
+    .run(facts.info_country, facts.info_region, facts.info_producer, facts.info_variety, facts.info_process, facts.info_altitude,
+      brewFilter, brewEspresso, sections.length ? JSON.stringify(sections) : null, req.params.id);
+  audit(req, `updated the info sheet for "${item.name}"`);
+  res.json(catalogItemFull(req.params.id));
+});
 
 app.get('/api/catalog', (req, res) => {
   res.json(db.prepare('SELECT * FROM catalog ORDER BY active DESC, name').all().map(i => catalogItemFull(i.id)));

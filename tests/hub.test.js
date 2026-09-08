@@ -112,6 +112,28 @@ const j = client(API, 'x-hub-key');
     r = await j('GET', '/api/activity', null, OWNER);
     ok(r.body.some(a => a.username === 'owner1' && /deleted order/.test(a.action)), 'delete is in the audit trail');
 
+    section('info sheets');
+    r = await j('PUT', `/api/catalog/${coffeeId}/sheet`, { info_country: 'Ethiopia' }, STAFF);
+    ok(r.status === 403, 'staff cannot edit info sheets');
+    r = await j('PUT', `/api/catalog/${coffeeId}/sheet`, {
+      info_country: 'Ethiopia', info_region: 'Guji', info_altitude: '2,200–2,300 masl',
+      brew_filter: 'Batch: 60g/L at 94C.', brew_espresso: '18g in, 40g out.',
+      info_sections: [{ title: 'Intro', body: 'Creamy body, blueberry sweetness.' }, { title: '', body: '' }, 'garbage'],
+    }, OWNER);
+    ok(r.status === 200 && r.body.info_sections.length === 1, 'sheet saved; empty/garbage sections dropped');
+    r = await fetch(`${API}/api/ingest/catalog`, { headers: { Authorization: `Bearer ${shopKey}` } }).then(x => x.json());
+    const synced = r.items.find(i => i.id === coffeeId);
+    ok(synced.info_sheet && synced.info_sheet.country === 'Ethiopia' && synced.info_sheet.brew_espresso === '18g in, 40g out.',
+      'sheet flows to the shop through catalog sync');
+    ok(synced.info_sheet.sections[0].title === 'Intro', 'sections arrive in order');
+    r = await j('GET', '/api/activity', null, OWNER);
+    ok(r.body.some(a => /updated the info sheet for "Blend No. 1"/.test(a.action)), 'sheet edit audited');
+    // a coffee with nothing filled in syncs with info_sheet null
+    r = await j('POST', '/api/catalog', { name: 'Sheetless Decaf', price_per_lb: 13 }, OWNER);
+    const plainId = r.body.id;
+    r = await fetch(`${API}/api/ingest/catalog`, { headers: { Authorization: `Bearer ${shopKey}` } }).then(x => x.json());
+    ok(r.items.find(i => i.id === plainId).info_sheet === null, 'empty sheet syncs as null — no phantom links');
+
     section('adjustment guards');
     r = await j('POST', '/api/on-hand/adjust', { coffee_id: coffeeId, profile: 'espresso', delta_lbs: 0 }, STAFF);
     ok(r.status === 400, 'zero-delta adjustment rejected');
