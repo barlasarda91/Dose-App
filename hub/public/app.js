@@ -6,6 +6,9 @@
   let CURRENCY = '$';
   const money = v => v == null ? '—' : `${CURRENCY}${(Math.round(v * 100) / 100).toFixed(2)}`;
 
+  const me = () => { try { return JSON.parse(localStorage.getItem('hub_user')) || {}; } catch { return {}; } };
+  const isOwner = () => me().role === 'owner';
+
   async function api(path, opts = {}) {
     const headers = { ...(opts.headers || {}) };
     if (opts.body) headers['Content-Type'] = 'application/json';
@@ -13,29 +16,97 @@
     const res = await fetch(path, { ...opts, headers });
     if (res.status === 401) { localStorage.removeItem('hub_key'); renderLogin(); throw new Error('Unauthorized'); }
     const data = await res.json().catch(() => ({}));
+    if (res.status === 403 && data.must_change_password) { renderChangePassword(); throw new Error('Set your own password first'); }
     if (!res.ok) throw new Error(data.error || `Request failed (${res.status})`);
     return data;
   }
 
   // ─── Login ──────────────────────────────────────────────────────────────────
-  function renderLogin(msg) {
+  async function renderLogin(msg) {
+    let setup = false;
+    try { setup = (await (await fetch('/api/auth-mode')).json()).setup_required; } catch { /* show normal login */ }
+    if (setup) return renderBootstrap();
     app.innerHTML = `
       <div class="login-wrap"><form class="login-card" id="login-form">
         <div class="login-title">Dose Hub</div>
         <div class="login-sub">Boxx Coffee Roasters Co.</div>
-        <label class="lbl" for="pw">Roastery Password</label>
-        <input type="password" id="pw" style="width:100%" autofocus>
+        <label class="lbl" for="un">Username</label>
+        <input id="un" autocomplete="username" style="width:100%;margin-bottom:12px" autofocus>
+        <label class="lbl" for="pw">Password</label>
+        <input type="password" id="pw" autocomplete="current-password" style="width:100%">
         <div class="err" id="login-err">${esc(msg || '')}</div>
         <button class="btn" type="submit" style="margin-top:14px;width:100%">Enter</button>
       </form></div>`;
     document.getElementById('login-form').onsubmit = async e => {
       e.preventDefault();
       try {
-        const data = await api('/api/login', { method: 'POST', body: JSON.stringify({ password: document.getElementById('pw').value }) });
+        const data = await api('/api/login', { method: 'POST', body: JSON.stringify({ username: document.getElementById('un').value, password: document.getElementById('pw').value }) });
         localStorage.setItem('hub_key', data.token);
+        localStorage.setItem('hub_user', JSON.stringify(data.user));
+        if (data.must_change_password) return renderChangePassword(document.getElementById('pw').value);
         renderShell('orders');
       } catch (err) {
-        document.getElementById('login-err').textContent = err.message === 'Unauthorized' ? 'Wrong password' : err.message;
+        document.getElementById('login-err').textContent = err.message;
+      }
+    };
+  }
+
+  // First run: HUB_PASSWORD is the one-time code that creates the owner account.
+  function renderBootstrap() {
+    app.innerHTML = `
+      <div class="login-wrap"><form class="login-card" id="boot-form">
+        <div class="login-title">Dose Hub</div>
+        <div class="login-sub">First run — create the owner account</div>
+        <label class="lbl">Your username</label>
+        <input id="b-un" placeholder="e.g. barlas" style="width:100%;margin-bottom:12px" autofocus>
+        <label class="lbl">Choose your password (10+ characters)</label>
+        <input type="password" id="b-pw" autocomplete="new-password" style="width:100%;margin-bottom:12px">
+        <label class="lbl">Bootstrap code (the HUB_PASSWORD value on the server)</label>
+        <input type="password" id="b-code" style="width:100%">
+        <div class="err" id="boot-err"></div>
+        <button class="btn" type="submit" style="margin-top:14px;width:100%">Create Owner Account</button>
+      </form></div>`;
+    document.getElementById('boot-form').onsubmit = async e => {
+      e.preventDefault();
+      try {
+        const data = await api('/api/setup-owner', { method: 'POST', body: JSON.stringify({
+          username: document.getElementById('b-un').value,
+          password: document.getElementById('b-pw').value,
+          bootstrap_password: document.getElementById('b-code').value,
+        }) });
+        localStorage.setItem('hub_key', data.token);
+        localStorage.setItem('hub_user', JSON.stringify(data.user));
+        renderShell('orders');
+      } catch (err) {
+        document.getElementById('boot-err').textContent = err.message;
+      }
+    };
+  }
+
+  // Forced when signed in on a temporary password.
+  function renderChangePassword(currentPrefill) {
+    app.innerHTML = `
+      <div class="login-wrap"><form class="login-card" id="cpw-form">
+        <div class="login-title">Set your password</div>
+        <div class="login-sub">${esc(me().username || '')} — choose your own before continuing</div>
+        <label class="lbl">Temporary (current) password</label>
+        <input type="password" id="c-cur" style="width:100%;margin-bottom:12px" ${currentPrefill ? '' : 'autofocus'}>
+        <label class="lbl">New password (10+ characters)</label>
+        <input type="password" id="c-new" autocomplete="new-password" style="width:100%" ${currentPrefill ? 'autofocus' : ''}>
+        <div class="err" id="cpw-err"></div>
+        <button class="btn" type="submit" style="margin-top:14px;width:100%">Save & Continue</button>
+      </form></div>`;
+    if (currentPrefill) document.getElementById('c-cur').value = currentPrefill;
+    document.getElementById('cpw-form').onsubmit = async e => {
+      e.preventDefault();
+      try {
+        await api('/api/me/password', { method: 'POST', body: JSON.stringify({
+          current_password: document.getElementById('c-cur').value,
+          new_password: document.getElementById('c-new').value,
+        }) });
+        renderShell('orders');
+      } catch (err) {
+        document.getElementById('cpw-err').textContent = err.message;
       }
     };
   }
@@ -43,18 +114,20 @@
   // ─── Shell + tabs ───────────────────────────────────────────────────────────
   const TABS = [['orders', 'Orders'], ['roast', 'Roast'], ['fulfill', 'Fulfillment'], ['onhand', 'On Hand'], ['math', 'Roast Math'], ['catalog', 'Catalog'], ['shops', 'Shops'], ['patterns', 'Patterns'], ['reports', 'Reports']];
   function renderShell(active) {
+    const tabs = isOwner() ? [...TABS, ['team', 'Team']] : TABS;
     app.innerHTML = `
       <nav class="nav">
         <span class="nav-logo">Dose Hub · Boxx Coffee Roasters Co.</span>
         <ul class="nav-links">
-          ${TABS.map(([id, label]) => `<li><span class="nav-link ${id === active ? 'active' : ''}" data-tab="${id}">${label}</span></li>`).join('')}
+          ${tabs.map(([id, label]) => `<li><span class="nav-link ${id === active ? 'active' : ''}" data-tab="${id}">${label}</span></li>`).join('')}
+          <li><span class="nav-link" style="color:var(--linen);cursor:default">${esc(me().username || '')}</span></li>
           <li><span class="nav-link" id="signout">Sign Out</span></li>
         </ul>
       </nav>
       <div class="page" id="page"></div>`;
     app.querySelectorAll('[data-tab]').forEach(el => el.onclick = () => renderShell(el.dataset.tab));
-    document.getElementById('signout').onclick = () => { localStorage.removeItem('hub_key'); renderLogin(); };
-    ({ orders: renderOrders, roast: renderRoast, fulfill: renderFulfill, onhand: renderOnHand, math: renderRoastMath, catalog: renderCatalog, shops: renderShops, patterns: renderPatterns, reports: renderReports })[active]();
+    document.getElementById('signout').onclick = () => { localStorage.removeItem('hub_key'); localStorage.removeItem('hub_user'); renderLogin(); };
+    ({ orders: renderOrders, roast: renderRoast, fulfill: renderFulfill, onhand: renderOnHand, math: renderRoastMath, catalog: renderCatalog, shops: renderShops, patterns: renderPatterns, reports: renderReports, team: renderTeam })[active]();
   }
 
   const header = (eyebrow, title, sub) =>
@@ -133,7 +206,7 @@
             ${editing === o.id
               ? `<button class="btn-sm btn" data-save-edit="${o.id}">Save & Notify</button>
                  <button class="btn-sm btn" data-cancel-edit="1">Cancel</button>`
-              : `<button class="btn-danger btn" data-del="${o.id}">Delete</button>
+              : `${isOwner() ? `<button class="btn-danger btn" data-del="${o.id}">Delete</button>` : ''}
                  ${o.items && o.items.length ? `<button class="btn-sm btn" data-start-edit="${o.id}">Edit Quantities</button>` : ''}
                  <button class="btn btn-olive" data-adv="${o.id}" data-to="confirmed">Confirm Order</button>`}
           </span>
@@ -180,14 +253,16 @@
                 <td class="num">${o.total_lbs || '—'}</td>
                 <td class="num">${money(o.total_cost)}</td>
                 <td style="color:var(--drift)">${esc(o.placed_by || '—')}</td>
-                <td><span class="status ${o.status}">${o.status}</span></td>
+                <td><span class="status ${o.status}">${o.status}</span>
+                  ${o.confirmed_by ? `<div style="font-size:10px;color:var(--drift);margin-top:4px">confirmed · ${esc(o.confirmed_by)}</div>` : ''}
+                  ${o.shipped_by ? `<div style="font-size:10px;color:var(--drift)">shipped · ${esc(o.shipped_by)}</div>` : ''}</td>
                 <td><div style="display:flex;gap:6px;flex-wrap:wrap">
                   ${editing === o.id
                     ? `<button class="btn-sm btn" data-save-edit="${o.id}">Save & Notify</button>
                        <button class="btn-sm btn" data-cancel-edit="1">Cancel</button>`
                     : `${nextAction(o)}
                        ${o.status === 'confirmed' && o.items && o.items.length ? `<button class="btn-sm btn" data-start-edit="${o.id}">Edit</button>` : ''}
-                       <button class="btn-danger btn" data-del="${o.id}">Delete</button>`}
+                       ${isOwner() ? `<button class="btn-danger btn" data-del="${o.id}">Delete</button>` : ''}`}
                 </div></td>
               </tr>`).join('')}
             </tbody></table></div>` : '<div class="empty">No orders match those filters.</div>'}` : ''}`;
@@ -424,13 +499,14 @@
         </tbody></table></div>` : '<div class="empty">Nothing on the shelf yet — it fills as batches out-produce orders.</div>'}
       <div class="sechead"><span>Movements</span><span style="font-size:11px;color:var(--drift)">every in and out, newest first</span></div>
       ${data.moves.length ? `<div class="table-wrap"><table>
-        <thead><tr><th>When</th><th>Coffee</th><th>Profile</th><th>What Happened</th><th class="num">Change</th></tr></thead>
+        <thead><tr><th>When</th><th>Coffee</th><th>Profile</th><th>What Happened</th><th>By</th><th class="num">Change</th></tr></thead>
         <tbody>${data.moves.map(m => `
           <tr>
             <td style="font-size:11px">${esc(fmtLA(m.created_at))}</td>
             <td>${esc(m.coffee_name)}</td>
             <td><span class="profile ${m.profile}">${PROFILE_NAMES[m.profile]}</span></td>
             <td>${esc(m.reason)}</td>
+            <td style="font-size:11px;color:var(--drift)">${esc(m.created_by || '—')}</td>
             <td class="num" style="color:${m.delta_lbs > 0 ? 'var(--olive)' : 'var(--graphite)'}">${m.delta_lbs > 0 ? '+' : ''}${m.delta_lbs} lbs</td>
           </tr>`).join('')}
         </tbody></table></div>` : '<div class="empty">No movements yet.</div>'}`;
@@ -1153,6 +1229,88 @@
         document.getElementById('sp-err').textContent = err.message;
       }
     };
+  }
+
+  // ─── Team (owners) ──────────────────────────────────────────────────────────
+  async function renderTeam() {
+    const page = document.getElementById('page');
+    page.innerHTML = header('Roastery', 'Team', '');
+    let users = [], activity = [];
+    try { [users, activity] = await Promise.all([api('/api/team'), api('/api/activity?limit=100')]); }
+    catch (e) { if (e.message !== 'Unauthorized') page.innerHTML += `<div class="err">${esc(e.message)}</div>`; return; }
+
+    const suggestPw = () => {
+      const words = ['roast', 'batch', 'crema', 'cherry', 'bloom', 'grind', 'olive', 'filter', 'kettle', 'burlap'];
+      const pick = () => words[Math.floor(Math.random() * words.length)];
+      return `${pick()}-${pick()}-${pick()}-${Math.floor(10 + Math.random() * 90)}`;
+    };
+
+    page.innerHTML += `
+      <div class="sechead"><span>Accounts</span></div>
+      <div class="table-wrap"><table>
+        <thead><tr><th>Username</th><th>Role</th><th>Status</th><th>Last Active</th><th>Created</th><th class="num"></th></tr></thead>
+        <tbody>${users.map(u => `
+          <tr style="${u.active ? '' : 'opacity:.55'}">
+            <td style="color:var(--ink)">${esc(u.username)}${u.username === me().username ? ' <span style="color:var(--drift);font-size:10px">(you)</span>' : ''}</td>
+            <td><span class="role-chip ${u.role}">${u.role}</span></td>
+            <td style="font-size:11px;color:var(--drift)">${u.active ? (u.must_change_password ? 'temp password — not yet set' : 'active') : 'deactivated'}</td>
+            <td style="font-size:11px;color:var(--drift)">${esc(fmtLA(u.last_active_at))}</td>
+            <td style="font-size:11px;color:var(--drift)">${esc(String(u.created_at || '').slice(0, 10))}</td>
+            <td class="num"><div style="display:flex;gap:6px;justify-content:flex-end">
+              <button class="btn-sm btn" data-reset="${u.id}" data-name="${esc(u.username)}">Reset Password</button>
+              ${u.username === me().username ? '' : u.active
+                ? `<button class="btn-danger btn" data-deact="${u.id}" data-name="${esc(u.username)}">Deactivate</button>`
+                : `<button class="btn-sm btn" data-react="${u.id}">Reactivate</button>`}
+            </div></td>
+          </tr>`).join('')}
+        </tbody></table></div>
+
+      <div class="card" style="max-width:640px;margin-top:18px">
+        <div class="sechead" style="border:none;margin-bottom:8px;padding-bottom:0"><span>Add Account</span></div>
+        <div style="display:grid;grid-template-columns:1fr 1fr;gap:14px;margin-bottom:14px">
+          <div><label class="lbl">Username</label><input id="t-un" placeholder="e.g. jordan"></div>
+          <div><label class="lbl">Role</label><select id="t-role" style="width:100%">
+            <option value="staff">Staff — run daily ops</option>
+            <option value="owner">Owner — everything + team & pricing</option>
+          </select></div>
+        </div>
+        <div style="max-width:320px;margin-bottom:10px"><label class="lbl">Temporary password</label><input id="t-pw" value="${suggestPw()}"></div>
+        <div style="font-size:11px;color:var(--drift);margin-bottom:14px">They log in with the temporary password and are asked to set their own on first sign-in.</div>
+        <button class="btn" id="t-add">Create Account</button>
+        <span class="err" id="t-err" style="margin-left:10px"></span>
+      </div>
+
+      <div class="sechead" style="margin-top:24px"><span>Activity — everything the hub does, signed</span><span style="font-size:11px;color:var(--drift)">last ${activity.length}</span></div>
+      ${activity.length ? `<div style="max-width:820px">${activity.map(a => `
+        <div class="act-row"><span>${esc(a.username)} <span style="color:var(--graphite)">${esc(a.action)}</span></span><span class="act-when">${esc(fmtLA(a.at))}</span></div>`).join('')}
+      </div>` : '<div class="empty">Nothing logged yet.</div>'}`;
+
+    document.getElementById('t-add').onclick = async () => {
+      const errEl = document.getElementById('t-err');
+      try {
+        await api('/api/team', { method: 'POST', body: JSON.stringify({
+          username: document.getElementById('t-un').value,
+          role: document.getElementById('t-role').value,
+          temp_password: document.getElementById('t-pw').value,
+        }) });
+        renderTeam();
+      } catch (e) { errEl.textContent = e.message; }
+    };
+    page.querySelectorAll('[data-reset]').forEach(btn => btn.onclick = async () => {
+      const temp = prompt(`New temporary password for ${btn.dataset.name} (10+ characters) — they set their own on next sign-in:`, suggestPw());
+      if (!temp) return;
+      try { await api(`/api/team/${btn.dataset.reset}/reset`, { method: 'POST', body: JSON.stringify({ temp_password: temp }) }); renderTeam(); }
+      catch (e) { alert(e.message); }
+    });
+    page.querySelectorAll('[data-deact]').forEach(btn => btn.onclick = async () => {
+      if (!confirm(`Deactivate ${btn.dataset.name}? They are signed out everywhere immediately.`)) return;
+      try { await api(`/api/team/${btn.dataset.deact}/deactivate`, { method: 'POST' }); renderTeam(); }
+      catch (e) { alert(e.message); }
+    });
+    page.querySelectorAll('[data-react]').forEach(btn => btn.onclick = async () => {
+      try { await api(`/api/team/${btn.dataset.react}/reactivate`, { method: 'POST' }); renderTeam(); }
+      catch (e) { alert(e.message); }
+    });
   }
 
   // ─── Boot ───────────────────────────────────────────────────────────────────

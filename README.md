@@ -104,7 +104,9 @@ The `hub/` directory contains a separate service for the roastery:
 2. Fresh deployment: enter hub URL + API key on the first-run screen. Existing deployment: Settings → Ordering → Roastery Hub.
 3. The shop's Order page switches from pool quantities to the live price list (their personalized view, including 12oz retail bags where offered), supports **standing orders** (weekly / bi-weekly / monthly, placed automatically at live prices), logins are verified by the hub, and roastery confirm/ship/deliver statuses appear in the shop's order history automatically. The hub URL is fixed app-wide (`DEFAULT_HUB_URL` env to override) — shops only ever enter their API key. Orders are priced server-side at order time — later price changes never rewrite history.
 
-Shop pushes are authenticated per shop (`Bearer dose_…`), re-priced and re-validated by the hub on ingest, and deduplicated (a retried push never duplicates an order). Hub login is rate-limited with expiring hashed session tokens — same security model as the shop app.
+Shop pushes are authenticated per shop (`Bearer dose_…`), re-priced and re-validated by the hub on ingest, and deduplicated (a retried push never duplicates an order).
+
+**Hub accounts** — every roastery person signs in with their own username + password (salted scrypt, per-user and per-IP lockouts, expiring hashed session tokens — the shop app's security model). `HUB_PASSWORD` is not a login: on a fresh hub it acts once, as the bootstrap code that creates the first **owner** account, then never works again. Two roles: **owners** additionally manage the Team tab (add accounts with a temporary password that must be replaced on first sign-in, reset, deactivate — deactivation signs that person out everywhere), catalog and price rules, shop credentials, and order deletion; **staff** run daily ops. Every consequential action lands in an append-only, signed **audit trail** (Team → Activity), orders show who confirmed and shipped them, and stock movements show who made them.
 
 ## Backups
 
