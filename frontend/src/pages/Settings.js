@@ -108,7 +108,7 @@ function UsersSection() {
   );
 }
 
-export default function Settings({ me }) {
+export default function Settings({ me, onReplayTour }) {
   const isAdmin = me?.role === 'admin';
   const [locationId, setLocationId] = useState('');
   const [shopName, setShopName]     = useState('');
@@ -217,7 +217,7 @@ export default function Settings({ me }) {
       )}
 
       {isAdmin && (
-        <div className="settings-section">
+        <div className="settings-section" data-tour="square">
           <div className="section-title">Square API</div>
           {(() => {
             const state = square.loading ? 'unset' : !square.configured ? 'unset' : square.ok ? 'ok' : 'bad';
@@ -300,6 +300,19 @@ export default function Settings({ me }) {
       )}
 
       {isAdmin && status.authMode !== 'hub' && <UsersSection />}
+
+      <div className="settings-section">
+        <div className="section-title">Help</div>
+        <div className="settings-card">
+          <div className="settings-field">
+            <label className="settings-field-lbl">App Tour</label>
+            <div className="settings-field-hint" style={{ marginBottom: 10 }}>
+              The guided walkthrough every new user sees on first sign-in — replay it anytime.
+            </div>
+            <button className="btn btn-secondary" onClick={onReplayTour}>Replay the App Tour</button>
+          </div>
+        </div>
+      </div>
 
       <div className="settings-section">
         <div className="section-title">Security</div>

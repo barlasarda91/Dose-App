@@ -5,6 +5,7 @@ import Stock     from './pages/Stock';
 import Order     from './pages/Order';
 import Recipes   from './pages/Recipes';
 import Settings  from './pages/Settings';
+import Tour      from './Tour';
 import { api, setKey, clearKey } from './api';
 
 // First run (gated by the setup code from the server logs): either connect
@@ -130,7 +131,8 @@ export default function App() {
   const [page, setPage] = useState('dashboard');
   // 'checking' | 'setup' | 'login' | 'in'
   const [auth, setAuth] = useState('checking');
-  const [me, setMe] = useState(null); // { username, role }
+  const [me, setMe] = useState(null); // { username, role, tour_seen_at }
+  const [tourOpen, setTourOpen] = useState(false);
 
   useEffect(() => {
     (async () => {
@@ -140,6 +142,7 @@ export default function App() {
         const user = await (await api('/api/me')).json();
         setMe(user);
         setAuth('in');
+        if (user && user.username && !user.tour_seen_at) setTourOpen(true);
       } catch (e) {
         if (e.unauthorized) { clearKey(); setAuth('login'); }
         else setAuth('in'); // server unreachable ≠ locked out; let pages surface the error
@@ -189,7 +192,8 @@ export default function App() {
       {page === 'stock'     && <Stock />}
       {page === 'order'     && <Order />}
       {page === 'recipes'   && <Recipes />}
-      {page === 'settings'  && <Settings me={me} />}
+      {page === 'settings'  && <Settings me={me} onReplayTour={() => setTourOpen(true)} />}
+      {tourOpen && <Tour page={page} setPage={setPage} onClose={jump => { setTourOpen(false); if (jump) setPage(jump); }} />}
     </>
   );
 }

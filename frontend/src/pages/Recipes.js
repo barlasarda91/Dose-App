@@ -128,7 +128,7 @@ export default function Recipes() {
             Pick a drink from your Square menu, say how it's brewed and how much coffee goes in.
             Dose handles the rest — usage, efficiency and reorder timing all flow from here.
           </p>
-          <button className="btn btn-primary" style={{ fontSize: 11, padding: '14px 28px', background: 'var(--olive)' }} onClick={() => openEditor(null)}>
+          <button className="btn btn-primary" data-tour="add-recipe" style={{ fontSize: 11, padding: '14px 28px', background: 'var(--olive)' }} onClick={() => openEditor(null)}>
             + Add Your First Recipe
           </button>
         </div>
@@ -325,7 +325,7 @@ export default function Recipes() {
         </div>
       )}
 
-      <button className="btn btn-primary" onClick={() => openEditor(null)}>+ Add Recipe</button>
+      <button className="btn btn-primary" data-tour="add-recipe" onClick={() => openEditor(null)}>+ Add Recipe</button>
       {showModal && editorModal()}
     </div>
   );
