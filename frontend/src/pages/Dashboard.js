@@ -3,6 +3,7 @@ import { api, apiJson } from '../api';
 import DateField from '../DateField';
 
 const TODAY = new Date().toISOString().slice(0, 10);
+const LBS = 453.592;
 
 // A cycle ends the day BEFORE the next delivery: the next delivery's on-hand
 // count closes the cycle, and its received bags belong to the next cycle.
@@ -12,35 +13,37 @@ function dayBefore(dateStr) {
   return t.toISOString().slice(0, 10);
 }
 
-function EffCard({ label, e, unit = 'g', note, displayUnit, scale = 1 }) {
+const ROASTS = [
+  ['Espresso Roast', 'espresso'],
+  ['Filter Roast',   'filter'],
+];
+const kg = v => (v / 1000).toFixed(1);
+const lbsOf = g => Math.round((g / LBS) * 10) / 10;
+
+// Closed-cycle card: efficiency and settled waste for one roast.
+function EffCard({ label, e }) {
   if (!e) return null;
   const isWaste = e.flag === 'WASTE';
   const isOver  = e.flag === 'OVER_EXPECTED';
   const noStock = e.flag === 'NO_STOCK_LOGGED';
   const cls = !e.efficiency_pct ? '' : isOver ? 'bad' : isWaste ? 'warn' : 'good';
-  const cycleOpen = e.cycle_open;
-  const u = displayUnit || unit;
-  const fmt = v => v != null ? (v * scale).toFixed(scale < 1 ? 1 : 0) : '—';
   return (
     <div className={`eff-card ${cls}`}>
       <div className="eff-label">{label}</div>
-      {note && <div className="eff-note">{note}</div>}
       {e.efficiency_pct != null ? (
         <>
           <div className="eff-pct">{e.efficiency_pct}<span>%</span></div>
-          <div className="eff-sub">{fmt(e.used)}{u} used / {fmt(e.stocked)}{u} stocked</div>
-          <div className="eff-sub">~{fmt(e.theoretical_remaining)}{u} expected remaining</div>
-          {!cycleOpen && e.actual_remaining !== null && (
+          <div className="eff-sub">{kg(e.used)}kg used / {kg(e.stocked)}kg stocked</div>
+          <div className="eff-sub">~{kg(e.theoretical_remaining)}kg expected remaining</div>
+          {e.actual_remaining !== null && (
             <div className="eff-sub" style={{ color: isWaste ? 'var(--red)' : 'var(--olive)' }}>
-              {fmt(e.actual_remaining)}{u} actual remaining
+              {kg(e.actual_remaining)}kg counted
             </div>
           )}
-          {!cycleOpen && e.waste !== null && (
-            // Waste is always shown; only above the 5%-of-opening-stock
-            // threshold does it turn red (and earn the WASTE flag below).
+          {e.waste !== null && (
             <div className="eff-sub" style={{ color: isWaste ? 'var(--red)' : 'var(--drift)' }}>
               {e.waste > 0
-                ? <>{fmt(e.waste)}{u} unaccounted ({e.stocked > 0 ? Math.round(e.waste / e.stocked * 1000) / 10 : 0}% of opening)</>
+                ? <>{e.waste >= 1000 ? `${kg(e.waste)}kg` : `${Math.round(e.waste)}g`} unaccounted ({e.stocked > 0 ? Math.round(e.waste / e.stocked * 1000) / 10 : 0}% of opening)</>
                 : 'no waste — counted at or above expected'}
             </div>
           )}
@@ -48,7 +51,6 @@ function EffCard({ label, e, unit = 'g', note, displayUnit, scale = 1 }) {
       ) : (
         <div className="eff-pct" style={{ fontSize: 26, color: 'var(--linen)' }}>—</div>
       )}
-      {cycleOpen && e.efficiency_pct != null && <span className="flag">◌ Open cycle</span>}
       {isOver  && <span className="flag flag-over">↑ Over expected</span>}
       {isWaste && <span className="flag flag-waste">⚠ Waste detected</span>}
       {noStock && <span className="flag flag-nostock">— No stock logged</span>}
@@ -56,22 +58,65 @@ function EffCard({ label, e, unit = 'g', note, displayUnit, scale = 1 }) {
   );
 }
 
-const POOLS = [
-  ['Espresso',  'espresso'],
-  ['Drip',      'drip'],
-  ['Cold Brew', 'coldbrew'],
-  ['Pour-Over', 'pourover'],
-];
+// Live card for the open cycle: only what's knowable without a count —
+// usage, burn per day, days left, suggested order. No waste guessing.
+function BurnCard({ label, e, sug, methodSplit }) {
+  if (!e) return null;
+  const daysLeft = sug?.days_left;
+  const barCol = daysLeft == null ? 'var(--linen)' : daysLeft < 3 ? 'var(--red)' : daysLeft < 5 ? 'var(--warn)' : 'var(--olive)';
+  const barW = daysLeft == null ? 0 : Math.max(3, Math.min(100, (daysLeft / 10) * 100));
+  const split = (methodSplit || []).filter(m => m.grams > 0);
+  const splitTotal = split.reduce((s, m) => s + m.grams, 0);
+  return (
+    <div className="eff-card">
+      <div className="eff-label">{label}</div>
+      <div className="eff-pct" style={{ color: 'var(--ink)' }}>{kg(e.used)} <span>kg used</span></div>
+      <div className="eff-sub">
+        {e.stocked > 0
+          ? <>of {kg(e.stocked)}kg stocked · ~{kg(Math.max(0, e.theoretical_remaining))}kg should remain</>
+          : e.used > 0 ? 'no stock logged for this roast yet' : 'no usage yet this cycle'}
+      </div>
+      {sug && (
+        <div style={{ borderTop: '1px solid var(--linen)', marginTop: 12, paddingTop: 10 }}>
+          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'baseline', fontSize: 12 }}>
+            <span style={{ color: 'var(--graphite)' }}>burn {lbsOf(sug.burn_g_per_day)} lbs/day</span>
+            <span style={{ fontFamily: 'var(--font-serif)', fontSize: 18, color: daysLeft != null && daysLeft < 5 ? barCol : 'var(--ink)' }}>
+              {daysLeft != null ? `~${daysLeft} days left` : '—'}
+            </span>
+          </div>
+          <div style={{ height: 10, background: 'var(--stone)', border: '1px solid var(--linen)', marginTop: 8 }}>
+            <div style={{ height: '100%', width: `${barW}%`, background: barCol }} />
+          </div>
+          <div className="eff-sub" style={{ marginTop: 4 }}>
+            suggested next order: <strong style={{ fontWeight: 400, color: 'var(--ink)' }}>{sug.suggested_lbs} lbs</strong> (covers {sug.horizon_days || 7} days)
+          </div>
+        </div>
+      )}
+      {split.length > 0 && splitTotal > 0 && (
+        <div style={{ borderTop: '1px solid var(--linen)', marginTop: 12, paddingTop: 10 }}>
+          <div className="eff-label">Where the filter roast goes</div>
+          <div style={{ display: 'flex', height: 12, border: '1px solid var(--linen)', overflow: 'hidden' }}>
+            {split.map(m => (
+              <div key={m.key} style={{ width: `${(m.grams / splitTotal * 100).toFixed(1)}%`, background: m.color }} title={`${m.label}: ${lbsOf(m.grams)} lbs`} />
+            ))}
+          </div>
+          <div style={{ display: 'flex', gap: 14, fontSize: 11, color: 'var(--drift)', marginTop: 6, flexWrap: 'wrap' }}>
+            {split.map(m => (
+              <span key={m.key}><span style={{ display: 'inline-block', width: 8, height: 8, marginRight: 5, background: m.color }} />{m.label} {lbsOf(m.grams)} lbs · {m.drinks} drinks</span>
+            ))}
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
 
-// Headline snapshot: how much of the coffee on hand the shop went through,
-// pool by pool, at a glance.
+// Headline snapshot: consumption per roast at a glance.
 function Snapshot({ a }) {
   const eff = a.eff || {};
-  const stocked = POOLS.reduce((s, [, k]) => s + (eff[k]?.stocked || 0), 0);
-  const used    = POOLS.reduce((s, [, k]) => s + (eff[k]?.used || 0), 0);
-  const waste   = POOLS.reduce((s, [, k]) => s + Math.max(0, eff[k]?.waste || 0), 0);
+  const stocked = ROASTS.reduce((s, [, k]) => s + (eff[k]?.stocked || 0), 0);
+  const used    = ROASTS.reduce((s, [, k]) => s + (eff[k]?.used || 0), 0);
   const pct = stocked > 0 ? Math.round((used / stocked) * 1000) / 10 : null;
-  const kg = v => (v / 1000).toFixed(1);
   return (
     <div className="snapshot">
       <div className="snapshot-head">
@@ -83,14 +128,9 @@ function Snapshot({ a }) {
               ? `~${kg(used)}kg of ${kg(stocked)}kg on hand · ${a.cycle_open ? 'cycle in progress' : 'cycle closed'}`
               : 'No coffee stock logged for this period'}
           </div>
-          {!a.cycle_open && waste > 0 && (
-            <div className="snapshot-detail" style={{ color: 'var(--red)' }}>
-              ~{waste >= 1000 ? `${kg(waste)}kg` : `${Math.round(waste)}g`} unaccounted vs physical count
-            </div>
-          )}
         </div>
       </div>
-      {POOLS.map(([label, k]) => {
+      {ROASTS.map(([label, k]) => {
         const e = eff[k];
         if (!e) return null;
         const p = e.stocked > 0 ? Math.min(100, (e.used / e.stocked) * 100) : 0;
@@ -111,6 +151,12 @@ function Snapshot({ a }) {
   );
 }
 
+const SPLIT_META = [
+  { key: 'batch',    label: 'Batch Brew', color: 'var(--warn)' },
+  { key: 'coldbrew', label: 'Cold Brew',  color: '#4A6E6B' },
+  { key: 'pourover', label: 'Pour-Over',  color: 'var(--olive)' },
+];
+
 export default function Dashboard() {
   const [startDate, setStartDate] = useState(() => { const d = new Date(); return d.getFullYear() + '-' + String(d.getMonth()+1).padStart(2,'0') + '-01'; });
   const [endDate, setEndDate]     = useState(TODAY);
@@ -119,9 +165,12 @@ export default function Dashboard() {
   const [downloading, setDownloading] = useState(false);
   const [error, setError]         = useState(null);
   const [deliveries, setDeliveries] = useState([]);
+  const [suggestion, setSuggestion] = useState(null);
+  const [history, setHistory]     = useState(null); // closed cycles, newest first
 
   useEffect(() => {
     apiJson('/api/coffee-deliveries').then(setDeliveries).catch(() => {});
+    apiJson('/api/order-suggestion').then(s => { if (s.available) setSuggestion(s); }).catch(() => {});
   }, []);
 
   const cycles = useMemo(() => {
@@ -161,14 +210,32 @@ export default function Dashboard() {
     runReport(c.start, c.end);
   }, [runReport]);
 
-  // Auto-load the current (most recent) cycle so the dashboard opens with a
-  // live snapshot instead of an empty state.
+  // Auto-load the current (most recent) cycle so the dashboard opens live.
   const autoRan = useRef(false);
   useEffect(() => {
     if (autoRan.current || cycles.length === 0) return;
     autoRan.current = true;
     selectCycle(cycles[cycles.length - 1]);
   }, [cycles, selectCycle]);
+
+  // Cycle-to-cycle waste: the last few CLOSED cycles, fetched once. Each is a
+  // Square query, so keep it to three and load them quietly in sequence.
+  const historyRan = useRef(false);
+  useEffect(() => {
+    if (historyRan.current || cycles.length === 0) return;
+    historyRan.current = true;
+    (async () => {
+      const closed = cycles.filter(c => !c.open).slice(-3).reverse();
+      const rows = [];
+      for (const c of closed) {
+        try {
+          const a = await apiJson('/api/analytics', { method: 'POST', body: JSON.stringify({ start_date: c.start, end_date: c.end }) });
+          if (!a.error) rows.push({ cycle: c, eff: a.eff });
+        } catch { /* skip cycles that fail */ }
+      }
+      setHistory(rows);
+    })();
+  }, [cycles]);
 
   const downloadReport = useCallback(async () => {
     setDownloading(true);
@@ -193,16 +260,30 @@ export default function Dashboard() {
   }, [startDate, endDate]);
 
   const a = analytics;
-  // Total drinks = sum of tracked items only (coffee drinks)
   const totalTracked = a ? Object.values(a.matched || {}).reduce((s, v) => s + (v.qty || 0), 0) : 0;
   const unmatchedEntries = a ? Object.entries(a.unmatched || {}) : [];
   const unmatchedQty = unmatchedEntries.reduce((s, [, q]) => s + q, 0);
+  const methodSplit = a?.method_usage
+    ? SPLIT_META.map(m => ({ ...m, grams: a.method_usage[m.key]?.grams || 0, drinks: a.method_usage[m.key]?.drinks || 0 }))
+    : [];
+
+  const wasteCell = e => {
+    if (!e || e.waste == null) return <td className="num-cell" style={{ color: 'var(--linen)' }}>—</td>;
+    const pct = e.stocked > 0 ? Math.round(e.waste / e.stocked * 1000) / 10 : 0;
+    const flagged = e.flag === 'WASTE';
+    return (
+      <td className="num-cell" style={{ color: flagged ? 'var(--red)' : 'var(--drift)', whiteSpace: 'nowrap' }}>
+        {e.waste > 0 ? `${e.waste >= 1000 ? kg(e.waste) + 'kg' : Math.round(e.waste) + 'g'} (${pct}%)` : 'none'}
+        {flagged && <span className="flag flag-waste" style={{ marginLeft: 8, marginTop: 0 }}>⚠</span>}
+      </td>
+    );
+  };
 
   return (
     <div className="page">
       <div className="page-eyebrow">Efficiency Tracking</div>
       <h1 className="page-title">Dashboard</h1>
-      <p className="page-sub">Coffee & milk efficiency by delivery cycle</p>
+      <p className="page-sub">Live burn per roast; waste settles when a delivery closes the cycle.</p>
       <hr className="page-rule" />
 
       {cycles.length > 0 && (
@@ -234,19 +315,8 @@ export default function Dashboard() {
         )}
       </div>
 
-      {error && (
-        <div className="error-banner">
-          <span>⚠</span>
-          <div>{error}</div>
-        </div>
-      )}
-
-      {loading && (
-        <div className="loading-overlay">
-          <div className="loading-spinner" />
-          <div className="loading-text">Fetching Square data…</div>
-        </div>
-      )}
+      {error && <div className="error-banner"><span>⚠</span><div>{error}</div></div>}
+      {loading && <div className="loading-overlay"><div className="loading-spinner" /><div className="loading-text">Fetching Square data…</div></div>}
 
       {!loading && a && (
         <>
@@ -265,8 +335,8 @@ export default function Dashboard() {
           <div className="stats-row">
             {[
               { lbl: 'Total Drinks', val: totalTracked.toLocaleString(), unit: 'tracked coffee drinks' },
-              { lbl: 'Espresso Used', val: ((a.eff?.espresso?.used || 0) / 1000).toFixed(2), unit: 'kg theoretical' },
-              { lbl: 'Coffee Used', val: (POOLS.reduce((s, [, k]) => s + (a.eff?.[k]?.used || 0), 0) / 1000).toFixed(2), unit: 'kg all pools' },
+              { lbl: 'Espresso Roast Used', val: kg(a.eff?.espresso?.used || 0), unit: 'kg theoretical' },
+              { lbl: 'Filter Roast Used', val: kg(a.eff?.filter?.used || 0), unit: 'kg theoretical' },
               { lbl: 'Period', val: a.period?.days, unit: 'days' },
             ].map(s => (
               <div key={s.lbl} className="stat-pill">
@@ -278,38 +348,58 @@ export default function Dashboard() {
           </div>
 
           {a.cycle_open ? (
-            <div className="cycle-status-banner open">
-              <span className="cycle-banner-label">◌ Open</span>
-              <div className="cycle-banner-text">Open cycle — no closing delivery logged yet. Efficiency reflects theoretical use against opening stock. Log the next delivery to close this cycle and calculate real waste.</div>
+            <div className="section">
+              <div className="section-title">Current Cycle — efficiency &amp; waste settle at your next delivery count</div>
+              <div className="eff-grid-3" style={{ gridTemplateColumns: '1fr 1fr' }}>
+                <BurnCard label="Espresso Roast" e={a.eff?.espresso} sug={suggestion ? { ...suggestion.pools?.espresso, horizon_days: suggestion.horizon_days } : null} />
+                <BurnCard label="Filter Roast" e={a.eff?.filter} sug={suggestion ? { ...suggestion.pools?.filter, horizon_days: suggestion.horizon_days } : null} methodSplit={methodSplit} />
+              </div>
             </div>
           ) : (
-            <div className="cycle-status-banner closed">
-              <span className="cycle-banner-label closed">● Closed</span>
-              <div className="cycle-banner-text">Closed cycle — closing delivery logged on {a.closing_delivery_date}. Waste calculated from actual on-hand count.</div>
+            <div className="section">
+              <div className="section-title">This Cycle — closed on {a.closing_delivery_date}</div>
+              <div className="eff-grid-3" style={{ gridTemplateColumns: '1fr 1fr' }}>
+                <EffCard label="Espresso Roast" e={a.eff?.espresso} />
+                <EffCard label="Filter Roast" e={a.eff?.filter} />
+              </div>
+            </div>
+          )}
+
+          {history && history.length > 0 && (
+            <div className="section">
+              <div className="section-title">Closed Cycles — waste, cycle to cycle (counted at each delivery, nothing extra to log)</div>
+              {ROASTS.map(([label, k]) => (
+                <div key={k} style={{ marginBottom: 16 }}>
+                  <div className="form-lbl" style={{ marginBottom: 6 }}>{label}</div>
+                  <div className="table-wrap">
+                    <table>
+                      <thead><tr><th>Cycle</th><th className="num-cell">Stocked</th><th className="num-cell">Used</th><th className="num-cell">Counted</th><th className="num-cell">Waste</th></tr></thead>
+                      <tbody>
+                        {history.map(({ cycle, eff }) => {
+                          const e = eff?.[k];
+                          return (
+                            <tr key={cycle.id}>
+                              <td>{cycle.start} → {cycle.end}</td>
+                              <td className="num-cell">{e ? `${kg(e.stocked)}kg` : '—'}</td>
+                              <td className="num-cell">{e ? `${kg(e.used)}kg` : '—'}</td>
+                              <td className="num-cell">{e && e.actual_remaining != null ? `${kg(e.actual_remaining)}kg` : '—'}</td>
+                              {wasteCell(e)}
+                            </tr>
+                          );
+                        })}
+                      </tbody>
+                    </table>
+                  </div>
+                </div>
+              ))}
             </div>
           )}
 
           <div className="section">
-            <div className="section-title">Coffee Efficiency</div>
-            <div className="eff-grid">
-              <EffCard label="Espresso"  e={a.eff?.espresso}  unit="g" />
-              <EffCard label="Drip"      e={a.eff?.drip}      unit="g" note="24.4g/cup · 110g per 4.5 cups" />
-              <EffCard label="Cold Brew" e={a.eff?.coldbrew}  unit="g" note="26.2g/serve · 4kg per 20×1.8L" />
-              <EffCard label="Pour-Over" e={a.eff?.pourover}  unit="g" note="incl. Turkish Coffee (7.5g)" />
-            </div>
-          </div>
-
-          {/* Total Drinks */}
-          <div className="section">
             <div className="section-title">Total Drinks</div>
             <div className="table-wrap">
               <table>
-                <thead>
-                  <tr>
-                    <th>Drink</th>
-                    <th>Total</th>
-                  </tr>
-                </thead>
+                <thead><tr><th>Drink</th><th>Total</th></tr></thead>
                 <tbody>
                   {Object.entries(a.matched || {})
                     .sort((x, y) => (y[1].qty || 0) - (x[1].qty || 0))
