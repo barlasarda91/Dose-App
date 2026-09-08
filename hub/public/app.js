@@ -891,7 +891,10 @@
             <td style="font-size:11px;color:var(--drift)">${i.visibility === 'exclusive'
               ? `Exclusive: ${i.exclusive_shop_ids.map(id => esc((shops.find(s => s.id === id) || {}).name || '?')).join(', ') || 'nobody yet'}`
               : 'All shops'}</td>
-            <td><button class="btn-sm btn" data-edit="${i.id}">Edit</button></td>
+            <td><div style="display:flex;gap:6px;justify-content:flex-end">
+              <button class="btn-sm btn" data-sheet="${i.id}">${hasSheet(i) ? 'Info Sheet ✓' : 'Info Sheet'}</button>
+              <button class="btn-sm btn" data-edit="${i.id}">Edit</button>
+            </div></td>
           </tr>`).join('')}
         </tbody></table></div>`;
       listEl.querySelectorAll('[data-edit]').forEach(btn => btn.onclick = () => {
@@ -899,6 +902,77 @@
         drawForm();
         window.scrollTo({ top: 0, behavior: 'smooth' });
       });
+      listEl.querySelectorAll('[data-sheet]').forEach(btn => btn.onclick = () =>
+        sheetEditor(items.find(i => String(i.id) === btn.dataset.sheet)));
+    }
+
+    const hasSheet = i => !!(i.info_country || i.info_region || i.info_producer || i.info_variety || i.info_process
+      || i.info_altitude || i.brew_filter || i.brew_espresso || (i.info_sections || []).length);
+
+    // Info-sheet editor: label facts, brew notes (filter/espresso), then the
+    // roastery's own sections in its own order.
+    function sheetEditor(item) {
+      let sections = (item.info_sections || []).map(x => ({ ...x }));
+      const wrap = document.createElement('div');
+      wrap.className = 'modal-bg show';
+      document.body.appendChild(wrap);
+      const FACTS = [['info_country', 'Country'], ['info_region', 'Region'], ['info_producer', 'Station / Farm'],
+        ['info_variety', 'Variety'], ['info_process', 'Process'], ['info_altitude', 'Altitude']];
+      function draw() {
+        wrap.innerHTML = `<div class="modal" style="width:680px">
+          <div class="modal-title">Info Sheet — ${esc(item.name)}</div>
+          <div class="modal-body">
+            <div class="lbl" style="margin-bottom:8px">Label Facts</div>
+            <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:10px;margin-bottom:16px">
+              ${FACTS.map(([k, l]) => `<div><label class="lbl">${l}</label><input data-fact="${k}" value="${esc(item[k] || '')}"></div>`).join('')}
+            </div>
+            <div class="lbl" style="margin-bottom:8px">Brewing Notes — shown first, above the story</div>
+            <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-bottom:16px">
+              <div><label class="lbl">Filter</label><textarea id="sh-bf" rows="3">${esc(item.brew_filter || '')}</textarea></div>
+              <div><label class="lbl">Espresso</label><textarea id="sh-be" rows="3">${esc(item.brew_espresso || '')}</textarea></div>
+            </div>
+            <div class="lbl" style="margin-bottom:8px">Sections — your headings, your order</div>
+            <div id="sh-secs">${sections.map((sec, idx) => `
+              <div style="border:1px solid var(--stone);padding:10px 12px;margin-bottom:10px">
+                <div style="display:flex;gap:8px;align-items:center;margin-bottom:8px">
+                  <input data-sec-title="${idx}" value="${esc(sec.title)}" placeholder="e.g. Intro, Relationship, Region…" style="flex:1">
+                  <button class="btn-sm" data-sec-up="${idx}" ${idx === 0 ? 'disabled' : ''}>↑</button>
+                  <button class="btn-sm" data-sec-down="${idx}" ${idx === sections.length - 1 ? 'disabled' : ''}>↓</button>
+                  <button class="btn-danger" data-sec-del="${idx}">Remove</button>
+                </div>
+                <textarea data-sec-body="${idx}" rows="4">${esc(sec.body)}</textarea>
+              </div>`).join('')}</div>
+            <button class="btn-sm" id="sh-add">+ Add Section</button>
+            <div style="display:flex;gap:10px;justify-content:flex-end;margin-top:18px">
+              <span class="err" id="sh-err" style="margin-right:auto"></span>
+              <button class="btn btn-ghost" id="sh-cancel">Cancel</button>
+              <button class="btn" id="sh-save">Save Info Sheet</button>
+            </div>
+          </div>
+        </div>`;
+        const collect = () => {
+          sections = sections.map((sec, idx) => ({
+            title: wrap.querySelector(`[data-sec-title="${idx}"]`).value,
+            body: wrap.querySelector(`[data-sec-body="${idx}"]`).value,
+          }));
+        };
+        wrap.querySelector('#sh-add').onclick = () => { collect(); sections.push({ title: '', body: '' }); draw(); };
+        wrap.querySelectorAll('[data-sec-del]').forEach(b => b.onclick = () => { collect(); sections.splice(parseInt(b.dataset.secDel, 10), 1); draw(); });
+        wrap.querySelectorAll('[data-sec-up]').forEach(b => b.onclick = () => { collect(); const i2 = parseInt(b.dataset.secUp, 10); [sections[i2 - 1], sections[i2]] = [sections[i2], sections[i2 - 1]]; draw(); });
+        wrap.querySelectorAll('[data-sec-down]').forEach(b => b.onclick = () => { collect(); const i2 = parseInt(b.dataset.secDown, 10); [sections[i2 + 1], sections[i2]] = [sections[i2], sections[i2 + 1]]; draw(); });
+        wrap.querySelector('#sh-cancel').onclick = () => wrap.remove();
+        wrap.querySelector('#sh-save').onclick = async () => {
+          collect();
+          const body = { brew_filter: wrap.querySelector('#sh-bf').value, brew_espresso: wrap.querySelector('#sh-be').value, info_sections: sections };
+          wrap.querySelectorAll('[data-fact]').forEach(el => { body[el.dataset.fact] = el.value; });
+          try {
+            const saved = await api(`/api/catalog/${item.id}/sheet`, { method: 'PUT', body: JSON.stringify(body) });
+            items = items.map(x => x.id === saved.id ? saved : x);
+            wrap.remove(); drawList();
+          } catch (e) { wrap.querySelector('#sh-err').textContent = e.message; }
+        };
+      }
+      draw();
     }
 
     drawForm(); drawList();
