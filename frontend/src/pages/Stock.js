@@ -64,7 +64,6 @@ export default function Stock() {
     <div className="page">
       <div className="page-eyebrow">Inventory</div>
       <h1 className="page-title">Stock Log</h1>
-      <p className="page-sub">Log coffee deliveries — each delivery closes the previous cycle.</p>
       <hr className="page-rule" />
 
       <div className="section">
