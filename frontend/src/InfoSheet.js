@@ -1,11 +1,5 @@
 import React from 'react';
-
-// House style for tasting notes regardless of how the roastery typed them:
-// "buttery, chocolate · marzipan" → "Buttery · Chocolate · Marzipan"
-const formatNotes = raw => String(raw || '')
-  .split(/[.,·;|]+/).map(w => w.trim()).filter(Boolean)
-  .map(w => w.charAt(0).toUpperCase() + w.slice(1))
-  .join(' · ');
+import { formatNotes } from './notes';
 
 // The roastery's coffee info sheet, rendered for the shop: label facts,
 // brewing notes first (that's what a busy bar needs), then the story

@@ -141,6 +141,14 @@
   const header = (eyebrow, title, sub) =>
     `<div class="eyebrow">${eyebrow}</div><h1 class="title">${title}</h1><hr class="rule">`;
 
+  // House style for tasting notes: "Jammy. Raisin, Bergamot, peach," →
+  // "Jammy. Raisin. Bergamot. Peach."
+  const fmtTastingNotes = raw => {
+    const tokens = String(raw || '').split(/[.,·;|/]+/).map(t => t.trim()).filter(Boolean)
+      .map(t => t.split(/\s+/).map(w => w.charAt(0).toUpperCase() + w.slice(1).toLowerCase()).join(' '));
+    return tokens.length ? tokens.join('. ') + '.' : '';
+  };
+
   const ROAST_TAGS = { espresso: 'ESP', filter: 'FLT', retail: 'RTL', retail_espresso: 'RTL·ESP', retail_filter: 'RTL·FLT' };
   const isRetail = r => r === 'retail' || String(r).startsWith('retail_');
   const roastTag = r => `<span class="roast-lbl">${ROAST_TAGS[r] || r}</span>`;
@@ -883,7 +891,7 @@
       const row = i => `
           <tr style="${i.active ? '' : 'opacity:.65'}">
             <td><span style="font-family:var(--serif);font-size:13px;color:var(--ink)">${esc(i.name)}</span>${badge(i)}
-              <div style="font-size:10px;color:var(--drift)">${esc(i.notes || '')}</div></td>
+              <div style="font-size:10px;color:var(--drift)">${esc(fmtTastingNotes(i.notes))}</div></td>
             <td class="num">${money(i.price_per_lb)}</td>
             <td class="num">${i.retail_price != null ? money(i.retail_price) : '—'}</td>
             <td style="font-size:11px;color:var(--drift)">${i.visibility === 'exclusive'
