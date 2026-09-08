@@ -134,6 +134,22 @@ const j = client(API, 'x-hub-key');
     r = await fetch(`${API}/api/ingest/catalog`, { headers: { Authorization: `Bearer ${shopKey}` } }).then(x => x.json());
     ok(r.items.find(i => i.id === plainId).info_sheet === null, 'empty sheet syncs as null — no phantom links');
 
+    section('archive / restore');
+    r = await j('POST', `/api/catalog/${plainId}/archive`, null, STAFF);
+    ok(r.status === 403, 'staff cannot archive');
+    r = await j('POST', `/api/catalog/${plainId}/archive`, null, OWNER);
+    ok(r.status === 200 && r.body.active === 0, 'owner archives a coffee');
+    r = await fetch(`${API}/api/ingest/catalog`, { headers: { Authorization: `Bearer ${shopKey}` } }).then(x => x.json());
+    ok(!r.items.some(i => i.id === plainId), 'archived coffee vanishes from the shop price list');
+    r = await ingest(shopKey, { order_date: '2026-06-05', items: [{ coffee_id: plainId, roast: 'espresso', lbs: 5 }] });
+    ok(r.status === 400, 'ordering an archived coffee refused');
+    r = await j('POST', `/api/catalog/${plainId}/restore`, null, OWNER);
+    ok(r.status === 200 && r.body.active === 1, 'restore brings it back');
+    r = await fetch(`${API}/api/ingest/catalog`, { headers: { Authorization: `Bearer ${shopKey}` } }).then(x => x.json());
+    ok(r.items.some(i => i.id === plainId), 'restored coffee reappears for shops');
+    r = await j('GET', '/api/activity', null, OWNER);
+    ok(r.body.some(a => /archived catalog item "Sheetless Decaf"/.test(a.action)), 'archive audited');
+
     section('adjustment guards');
     r = await j('POST', '/api/on-hand/adjust', { coffee_id: coffeeId, profile: 'espresso', delta_lbs: 0 }, STAFF);
     ok(r.status === 400, 'zero-delta adjustment rejected');

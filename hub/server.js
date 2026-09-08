@@ -931,6 +931,25 @@ function catalogItemFull(id) {
 
 // The info sheet is edited on its own — the story lives apart from pricing.
 const SHEET_FACTS = ['info_country', 'info_region', 'info_producer', 'info_variety', 'info_process', 'info_altitude'];
+// Archive / restore: archived coffees vanish from every shop's price list
+// instantly but keep their history (orders reference them by id). Deleting
+// a catalog item is deliberately not a thing.
+app.post('/api/catalog/:id/archive', requireOwner, (req, res) => {
+  const item = db.prepare('SELECT * FROM catalog WHERE id=?').get(req.params.id);
+  if (!item) return res.status(404).json({ error: 'Not found' });
+  db.prepare('UPDATE catalog SET active=0 WHERE id=?').run(item.id);
+  audit(req, `archived catalog item "${item.name}"`);
+  res.json(catalogItemFull(item.id));
+});
+
+app.post('/api/catalog/:id/restore', requireOwner, (req, res) => {
+  const item = db.prepare('SELECT * FROM catalog WHERE id=?').get(req.params.id);
+  if (!item) return res.status(404).json({ error: 'Not found' });
+  db.prepare('UPDATE catalog SET active=1 WHERE id=?').run(item.id);
+  audit(req, `restored catalog item "${item.name}"`);
+  res.json(catalogItemFull(item.id));
+});
+
 app.put('/api/catalog/:id/sheet', requireOwner, (req, res) => {
   const item = db.prepare('SELECT * FROM catalog WHERE id=?').get(req.params.id);
   if (!item) return res.status(404).json({ error: 'Not found' });

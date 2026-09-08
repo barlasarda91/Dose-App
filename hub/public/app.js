@@ -814,6 +814,7 @@
     page.appendChild(listEl);
 
     let editing = null; // item being edited, or null = adding
+    let archivedOpen = false;
 
     function drawForm() {
       const it = editing || { name: '', notes: '', price_per_lb: '', badge: '', low_stock: 0, visibility: 'standard', exclusive_shop_ids: [], active: 1 };
@@ -878,12 +879,9 @@
       const badge = i => [
         i.badge ? `<span class="badge seasonal">${esc(i.badge)}</span>` : '',
         i.low_stock ? '<span class="badge low">Low stock</span>' : '',
-        !i.active ? '<span class="badge">Archived</span>' : '',
       ].join('');
-      listEl.innerHTML = `<div class="table-wrap" style="margin-top:14px"><table>
-        <thead><tr><th>Coffee</th><th class="num">Base / lb</th><th class="num">12oz Bag</th><th>Visibility</th><th></th></tr></thead>
-        <tbody>${items.map(i => `
-          <tr style="${i.active ? '' : 'opacity:.55'}">
+      const row = i => `
+          <tr style="${i.active ? '' : 'opacity:.65'}">
             <td><span style="font-family:var(--serif);font-size:13px;color:var(--ink)">${esc(i.name)}</span>${badge(i)}
               <div style="font-size:10px;color:var(--drift)">${esc(i.notes || '')}</div></td>
             <td class="num">${money(i.price_per_lb)}</td>
@@ -894,9 +892,27 @@
             <td><div style="display:flex;gap:6px;justify-content:flex-end">
               <button class="btn-sm btn" data-sheet="${i.id}">${hasSheet(i) ? 'Info Sheet ✓' : 'Info Sheet'}</button>
               <button class="btn-sm btn" data-edit="${i.id}">Edit</button>
+              ${i.active
+                ? `<button class="btn-danger btn" data-archive="${i.id}" data-name="${esc(i.name)}">Archive</button>`
+                : `<button class="btn-sm btn" data-restore="${i.id}">Restore</button>`}
             </div></td>
-          </tr>`).join('')}
-        </tbody></table></div>`;
+          </tr>`;
+      const table = rows => `<div class="table-wrap" style="margin-top:14px"><table>
+        <thead><tr><th>Coffee</th><th class="num">Base / lb</th><th class="num">12oz Bag</th><th>Visibility</th><th></th></tr></thead>
+        <tbody>${rows.map(row).join('')}</tbody></table></div>`;
+      const live = items.filter(i => i.active);
+      const archived = items.filter(i => !i.active);
+      listEl.innerHTML = `
+        ${live.length ? table(live) : '<div class="empty">No active coffees — everything is archived.</div>'}
+        ${archived.length ? `
+          <div class="collapsed" id="arch-toggle" style="margin-top:14px">
+            <span><span class="chev ${archivedOpen ? 'open' : ''}">›</span> &nbsp;<strong style="font-weight:400">Archived</strong>
+              <span style="color:var(--drift)"> — ${archived.length} coffee${archived.length === 1 ? '' : 's'} shops can no longer order</span></span>
+            <span style="font-size:11px;color:var(--drift)">${archivedOpen ? 'click to collapse' : 'click to open'}</span>
+          </div>
+          ${archivedOpen ? table(archived) : ''}` : ''}`;
+      const at = document.getElementById('arch-toggle');
+      if (at) at.onclick = () => { archivedOpen = !archivedOpen; drawList(); };
       listEl.querySelectorAll('[data-edit]').forEach(btn => btn.onclick = () => {
         editing = items.find(i => String(i.id) === btn.dataset.edit);
         drawForm();
@@ -904,6 +920,16 @@
       });
       listEl.querySelectorAll('[data-sheet]').forEach(btn => btn.onclick = () =>
         sheetEditor(items.find(i => String(i.id) === btn.dataset.sheet)));
+      const act = (sel, path) => listEl.querySelectorAll(sel).forEach(btn => btn.onclick = async () => {
+        if (path === 'archive' && !confirm(`Archive ${btn.dataset.name}? It disappears from every shop's price list immediately — order history keeps it. Restore anytime.`)) return;
+        try {
+          const saved = await api(`/api/catalog/${btn.dataset.archive || btn.dataset.restore}/${path}`, { method: 'POST' });
+          items = items.map(x => x.id === saved.id ? saved : x);
+          drawList();
+        } catch (e) { alert(e.message); }
+      });
+      act('[data-archive]', 'archive');
+      act('[data-restore]', 'restore');
     }
 
     const hasSheet = i => !!(i.info_country || i.info_region || i.info_producer || i.info_variety || i.info_process
