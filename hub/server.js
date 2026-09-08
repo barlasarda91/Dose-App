@@ -261,8 +261,48 @@ const configReport = () => ({
   currency: CURRENCY,
 });
 console.log('Hub config:', JSON.stringify(configReport()));
+
+// ─── Nightly backups ─────────────────────────────────────────────────────────
+// One snapshot per LA calendar day on the hub's own volume, newest
+// BACKUP_KEEP retained. db.backup() is SQLite's online backup — safe live.
+const fsb = require('fs');
+const BACKUP_DIR = process.env.BACKUP_DIR || path.join(path.dirname(dbPath), 'backups');
+const BACKUP_KEEP = Math.max(1, parseInt(process.env.BACKUP_KEEP, 10) || 14);
+const BACKUP_RE = /^hub-\d{4}-\d{2}-\d{2}\.db$/;
+const backupToday = () => new Date().toLocaleDateString('en-CA', { timeZone: process.env.HUB_TZ || 'America/Los_Angeles' });
+
+function listBackups() {
+  try { return fsb.readdirSync(BACKUP_DIR).filter(f => BACKUP_RE.test(f)).sort(); } catch { return []; }
+}
+
+async function runBackup({ force = false } = {}) {
+  fsb.mkdirSync(BACKUP_DIR, { recursive: true });
+  const target = path.join(BACKUP_DIR, `hub-${backupToday()}.db`);
+  if (!force && fsb.existsSync(target)) return { written: false, file: path.basename(target) };
+  const tmp = target + '.tmp';
+  await db.backup(tmp);
+  fsb.renameSync(tmp, target); // appear atomically — a download never sees a half-written file
+  const files = listBackups();
+  for (const f of files.slice(0, Math.max(0, files.length - BACKUP_KEEP))) fsb.unlinkSync(path.join(BACKUP_DIR, f));
+  console.log(`Backup written: ${target}`);
+  return { written: true, file: path.basename(target) };
+}
+
+const backupTick = () => runBackup().catch(err => console.error('BACKUP FAILED:', err.message));
+backupTick();
+setInterval(backupTick, 60 * 60 * 1000).unref();
+
+function backupStatus() {
+  const files = listBackups();
+  if (!files.length) return { count: 0, last: null, age_hours: null };
+  const last = files[files.length - 1];
+  const st = fsb.statSync(path.join(BACKUP_DIR, last));
+  return { count: files.length, last, age_hours: Math.round((Date.now() - st.mtimeMs) / 36e5 * 10) / 10 };
+}
+
 app.get('/api/health', async (req, res) => {
   const report = configReport();
+  report.backup = backupStatus();
   // /api/health?probe=email — ask Resend directly whether the configured key
   // is accepted (no email is sent).
   if (req.query.probe === 'email' && RESEND_KEY) {
@@ -585,6 +625,28 @@ app.use('/api', (req, res, next) => {
   const token = req.get('x-hub-key') || '';
   if (token && db.prepare("SELECT token FROM sessions WHERE token=? AND expires_at > datetime('now')").get(sha256(token))) return next();
   res.status(401).json({ error: 'Unauthorized' });
+});
+
+// ─── Backup access (dashboard login required — registered behind the gate) ───
+app.get('/api/backups', (req, res) => {
+  const files = listBackups().map(f => {
+    const st = fsb.statSync(path.join(BACKUP_DIR, f));
+    return { file: f, bytes: st.size, modified: st.mtime.toISOString() };
+  });
+  res.json({ ...backupStatus(), keep: BACKUP_KEEP, files });
+});
+
+app.post('/api/backups/run', async (req, res) => {
+  try { res.json(await runBackup({ force: true })); }
+  catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.get('/api/backups/download', (req, res) => {
+  const files = listBackups();
+  if (!files.length) return res.status(404).json({ error: 'No backups yet' });
+  const name = req.query.file && BACKUP_RE.test(req.query.file) && files.includes(req.query.file)
+    ? req.query.file : files[files.length - 1];
+  res.download(path.join(BACKUP_DIR, name), name);
 });
 
 // ─── Catalog management ───────────────────────────────────────────────────────
