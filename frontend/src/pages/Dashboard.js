@@ -118,7 +118,7 @@ function Snapshot({ a }) {
   const used    = ROASTS.reduce((s, [, k]) => s + (eff[k]?.used || 0), 0);
   const pct = stocked > 0 ? Math.round((used / stocked) * 1000) / 10 : null;
   return (
-    <div className="snapshot">
+    <div className="snapshot" data-tour="snapshot">
       <div className="snapshot-head">
         <div className="snapshot-pct">{pct != null ? <>{pct}<span>%</span></> : '—'}</div>
         <div>

@@ -299,6 +299,38 @@ tbody tr.selected td, tr.selected td { background: rgba(107,110,74,0.12); }
 .hcard-foot { display: flex; justify-content: space-between; align-items: center; gap: 8px; padding: 8px 14px; border-top: 1px solid rgba(184,175,163,0.4); font-size:11px; color: var(--drift); flex-wrap: wrap; }
 
 /* ── Mobile layout (the same webpage below 700px — desktop untouched) ── */
+
+/* ─── Guided tour ──────────────────────────────────────────────────────────── */
+.tour-layer { position: fixed; inset: 0; z-index: 1000; }
+.tour-dim { position: absolute; inset: 0; background: rgba(26,25,22,0.55); }
+.tour-spot {
+  position: fixed; pointer-events: none;
+  box-shadow: 0 0 0 9999px rgba(26,25,22,0.55), 0 0 0 3px var(--parch), 0 0 0 5px var(--olive);
+  transition: top .25s, left .25s, width .25s, height .25s;
+}
+.tour-card {
+  position: fixed; width: 360px; max-width: calc(100vw - 32px);
+  background: var(--parch); border: 1px solid var(--ink);
+  box-shadow: 6px 6px 0 rgba(26,25,22,0.35); padding: 20px 22px;
+}
+.tour-card-center { width: 410px; text-align: center; }
+.tour-wordmark { margin-bottom: 12px; }
+.tour-wordmark div { font-family: var(--font-serif); font-size: 22px; letter-spacing: 0.04em; }
+.tour-wordmark span { font-size: 9px; letter-spacing: 0.3em; text-transform: uppercase; color: var(--drift); }
+.tour-step { font-size: 9px; letter-spacing: 0.22em; text-transform: uppercase; color: var(--olive); margin-bottom: 6px; }
+.tour-title { font-family: var(--font-serif); font-size: 19px; margin-bottom: 8px; }
+.tour-copy { font-size: 12px; color: var(--graphite); line-height: 1.8; margin-bottom: 16px; }
+.tour-actions { display: grid; gap: 10px; margin-bottom: 16px; }
+.tour-foot { display: flex; justify-content: space-between; align-items: center; gap: 12px; }
+.tour-card-center .tour-foot { justify-content: center; gap: 18px; }
+.tour-hint { font-size: 10px; color: var(--drift); }
+.tour-skip { font-size: 10px; letter-spacing: 0.14em; text-transform: uppercase; color: var(--drift); text-decoration: underline; cursor: pointer; }
+.tour-btns { display: flex; gap: 8px; align-items: center; }
+.tour-dots { display: flex; gap: 6px; margin-top: 15px; }
+.tour-card-center .tour-dots { justify-content: center; }
+.tour-dot { width: 7px; height: 7px; border-radius: 50%; background: var(--stone); border: 1px solid var(--linen); }
+.tour-dot.on { background: var(--olive); border-color: var(--olive); }
+
 @media (max-width: 700px) {
   .nav { height: auto; flex-direction: column; align-items: stretch; padding: 0; }
   .nav-logo { padding: 12px 16px 0; }
@@ -318,4 +350,5 @@ tbody tr.selected td, tr.selected td { background: rgba(107,110,74,0.12); }
   .btn { padding: 12px 18px; }
   .btn-danger, .btn-sm { padding: 9px 12px; }
   .modal { max-height: 90vh; overflow-y: auto; }
+  .tour-card, .tour-card-center { left: 10px !important; right: 10px; bottom: 12px; top: auto !important; width: auto; transform: none !important; }
 }

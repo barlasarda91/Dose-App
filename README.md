@@ -51,6 +51,7 @@ Track coffee and milk efficiency for your coffee shop by comparing Square POS sa
 - **Order** — place a coffee order with the roastery, emailed to the configured address (default `hello@boxxcoffee.com`). Includes a suggested order computed from the current cycle's burn rate, a one-click **Duplicate Last Order**, and a full order history.
 - **Drink Recipes** — each recipe is **picked from the shop's live Square catalog** (with 30-day sold counts), never typed, so names always match sales data. The editor asks *how is it brewed* — Espresso Machine, Batch Brew, Cold Brew, or Pour-Over — and the method decides the roast. Batch methods take batch inputs (coffee per batch + yield as cups served, or liters + serving oz) and the per-cup dose is computed server-side; espresso and pour-over keep a per-drink dose. Square items with no recipe are surfaced with **Map It** or **No coffee — ignore**. Starts empty — nothing is pre-seeded.
 - **Settings** — Square access token + Location ID, ordering config, and user management (all admin-only), plus own-password change for everyone. Secret fields are write-only: they show configured/not-configured, never the value.
+- **App Tour** — every user's first sign-in opens a guided, click-through walkthrough of the real app (spotlight steps, in adoption order: log a delivery → connect Square → add recipes), ending with buttons that jump straight to those actions. Seen-state is per user, server-side; replayable from Settings → Help.
 
 ## Delivery cycles
 

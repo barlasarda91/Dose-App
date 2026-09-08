@@ -68,7 +68,7 @@ export default function Stock() {
 
       <div className="section">
         <div className="section-title">Coffee Deliveries</div>
-        <div className="card" style={{ marginBottom: 16 }}>
+        <div className="card" data-tour="delivery-form" style={{ marginBottom: 16 }}>
           <div className="card-title">Log New Delivery</div>
           <p style={{ fontSize: 12, color: 'var(--drift)', marginBottom: 14, lineHeight: 1.6 }}>
             Enter lbs on hand before this delivery, and lbs received. Opening stock for a period = on hand + received at the first delivery.

@@ -250,7 +250,7 @@ export default function Order() {
       {dupNote && <div className="warn-box">⚠ {dupNote}</div>}
 
       {catalogMode ? (
-        <div className="section">
+        <div className="section" data-tour="order-form">
           <div className="section-title" style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 10 }}>
             <span>Coffee List</span>
             {isMobile && lastCatalogOrder && (
