@@ -215,6 +215,7 @@ for (const t of ['coffee_deliveries', 'milk_deliveries', 'coffee_orders', 'drink
   try { db.exec(`ALTER TABLE ${t} ADD COLUMN created_by TEXT`); } catch { /* already present */ }
 }
 try { db.exec('ALTER TABLE coffee_orders ADD COLUMN hub_status TEXT'); } catch { /* already present */ }
+try { db.exec('ALTER TABLE users ADD COLUMN tour_seen_at TEXT'); } catch { /* present */ }
 for (const col of ['last_run_at TEXT', 'last_result TEXT']) {
   try { db.exec(`ALTER TABLE standing_orders ADD COLUMN ${col}`); } catch { /* present */ }
 }
@@ -431,7 +432,7 @@ app.use('/api', (req, res, next) => {
   if (OPEN_PATHS.has(req.path)) return next();
   const token = req.get('x-dose-key') || '';
   const row = token && db.prepare(
-    `SELECT s.token AS thash, s.expires_at, u.id, u.username, u.role
+    `SELECT s.token AS thash, s.expires_at, u.id, u.username, u.role, u.tour_seen_at
      FROM sessions s JOIN users u ON u.id = s.user_id
      WHERE s.token=? AND s.expires_at > datetime('now')`
   ).get(sha256(token));
@@ -440,7 +441,7 @@ app.use('/api', (req, res, next) => {
     if (new Date(row.expires_at + 'Z') - Date.now() < SESSION_RENEW_BELOW_DAYS * 86400_000) {
       db.prepare(`UPDATE sessions SET expires_at = datetime('now', '+${SESSION_DAYS} days') WHERE token=?`).run(row.thash);
     }
-    req.user = { id: row.id, username: row.username, role: row.role };
+    req.user = { id: row.id, username: row.username, role: row.role, tour_seen_at: row.tour_seen_at };
     return next();
   }
   res.status(401).json({ error: 'Unauthorized' });
@@ -616,6 +617,13 @@ app.post('/api/login', asyncRoute(async (req, res) => {
 }));
 
 app.get('/api/me', (req, res) => res.json(req.user));
+
+// The guided tour shows once per user, tracked server-side so it follows the
+// person across devices. Replayable from Settings regardless.
+app.post('/api/me/tour-done', (req, res) => {
+  db.prepare("UPDATE users SET tour_seen_at=datetime('now') WHERE id=?").run(req.user.id);
+  res.json({ ok: true });
+});
 
 // Change your own password; signs out your other sessions. Hub-managed
 // identities change their password AT the hub (proxied with the API key).
