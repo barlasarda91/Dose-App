@@ -361,7 +361,52 @@ async function sendEmail(to, subject, html) {
 
 const esc = s => String(s ?? '').replace(/[<>&"]/g, c => ({ '<': '&lt;', '>': '&gt;', '&': '&amp;', '"': '&quot;' }[c]));
 
-function orderEmailHtml(order, items, shop, headline, sub) {
+// Email palette (mirrors the app's tokens — emails can't use CSS variables)
+const EM = { ink: '#1A1916', parch: '#F5EFE3', linen: '#DDD6CC', drift: '#7A7268', graphite: '#3D3A34', olive: '#6B6E4A', mute: '#B8AFA3' };
+
+const EMAIL_STAGES = ['Received', 'Confirmed', 'Roasted', 'Shipped'];
+
+// The stage an order is really at — used by the Updated email so the progress
+// line reflects truth rather than the email's own occasion.
+function orderStage(order, items) {
+  if (order.status === 'shipped' || order.status === 'delivered') return 'Shipped';
+  if (items && items.length && items.every(i => i.roasted)) return 'Roasted';
+  if (order.status === 'confirmed') return 'Confirmed';
+  return 'Received';
+}
+
+// Received → Confirmed → Roasted → Shipped, as a table (email clients choke
+// on flexbox). Olive dots for done stages, current stage bolded.
+function emailProgressLine(stage) {
+  const idx = EMAIL_STAGES.indexOf(stage);
+  if (idx === -1) return '';
+  const cells = EMAIL_STAGES.map((s, i) => {
+    const done = i <= idx;
+    return `<td align="center" style="padding:0;width:25%;">
+      <span style="display:inline-block;width:9px;height:9px;border-radius:50%;background:${done ? EM.olive : EM.linen};"></span><br>
+      <span style="font-family:monospace;font-size:9px;letter-spacing:0.12em;text-transform:uppercase;color:${i === idx ? EM.olive : done ? EM.graphite : EM.mute};${i === idx ? 'font-weight:bold;' : ''}">${s}</span>
+    </td>`;
+  }).join('');
+  return `<table width="100%" cellpadding="0" cellspacing="0" style="border-collapse:collapse;background:#EDE6D8;border-bottom:1px solid ${EM.linen};">
+    <tr><td style="padding:12px 26px 3px;">
+      <table width="100%" cellpadding="0" cellspacing="0"><tr>${cells}</tr></table>
+    </td></tr><tr><td style="height:10px;"></td></tr></table>`;
+}
+
+// Typographic wordmark rather than an image: most clients block remote images
+// until the reader opts in, so an image-led header would arrive broken.
+function emailHeader(headline, shopLine, accent) {
+  return `<div style="background:${accent || EM.ink};padding:20px 26px 18px;">
+      <div style="font-family:Georgia,serif;font-size:22px;letter-spacing:0.06em;color:${EM.parch};">BOXX</div>
+      <div style="font-family:monospace;font-size:9px;color:${EM.mute};letter-spacing:0.3em;text-transform:uppercase;margin-top:1px;">Coffee Roasters Co.</div>
+      <div style="font-family:Georgia,serif;font-size:17px;color:${EM.parch};margin-top:14px;border-top:1px solid rgba(245,239,227,0.25);padding-top:12px;">${esc(headline)}</div>
+      <div style="font-family:monospace;font-size:11px;color:${EM.mute};letter-spacing:0.14em;text-transform:uppercase;margin-top:5px;">${shopLine}</div>
+    </div>`;
+}
+
+// opts: { stage: 'Received'|'Confirmed'|'Roasted'|'Shipped' (progress line;
+// omit for non-status emails), accent: header color override }
+function orderEmailHtml(order, items, shop, headline, sub, opts = {}) {
   const roastLabel = r =>
     r === 'espresso' ? 'Espresso Roast' : r === 'filter' ? 'Filter Roast'
     : r === 'retail_espresso' ? '12oz Bags — Espresso Roast'
@@ -379,15 +424,12 @@ function orderEmailHtml(order, items, shop, headline, sub) {
     : `<tr><td colspan="4" style="padding:9px 14px;font-family:monospace;font-size:12px;color:#3D3A34;">
         ${['espresso_lbs', 'drip_lbs', 'coldbrew_lbs', 'pourover_lbs'].filter(f => order[f] > 0).map(f => `${f.replace('_lbs', '')}: ${order[f]} lbs`).join(' · ')}
       </td></tr>`;
+  const shopLine = `${esc(shop.name)} · placed ${esc(order.order_date)}${order.requested_date ? ` · requested ${esc(order.requested_date)}` : ''}`;
   return `
   <div style="max-width:560px;margin:0 auto;background:#F5EFE3;border:1px solid #DDD6CC;">
-    <div style="background:#1A1916;padding:22px 26px;">
-      <div style="font-family:Georgia,serif;font-size:18px;color:#F5EFE3;">${esc(headline)}</div>
-      <div style="font-family:monospace;font-size:11px;color:#B8AFA3;letter-spacing:0.14em;text-transform:uppercase;margin-top:6px;">
-        ${esc(shop.name)} · placed ${esc(order.order_date)}${order.requested_date ? ` · requested ${esc(order.requested_date)}` : ''}
-      </div>
-    </div>
-    ${sub ? `<div style="padding:14px 26px;font-family:monospace;font-size:12px;color:#3D3A34;border-bottom:1px solid #DDD6CC;">${esc(sub)}</div>` : ''}
+    ${emailHeader(headline, shopLine, opts.accent)}
+    ${opts.stage ? emailProgressLine(opts.stage) : ''}
+    ${sub ? `<div style="padding:14px 26px;font-family:monospace;font-size:12px;color:#3D3A34;line-height:1.7;border-bottom:1px solid #DDD6CC;">${esc(sub)}</div>` : ''}
     <table style="width:100%;border-collapse:collapse;">
       <thead><tr>
         ${['Coffee', 'Qty', 'Price', 'Total'].map((h, i) => `<th style="padding:9px 14px;background:#DDD6CC;font-family:monospace;font-size:10px;letter-spacing:0.16em;text-transform:uppercase;color:#7A7268;text-align:${i ? 'right' : 'left'};">${h}</th>`).join('')}
@@ -401,8 +443,9 @@ function orderEmailHtml(order, items, shop, headline, sub) {
       </tr></tfoot>
     </table>
     ${order.notes ? `<div style="padding:14px 26px;font-family:monospace;font-size:12px;color:#3D3A34;">Notes: ${esc(order.notes)}</div>` : ''}
-    <div style="padding:14px 26px;font-family:monospace;font-size:10px;color:#7A7268;border-top:1px solid #DDD6CC;">
-      Dose Hub · Boxx Coffee Roasters Co.
+    <div style="padding:14px 26px;font-family:monospace;font-size:10px;color:#7A7268;border-top:1px solid #DDD6CC;line-height:1.7;">
+      Dose Hub · Boxx Coffee Roasters Co. · Los Angeles, CA<br>
+      Questions about this order? Just reply to this email.
     </div>
   </div>`;
 }
@@ -477,7 +520,7 @@ app.post('/api/ingest/orders', async (req, res) => {
     const order = db.prepare('SELECT * FROM orders WHERE id=?').get(orderId);
     const items = db.prepare('SELECT * FROM order_items WHERE order_id=?').all(orderId);
     const receipt = await sendEmail(shop.email, `Order received — ${shop.name} — ${order.order_date}`,
-      orderEmailHtml(order, items, shop, 'Order Received', 'Your order has been received by the roastery. You will get another email when it is confirmed.'));
+      orderEmailHtml(order, items, shop, 'Order Received', 'Your order has been received by the roastery. You will get another email when it is confirmed.', { stage: 'Received' }));
     if (process.env.HUB_NOTIFY_EMAIL) {
       await sendEmail(process.env.HUB_NOTIFY_EMAIL, `New order — ${shop.name} — ${order.order_date}`,
         orderEmailHtml(order, items, shop, 'New Order', null));
@@ -829,9 +872,9 @@ app.patch('/api/orders/:id', async (req, res) => {
     const items = db.prepare('SELECT * FROM order_items WHERE order_id=?').all(order.id);
     email = status === 'confirmed'
       ? await sendEmail(shop.email, `Order confirmed — ${shop.name} — ${order.order_date}`,
-          orderEmailHtml(order, items, shop, 'Order Confirmed', 'The roastery has confirmed your order and it is being prepared.'))
+          orderEmailHtml(order, items, shop, 'Order Confirmed', 'The roastery has confirmed your order and it is being prepared.', { stage: 'Confirmed', accent: EM.olive }))
       : await sendEmail(shop.email, `Order shipped — ${shop.name} — ${order.order_date}`,
-          orderEmailHtml(order, items, shop, 'Order Shipped', 'Your order is packed and on the way.'));
+          orderEmailHtml(order, items, shop, 'Order Shipped', 'Your order is packed and on the way.', { stage: 'Shipped', accent: EM.olive }));
   }
 
   const updated = orderFull(db.prepare('SELECT o.*, s.name AS shop_name FROM orders o JOIN shops s ON s.id=o.shop_id WHERE o.id=?').get(req.params.id));
@@ -884,7 +927,7 @@ app.put('/api/orders/:id/items', async (req, res) => {
     const shop = db.prepare('SELECT * FROM shops WHERE id=?').get(order.shop_id);
     const updated = db.prepare('SELECT * FROM orders WHERE id=?').get(order.id);
     const email = await sendEmail(shop.email, `Order updated — ${shop.name} — ${order.order_date}`,
-      orderEmailHtml(updated, remaining, shop, 'Order Updated', 'The roastery adjusted your order — here is the updated summary. Questions? Just reply to this email.'));
+      orderEmailHtml(updated, remaining, shop, 'Order Updated', 'The roastery adjusted your order — here is the updated summary.', { stage: orderStage(updated, remaining) }));
 
     res.json({ ...orderFull(db.prepare('SELECT o.*, s.name AS shop_name FROM orders o JOIN shops s ON s.id=o.shop_id WHERE o.id=?').get(order.id)), email });
   } catch (err) {
@@ -1046,7 +1089,7 @@ app.post('/api/roast-program/fill', async (req, res) => {
       const its = db.prepare('SELECT * FROM order_items WHERE order_id=?').all(oid);
       const email = await sendEmail(shop.email, `Order roasted — ${shop.name} — ${order.order_date}`,
         orderEmailHtml(order, its, shop, 'Order Roasted',
-          'Your coffee has been roasted. Packing is next — you will get another email when your order ships.'));
+          'Your coffee has been roasted. Packing is next — you will get another email when your order ships.', { stage: 'Roasted' }));
       emails.push({ order_id: oid, shop_name: shop.name, ...email });
     }
     res.json({
