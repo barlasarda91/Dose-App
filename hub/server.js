@@ -136,10 +136,34 @@ db.exec(`
     expires_at TEXT,
     created_at TEXT DEFAULT (datetime('now'))
   );
+
+  CREATE TABLE IF NOT EXISTS hub_users (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    username TEXT NOT NULL UNIQUE,
+    password_hash TEXT NOT NULL,
+    role TEXT NOT NULL DEFAULT 'staff' CHECK(role IN ('owner','staff')),
+    active INTEGER NOT NULL DEFAULT 1,
+    must_change_password INTEGER NOT NULL DEFAULT 0,
+    last_active_at TEXT,
+    created_at TEXT DEFAULT (datetime('now'))
+  );
+
+  CREATE TABLE IF NOT EXISTS audit_log (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    at TEXT DEFAULT (datetime('now')),
+    username TEXT NOT NULL,
+    action TEXT NOT NULL
+  );
 `);
 
 // Databases created before this version predate some columns.
 try { db.exec('ALTER TABLE shops ADD COLUMN email TEXT'); } catch { /* present */ }
+// Sessions predate named accounts — old tokens carry no user and stop working.
+try { db.exec('ALTER TABLE sessions ADD COLUMN user_id INTEGER'); } catch { /* present */ }
+try { db.exec('ALTER TABLE stock_moves ADD COLUMN created_by TEXT'); } catch { /* present */ }
+for (const col of ['confirmed_by TEXT', 'confirmed_at TEXT', 'shipped_by TEXT', 'shipped_at TEXT']) {
+  try { db.exec(`ALTER TABLE orders ADD COLUMN ${col}`); } catch { /* present */ }
+}
 for (const col of ['login_username TEXT', 'password_hash TEXT', 'salt TEXT', 'invite_token_hash TEXT', 'invite_expires_at TEXT']) {
   try { db.exec(`ALTER TABLE shops ADD COLUMN ${col}`); } catch { /* present */ }
 }
@@ -263,6 +287,7 @@ const configReport = () => ({
 console.log('Hub config:', JSON.stringify(configReport()));
 app.get('/api/health', async (req, res) => {
   const report = configReport();
+  report.named_accounts = hubUsersExist();
   // /api/health?probe=email — ask Resend directly whether the configured key
   // is accepted (no email is sent).
   if (req.query.probe === 'email' && RESEND_KEY) {
@@ -284,9 +309,8 @@ app.get('/api/health', async (req, res) => {
   res.json(report);
 });
 
-// ─── Roastery auth (shared password from HUB_PASSWORD) ───────────────────────
+// ─── Roastery auth (named accounts; HUB_PASSWORD bootstraps the first owner) ──
 const HUB_PASSWORD = process.env.HUB_PASSWORD || '';
-if (!HUB_PASSWORD) console.warn('WARNING: HUB_PASSWORD is not set — the hub dashboard cannot be logged into until it is.');
 
 function safeEqual(a, b) {
   return crypto.timingSafeEqual(
@@ -295,10 +319,44 @@ function safeEqual(a, b) {
   );
 }
 
-function issueToken() {
+const hubUsersExist = () => db.prepare('SELECT COUNT(*) c FROM hub_users').get().c > 0;
+if (!hubUsersExist() && !HUB_PASSWORD) {
+  console.warn('WARNING: no hub accounts exist and HUB_PASSWORD is not set — the first owner account cannot be created until it is.');
+}
+
+const USERNAME_RE = /^[a-z0-9._-]{3,32}$/;
+const PASSWORD_MIN = 10;
+
+function hubHashPassword(pw) {
+  return new Promise((resolve, reject) => {
+    const salt = crypto.randomBytes(16);
+    crypto.scrypt(String(pw), salt, 64, (err, dk) => err ? reject(err) : resolve(salt.toString('hex') + ':' + dk.toString('hex')));
+  });
+}
+function hubVerifyPassword(pw, stored) {
+  return new Promise((resolve, reject) => {
+    const [saltHex, hashHex] = String(stored || '').split(':');
+    if (!saltHex || !hashHex) return resolve(false);
+    crypto.scrypt(String(pw), Buffer.from(saltHex, 'hex'), 64, (err, dk) => {
+      if (err) return reject(err);
+      const want = Buffer.from(hashHex, 'hex');
+      resolve(want.length === dk.length && crypto.timingSafeEqual(want, dk));
+    });
+  });
+}
+
+// Append-only trail of everything consequential, signed by whoever did it.
+function audit(req, action) {
+  try {
+    db.prepare('INSERT INTO audit_log (username, action) VALUES (?, ?)')
+      .run((req.hubUser && req.hubUser.username) || 'system', String(action).slice(0, 400));
+  } catch (err) { console.error('audit failed:', err.message); }
+}
+
+function issueToken(userId) {
   const token = crypto.randomBytes(32).toString('hex');
-  db.prepare(`INSERT INTO sessions (token, expires_at) VALUES (?, datetime('now', '+${SESSION_DAYS} days'))`)
-    .run(sha256(token));
+  db.prepare(`INSERT INTO sessions (token, user_id, expires_at) VALUES (?, ?, datetime('now', '+${SESSION_DAYS} days'))`)
+    .run(sha256(token), userId);
   return token;
 }
 
@@ -322,17 +380,57 @@ function recordFailure(key) {
   loginFailures.set(key, e);
 }
 
-app.post('/api/login', (req, res) => {
-  if (!HUB_PASSWORD) return res.status(503).json({ error: 'HUB_PASSWORD not configured on the server' });
-  const key = `ip:${req.ip}`;
-  const wait = lockedFor(key);
-  if (wait > 0) return res.status(429).json({ error: `Too many attempts — try again in ${wait}s` });
-  if (!safeEqual((req.body && req.body.password) || '', HUB_PASSWORD)) {
-    recordFailure(key);
-    return res.status(401).json({ error: 'Wrong password' });
+// Public: tells the login screen whether this hub still needs its first owner.
+app.get('/api/auth-mode', (req, res) => res.json({ setup_required: !hubUsersExist() }));
+
+// First run only: HUB_PASSWORD acts as the one-time bootstrap code to create
+// the first owner account, then never logs anyone in again.
+app.post('/api/setup-owner', async (req, res) => {
+  try {
+    if (hubUsersExist()) return res.status(400).json({ error: 'Already set up — log in with your account' });
+    if (!HUB_PASSWORD) return res.status(503).json({ error: 'HUB_PASSWORD is not set on the server — it is needed once, as the bootstrap code' });
+    const { username, password, bootstrap_password } = req.body || {};
+    const key = `ip:${req.ip}`;
+    const wait = lockedFor(key);
+    if (wait > 0) return res.status(429).json({ error: `Too many attempts — try again in ${wait}s` });
+    if (!safeEqual(bootstrap_password || '', HUB_PASSWORD)) {
+      recordFailure(key);
+      return res.status(403).json({ error: 'Wrong bootstrap code (the HUB_PASSWORD value on the server)' });
+    }
+    const uname = String(username || '').trim().toLowerCase();
+    if (!USERNAME_RE.test(uname)) return res.status(400).json({ error: 'Username: 3–32 chars, lowercase letters/numbers/._- only' });
+    if (String(password || '').length < PASSWORD_MIN) return res.status(400).json({ error: `Password must be at least ${PASSWORD_MIN} characters` });
+    const hash = await hubHashPassword(password);
+    const r = db.prepare('INSERT INTO hub_users (username, password_hash, role) VALUES (?, ?, ?)').run(uname, hash, 'owner');
+    loginFailures.delete(key);
+    db.prepare('INSERT INTO audit_log (username, action) VALUES (?, ?)').run(uname, 'created the first owner account (bootstrap)');
+    res.json({ ok: true, token: issueToken(r.lastInsertRowid), user: { username: uname, role: 'owner' }, must_change_password: false });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
   }
-  loginFailures.delete(key);
-  res.json({ ok: true, token: issueToken() });
+});
+
+app.post('/api/login', async (req, res) => {
+  try {
+    if (!hubUsersExist()) return res.status(409).json({ error: 'Setup required', setup_required: true });
+    const { username, password } = req.body || {};
+    const uname = String(username || '').trim().toLowerCase();
+    const ipKey = `ip:${req.ip}`;
+    const userKey = `u:${uname}`;
+    const wait = Math.max(lockedFor(ipKey), lockedFor(userKey));
+    if (wait > 0) return res.status(429).json({ error: `Too many attempts — try again in ${wait}s` });
+    const user = db.prepare('SELECT * FROM hub_users WHERE username=? AND active=1').get(uname);
+    const okPw = user ? await hubVerifyPassword(password || '', user.password_hash) : (await hubHashPassword('timing-equalizer'), false);
+    if (!okPw) {
+      recordFailure(ipKey); recordFailure(userKey);
+      return res.status(401).json({ error: 'Wrong username or password' });
+    }
+    loginFailures.delete(ipKey); loginFailures.delete(userKey);
+    db.prepare("UPDATE hub_users SET last_active_at=datetime('now') WHERE id=?").run(user.id);
+    res.json({ ok: true, token: issueToken(user.id), user: { username: user.username, role: user.role }, must_change_password: !!user.must_change_password });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
 });
 
 // ─── Email (Resend) ───────────────────────────────────────────────────────────
@@ -624,10 +722,115 @@ app.post('/api/public/set-password', async (req, res) => {
 
 // ─── Dashboard auth gate ──────────────────────────────────────────────────────
 app.use('/api', (req, res, next) => {
-  if (req.path === '/login' || req.path.startsWith('/ingest/') || req.path.startsWith('/public/')) return next();
+  if (['/login', '/setup-owner', '/auth-mode'].includes(req.path) || req.path.startsWith('/ingest/') || req.path.startsWith('/public/')) return next();
   const token = req.get('x-hub-key') || '';
-  if (token && db.prepare("SELECT token FROM sessions WHERE token=? AND expires_at > datetime('now')").get(sha256(token))) return next();
-  res.status(401).json({ error: 'Unauthorized' });
+  const row = token && db.prepare(
+    `SELECT u.id, u.username, u.role, u.must_change_password
+     FROM sessions s JOIN hub_users u ON u.id = s.user_id
+     WHERE s.token=? AND s.expires_at > datetime('now') AND u.active=1`
+  ).get(sha256(token));
+  if (!row) return res.status(401).json({ error: 'Unauthorized' });
+  req.hubUser = { id: row.id, username: row.username, role: row.role };
+  db.prepare("UPDATE hub_users SET last_active_at=datetime('now') WHERE id=? AND (last_active_at IS NULL OR last_active_at < datetime('now','-5 minutes'))").run(row.id);
+  // A temporary password only unlocks changing it to a real one.
+  if (row.must_change_password && !['/me', '/me/password'].includes(req.path)) {
+    return res.status(403).json({ error: 'Set your own password first', must_change_password: true });
+  }
+  next();
+});
+
+function requireOwner(req, res, next) {
+  if (req.hubUser && req.hubUser.role === 'owner') return next();
+  res.status(403).json({ error: 'Owner access required' });
+}
+
+// ─── Who am I / own password ─────────────────────────────────────────────────
+app.get('/api/me', (req, res) => {
+  const u = db.prepare('SELECT username, role, must_change_password FROM hub_users WHERE id=?').get(req.hubUser.id);
+  res.json({ username: u.username, role: u.role, must_change_password: !!u.must_change_password });
+});
+
+app.post('/api/me/password', async (req, res) => {
+  try {
+    const { current_password, new_password } = req.body || {};
+    const u = db.prepare('SELECT * FROM hub_users WHERE id=?').get(req.hubUser.id);
+    if (!(await hubVerifyPassword(current_password || '', u.password_hash)))
+      return res.status(401).json({ error: 'Current password is wrong' });
+    if (String(new_password || '').length < PASSWORD_MIN)
+      return res.status(400).json({ error: `New password must be at least ${PASSWORD_MIN} characters` });
+    const hash = await hubHashPassword(new_password);
+    db.prepare('UPDATE hub_users SET password_hash=?, must_change_password=0 WHERE id=?').run(hash, u.id);
+    // Other sessions (e.g. someone holding the temp password) die; this one stays.
+    const keep = sha256(req.get('x-hub-key') || '');
+    db.prepare('DELETE FROM sessions WHERE user_id=? AND token != ?').run(u.id, keep);
+    audit(req, 'changed their password');
+    res.json({ ok: true });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ─── Team management (owners) ────────────────────────────────────────────────
+app.get('/api/team', requireOwner, (req, res) => {
+  res.json(db.prepare('SELECT id, username, role, active, must_change_password, last_active_at, created_at FROM hub_users ORDER BY active DESC, username').all());
+});
+
+app.post('/api/team', requireOwner, async (req, res) => {
+  try {
+    const { username, role, temp_password } = req.body || {};
+    const uname = String(username || '').trim().toLowerCase();
+    if (!USERNAME_RE.test(uname)) return res.status(400).json({ error: 'Username: 3–32 chars, lowercase letters/numbers/._- only' });
+    if (!['owner', 'staff'].includes(role)) return res.status(400).json({ error: 'Role must be owner or staff' });
+    if (String(temp_password || '').length < PASSWORD_MIN) return res.status(400).json({ error: `Temporary password must be at least ${PASSWORD_MIN} characters` });
+    if (db.prepare('SELECT id FROM hub_users WHERE username=?').get(uname)) return res.status(400).json({ error: 'That username is taken' });
+    const hash = await hubHashPassword(temp_password);
+    db.prepare('INSERT INTO hub_users (username, password_hash, role, must_change_password) VALUES (?, ?, ?, 1)').run(uname, hash, role);
+    audit(req, `created ${role} account "${uname}"`);
+    res.json(db.prepare('SELECT id, username, role, active, must_change_password, last_active_at, created_at FROM hub_users WHERE username=?').get(uname));
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.post('/api/team/:id/reset', requireOwner, async (req, res) => {
+  try {
+    const u = db.prepare('SELECT * FROM hub_users WHERE id=?').get(req.params.id);
+    if (!u) return res.status(404).json({ error: 'No such account' });
+    const temp = String((req.body || {}).temp_password || '');
+    if (temp.length < PASSWORD_MIN) return res.status(400).json({ error: `Temporary password must be at least ${PASSWORD_MIN} characters` });
+    const hash = await hubHashPassword(temp);
+    db.prepare('UPDATE hub_users SET password_hash=?, must_change_password=1 WHERE id=?').run(hash, u.id);
+    db.prepare('DELETE FROM sessions WHERE user_id=?').run(u.id);
+    audit(req, `reset the password for "${u.username}"`);
+    res.json({ ok: true });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.post('/api/team/:id/deactivate', requireOwner, (req, res) => {
+  const u = db.prepare('SELECT * FROM hub_users WHERE id=?').get(req.params.id);
+  if (!u) return res.status(404).json({ error: 'No such account' });
+  if (u.id === req.hubUser.id) return res.status(400).json({ error: 'You cannot deactivate your own account' });
+  const owners = db.prepare("SELECT COUNT(*) c FROM hub_users WHERE role='owner' AND active=1").get().c;
+  if (u.role === 'owner' && u.active && owners <= 1) return res.status(400).json({ error: 'Cannot deactivate the last active owner' });
+  db.prepare('UPDATE hub_users SET active=0 WHERE id=?').run(u.id);
+  db.prepare('DELETE FROM sessions WHERE user_id=?').run(u.id); // signed out everywhere, immediately
+  audit(req, `deactivated account "${u.username}"`);
+  res.json({ ok: true });
+});
+
+app.post('/api/team/:id/reactivate', requireOwner, (req, res) => {
+  const u = db.prepare('SELECT * FROM hub_users WHERE id=?').get(req.params.id);
+  if (!u) return res.status(404).json({ error: 'No such account' });
+  db.prepare('UPDATE hub_users SET active=1 WHERE id=?').run(u.id);
+  audit(req, `reactivated account "${u.username}"`);
+  res.json({ ok: true });
+});
+
+app.get('/api/activity', requireOwner, (req, res) => {
+  const limit = Math.min(500, Math.max(1, parseInt(req.query.limit, 10) || 100));
+  res.json(db.prepare('SELECT at, username, action FROM audit_log ORDER BY id DESC LIMIT ?').all(limit));
 });
 
 // ─── Catalog management ───────────────────────────────────────────────────────
@@ -658,17 +861,18 @@ function saveCatalogBody(b) {
   };
 }
 
-app.post('/api/catalog', (req, res) => {
+app.post('/api/catalog', requireOwner, (req, res) => {
   const v = saveCatalogBody(req.body || {});
   if (v.name.length < 2) return res.status(400).json({ error: 'Coffee name required' });
   const r = db.prepare('INSERT INTO catalog (name, notes, price_per_lb, retail_price, badge, low_stock, visibility, active) VALUES (?,?,?,?,?,?,?,?)')
     .run(v.name, v.notes, v.price, v.retail, v.badge, v.low_stock, v.visibility, v.active);
   const setGrants = db.prepare('INSERT INTO catalog_visibility (coffee_id, shop_id) VALUES (?,?)');
   if (v.visibility === 'exclusive') for (const sid of v.shopIds) setGrants.run(r.lastInsertRowid, sid);
+  audit(req, `added catalog item "${v.name}"`);
   res.json(catalogItemFull(r.lastInsertRowid));
 });
 
-app.put('/api/catalog/:id', (req, res) => {
+app.put('/api/catalog/:id', requireOwner, (req, res) => {
   if (!db.prepare('SELECT id FROM catalog WHERE id=?').get(req.params.id)) return res.status(404).json({ error: 'Not found' });
   const v = saveCatalogBody(req.body || {});
   if (v.name.length < 2) return res.status(400).json({ error: 'Coffee name required' });
@@ -679,6 +883,7 @@ app.put('/api/catalog/:id', (req, res) => {
     const ins = db.prepare('INSERT INTO catalog_visibility (coffee_id, shop_id) VALUES (?,?)');
     for (const sid of v.shopIds) ins.run(req.params.id, sid);
   }
+  audit(req, `updated catalog item "${v.name}"`);
   res.json(catalogItemFull(req.params.id));
 });
 
@@ -734,7 +939,7 @@ async function createInvite(shopId, req) {
 // Creating a shop creates its ACCOUNT: login username (from the name),
 // registered email, and API key (returned once). The password is set by the
 // shop itself through the invite link.
-app.post('/api/shops', async (req, res) => {
+app.post('/api/shops', requireOwner, async (req, res) => {
   try {
     const name = String((req.body && req.body.name) || '').trim();
     const email = String((req.body && req.body.email) || '').trim() || null;
@@ -745,6 +950,7 @@ app.post('/api/shops', async (req, res) => {
     const r = db.prepare('INSERT INTO shops (name, email, api_key_hash, login_username) VALUES (?,?,?,?)')
       .run(name, email, sha256(apiKey), loginUsername);
     const invite = await createInvite(r.lastInsertRowid, req);
+    audit(req, `created shop "${name}"`);
     res.json({ shop: shopWithStats(db.prepare('SELECT * FROM shops WHERE id=?').get(r.lastInsertRowid)), api_key: apiKey, invite });
   } catch (err) {
     if (String(err.message).includes('UNIQUE')) return res.status(400).json({ error: 'A shop with that name already exists' });
@@ -755,11 +961,12 @@ app.post('/api/shops', async (req, res) => {
 
 // Re-send (or hand out) a fresh invite — also how a lost password gets reset
 // by the shop itself.
-app.post('/api/shops/:id/invite', async (req, res) => {
+app.post('/api/shops/:id/invite', requireOwner, async (req, res) => {
   try {
     const shop = db.prepare('SELECT * FROM shops WHERE id=?').get(req.params.id);
     if (!shop) return res.status(404).json({ error: 'Shop not found' });
     if (!shop.email) return res.status(400).json({ error: 'Set a registered email for this shop first (Edit)' });
+    audit(req, `sent a password invite for shop "${shop.name}"`);
     res.json({ ok: true, invite: await createInvite(shop.id, req) });
   } catch (err) {
     console.error(err);
@@ -769,7 +976,7 @@ app.post('/api/shops/:id/invite', async (req, res) => {
 
 // Set or reset a shop's login password (also backfills the login username
 // for shops created before accounts existed).
-app.post('/api/shops/:id/reset-login', async (req, res) => {
+app.post('/api/shops/:id/reset-login', requireOwner, async (req, res) => {
   try {
     const shop = db.prepare('SELECT * FROM shops WHERE id=?').get(req.params.id);
     if (!shop) return res.status(404).json({ error: 'Shop not found' });
@@ -779,6 +986,7 @@ app.post('/api/shops/:id/reset-login', async (req, res) => {
     const loginUsername = shop.login_username || genLoginUsername(shop.name);
     const { salt, hash } = await hashPassword(password);
     db.prepare('UPDATE shops SET login_username=?, password_hash=?, salt=? WHERE id=?').run(loginUsername, hash, salt, shop.id);
+    audit(req, `reset the shop login for "${shop.name}"`);
     res.json({ ok: true, login_username: loginUsername });
   } catch (err) {
     console.error(err);
@@ -796,11 +1004,12 @@ app.put('/api/shops/:id', (req, res) => {
   res.json(shopWithStats(db.prepare('SELECT * FROM shops WHERE id=?').get(shop.id)));
 });
 
-app.post('/api/shops/:id/rotate-key', (req, res) => {
+app.post('/api/shops/:id/rotate-key', requireOwner, (req, res) => {
   const shop = db.prepare('SELECT * FROM shops WHERE id=?').get(req.params.id);
   if (!shop) return res.status(404).json({ error: 'Shop not found' });
   const apiKey = 'dose_' + crypto.randomBytes(24).toString('hex');
   db.prepare('UPDATE shops SET api_key_hash=? WHERE id=?').run(sha256(apiKey), shop.id);
+  audit(req, `rotated the API key for shop "${shop.name}"`);
   res.json({ ok: true, api_key: apiKey });
 });
 
@@ -826,7 +1035,7 @@ app.get('/api/shops/:id/pricing', (req, res) => {
 });
 
 // Replace-all semantics: the payload is the complete rule set for this shop.
-app.put('/api/shops/:id/pricing', (req, res) => {
+app.put('/api/shops/:id/pricing', requireOwner, (req, res) => {
   const shop = db.prepare('SELECT * FROM shops WHERE id=?').get(req.params.id);
   if (!shop) return res.status(404).json({ error: 'Shop not found' });
   const { global_rule, item_rules } = req.body || {};
@@ -837,6 +1046,7 @@ app.put('/api/shops/:id/pricing', (req, res) => {
   for (const r of (Array.isArray(item_rules) ? item_rules : [])) {
     if (valid(r) && Number.isFinite(parseInt(r.coffee_id, 10))) ins.run(shop.id, parseInt(r.coffee_id, 10), r.rule_type, parseFloat(r.value));
   }
+  audit(req, `changed price rules for ${shop.name}`);
   res.json({ ok: true });
 });
 
@@ -863,6 +1073,15 @@ app.patch('/api/orders/:id', async (req, res) => {
   const before = db.prepare('SELECT * FROM orders WHERE id=?').get(req.params.id);
   if (!before) return res.status(404).json({ error: 'Order not found' });
   db.prepare('UPDATE orders SET status=? WHERE id=?').run(status, req.params.id);
+  const by = req.hubUser.username;
+  if (status === 'confirmed' && before.status !== 'confirmed')
+    db.prepare("UPDATE orders SET confirmed_by=?, confirmed_at=datetime('now') WHERE id=?").run(by, req.params.id);
+  if (status === 'shipped' && before.status !== 'shipped')
+    db.prepare("UPDATE orders SET shipped_by=?, shipped_at=datetime('now') WHERE id=?").run(by, req.params.id);
+  if (status !== before.status) {
+    const shopName = (db.prepare('SELECT name FROM shops WHERE id=?').get(before.shop_id) || {}).name || '?';
+    audit(req, `${status === 'new' ? 'reopened' : status} order #${before.id} (${shopName})`);
+  }
 
   // Confirming and shipping each notify the shop by email.
   let email = null;
@@ -885,11 +1104,13 @@ app.patch('/api/orders/:id', async (req, res) => {
 // history. Removes the order and its line items; stock-ledger movements from
 // already-filled lines are kept (the coffee was really roasted). The shop's
 // own local log keeps its copy.
-app.delete('/api/orders/:id', (req, res) => {
+app.delete('/api/orders/:id', requireOwner, (req, res) => {
   const order = db.prepare('SELECT * FROM orders WHERE id=?').get(req.params.id);
   if (!order) return res.status(404).json({ error: 'Order not found' });
+  const shopName = (db.prepare('SELECT name FROM shops WHERE id=?').get(order.shop_id) || {}).name || '?';
   db.prepare('DELETE FROM order_items WHERE order_id=?').run(order.id);
   db.prepare('DELETE FROM orders WHERE id=?').run(order.id);
+  audit(req, `deleted order #${order.id} (${shopName}, ${order.total_lbs} lbs, placed ${order.order_date})`);
   res.json({ ok: true });
 });
 
@@ -925,6 +1146,7 @@ app.put('/api/orders/:id/items', async (req, res) => {
     db.prepare('UPDATE orders SET total_lbs=?, total_cost=? WHERE id=?').run(totalLbs, totalCost, order.id);
 
     const shop = db.prepare('SELECT * FROM shops WHERE id=?').get(order.shop_id);
+    audit(req, `edited order #${order.id} (${shop.name}) — now ${totalLbs} lbs / ${money(totalCost)}`);
     const updated = db.prepare('SELECT * FROM orders WHERE id=?').get(order.id);
     const email = await sendEmail(shop.email, `Order updated — ${shop.name} — ${order.order_date}`,
       orderEmailHtml(updated, remaining, shop, 'Order Updated', 'The roastery adjusted your order — here is the updated summary.', { stage: orderStage(updated, remaining) }));
@@ -1061,13 +1283,14 @@ app.post('/api/roast-program/fill', async (req, res) => {
       if (plan.batches > 0) {
         actual = parseFloat((req.body || {}).actual_out_lbs);
         if (!Number.isFinite(actual) || actual <= 0) actual = plan.expected_out_lbs;
-        db.prepare('INSERT INTO stock_moves (coffee_id, coffee_name, profile, delta_lbs, reason) VALUES (?,?,?,?,?)')
+        db.prepare('INSERT INTO stock_moves (coffee_id, coffee_name, profile, delta_lbs, reason, created_by) VALUES (?,?,?,?,?,?)')
           .run(coffeeId, d.coffee_name, profile, r2(actual),
-            `Roasted ${plan.batches} batch${plan.batches === 1 ? '' : 'es'}${mode === 'fresh' ? ' (fresh — stock left alone)' : ''}`);
+            `Roasted ${plan.batches} batch${plan.batches === 1 ? '' : 'es'}${mode === 'fresh' ? ' (fresh — stock left alone)' : ''}`, req.hubUser.username);
       }
-      db.prepare('INSERT INTO stock_moves (coffee_id, coffee_name, profile, delta_lbs, reason) VALUES (?,?,?,?,?)')
+      db.prepare('INSERT INTO stock_moves (coffee_id, coffee_name, profile, delta_lbs, reason, created_by) VALUES (?,?,?,?,?,?)')
         .run(coffeeId, d.coffee_name, profile, -plan.owed_lbs,
-          `Filled ${d.orderIds.size} order${d.orderIds.size === 1 ? '' : 's'}${plan.batches ? '' : ' from stock'}`);
+          `Filled ${d.orderIds.size} order${d.orderIds.size === 1 ? '' : 's'}${plan.batches ? '' : ' from stock'}`, req.hubUser.username);
+      audit(req, `filled ${d.coffee_name} · ${profile} (${mode}${plan.batches ? `, ${plan.batches} batch${plan.batches === 1 ? '' : 'es'}` : ''}, ${d.orderIds.size} order${d.orderIds.size === 1 ? '' : 's'})`);
     }
 
     const roasts = PROFILE_ROASTS[profile];
@@ -1173,8 +1396,9 @@ app.post('/api/on-hand/adjust', (req, res) => {
     : (db.prepare('SELECT coffee_name FROM stock_moves WHERE coffee_id=? LIMIT 1').get(coffeeId) || {}).coffee_name;
   if (!name) return res.status(404).json({ error: 'Unknown coffee' });
   const note = String((req.body || {}).note || '').slice(0, 200);
-  db.prepare('INSERT INTO stock_moves (coffee_id, coffee_name, profile, delta_lbs, reason) VALUES (?,?,?,?,?)')
-    .run(coffeeId, name, profile, r2(delta), `Manual adjustment${note ? ` — ${note}` : ''}`);
+  db.prepare('INSERT INTO stock_moves (coffee_id, coffee_name, profile, delta_lbs, reason, created_by) VALUES (?,?,?,?,?,?)')
+    .run(coffeeId, name, profile, r2(delta), `Manual adjustment${note ? ` — ${note}` : ''}`, req.hubUser.username);
+  audit(req, `adjusted On Hand: ${name} · ${profile} ${delta > 0 ? '+' : ''}${r2(delta)} lbs${note ? ` (${note})` : ''}`);
   res.json({ ok: true, on_hand_now: stockLbs(coffeeId, profile) });
 });
 
