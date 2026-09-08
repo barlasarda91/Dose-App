@@ -666,6 +666,8 @@ app.post('/api/settings', (req, res) => {
 });
 
 // ─── Square helpers ───────────────────────────────────────────────────────────
+// Overridable so integration tests can point the app at a mock Square server.
+const SQUARE_BASE = process.env.SQUARE_BASE_URL || 'https://connect.squareup.com';
 let cachedLocations = null;
 
 function getSquareToken() {
@@ -676,7 +678,7 @@ function getSquareToken() {
 
 async function getLocations() {
   if (cachedLocations) return cachedLocations;
-  const res = await fetch('https://connect.squareup.com/v2/locations', {
+  const res = await fetch(`${SQUARE_BASE}/v2/locations`, {
     headers: { 'Authorization': `Bearer ${getSquareToken()}`, 'Square-Version': '2024-01-17' }
   });
   const data = await res.json();
@@ -725,7 +727,7 @@ function utcOffset(dateStr, timeZone) {
 
 async function squarePost(endpoint, body) {
   const token = getSquareToken();
-  const res = await fetch(`https://connect.squareup.com/v2${endpoint}`, {
+  const res = await fetch(`${SQUARE_BASE}/v2${endpoint}`, {
     method: 'POST',
     headers: { 'Authorization': `Bearer ${token}`, 'Content-Type': 'application/json', 'Square-Version': '2024-01-17' },
     body: JSON.stringify(body),
@@ -990,7 +992,7 @@ async function fetchSquareCatalogItems() {
   const names = new Set();
   let cursor;
   do {
-    const url = new URL('https://connect.squareup.com/v2/catalog/list');
+    const url = new URL(`${SQUARE_BASE}/v2/catalog/list`);
     url.searchParams.set('types', 'ITEM');
     if (cursor) url.searchParams.set('cursor', cursor);
     const r = await fetch(url, { headers: { 'Authorization': `Bearer ${token}`, 'Square-Version': '2024-01-17' } });
