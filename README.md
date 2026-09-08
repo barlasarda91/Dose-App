@@ -108,6 +108,14 @@ Shop pushes are authenticated per shop (`Bearer dose_…`), re-priced and re-val
 
 **Hub accounts** — every roastery person signs in with their own username + password (salted scrypt, per-user and per-IP lockouts, expiring hashed session tokens — the shop app's security model). `HUB_PASSWORD` is not a login: on a fresh hub it acts once, as the bootstrap code that creates the first **owner** account, then never works again. Two roles: **owners** additionally manage the Team tab (add accounts with a temporary password that must be replaced on first sign-in, reset, deactivate — deactivation signs that person out everywhere), catalog and price rules, shop credentials, and order deletion; **staff** run daily ops. Every consequential action lands in an append-only, signed **audit trail** (Team → Activity), orders show who confirmed and shipped them, and stock movements show who made them.
 
+## Backups
+
+Both services snapshot their SQLite database **nightly** (one per Los Angeles calendar day) into a `backups/` folder next to the database — on the same mounted Railway volume — keeping the newest **14** (`BACKUP_KEEP` to change, `BACKUP_DIR` to relocate). Snapshots use SQLite's online backup, so they're consistent even while the app is serving. A missed night self-heals: the hourly check (and every restart) writes the day's snapshot if it's absent.
+
+- **See it's working**: hub `/api/health` reports `backup: { last, age_hours, count }`; the shop app has admin-only `GET /api/backups`.
+- **Pull a copy off Railway**: `GET /api/backups/download` (latest, or `?file=` for a specific one) — shop admin login / hub dashboard login required. `POST /api/backups/run` forces a fresh snapshot first if wanted.
+- **Second layer**: enable Railway's own volume backups (service → volume → Backups) so the entire volume — snapshots included — is also covered outside the box.
+
 ## Development
 
 ```bash
