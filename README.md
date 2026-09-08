@@ -106,6 +106,14 @@ The `hub/` directory contains a separate service for the roastery:
 
 Shop pushes are authenticated per shop (`Bearer dose_…`), re-priced and re-validated by the hub on ingest, and deduplicated (a retried push never duplicates an order). Hub login is rate-limited with expiring hashed session tokens — same security model as the shop app.
 
+## Backups
+
+Both services snapshot their SQLite database **nightly** (one per Los Angeles calendar day) into a `backups/` folder next to the database — on the same mounted Railway volume — keeping the newest **14** (`BACKUP_KEEP` to change, `BACKUP_DIR` to relocate). Snapshots use SQLite's online backup, so they're consistent even while the app is serving. A missed night self-heals: the hourly check (and every restart) writes the day's snapshot if it's absent.
+
+- **See it's working**: hub `/api/health` reports `backup: { last, age_hours, count }`; the shop app has admin-only `GET /api/backups`.
+- **Pull a copy off Railway**: `GET /api/backups/download` (latest, or `?file=` for a specific one) — shop admin login / hub dashboard login required. `POST /api/backups/run` forces a fresh snapshot first if wanted.
+- **Second layer**: enable Railway's own volume backups (service → volume → Backups) so the entire volume — snapshots included — is also covered outside the box.
+
 ## Development
 
 ```bash
