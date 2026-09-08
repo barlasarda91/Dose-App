@@ -5,3 +5,4 @@ frontend/build/
 .env
 *.db
 *.db-journal
+tests/.tmp/
