@@ -57,8 +57,10 @@
       <div class="login-wrap"><form class="login-card" id="boot-form">
         <div class="login-title">Dose Hub</div>
         <div class="login-sub">First run — create the owner account</div>
-        <label class="lbl">Your username</label>
+        <label class="lbl">Your username — permanent, not changeable later</label>
         <input id="b-un" placeholder="e.g. barlas" style="width:100%;margin-bottom:12px" autofocus>
+        <label class="lbl">Your email</label>
+        <input id="b-email" type="email" placeholder="you@boxxcoffee.com" style="width:100%;margin-bottom:12px">
         <label class="lbl">Choose your password (10+ characters)</label>
         <input type="password" id="b-pw" autocomplete="new-password" style="width:100%;margin-bottom:12px">
         <label class="lbl">Bootstrap code (the HUB_PASSWORD value on the server)</label>
@@ -71,6 +73,7 @@
       try {
         const data = await api('/api/setup-owner', { method: 'POST', body: JSON.stringify({
           username: document.getElementById('b-un').value,
+          email: document.getElementById('b-email').value,
           password: document.getElementById('b-pw').value,
           bootstrap_password: document.getElementById('b-code').value,
         }) });
@@ -1248,10 +1251,11 @@
     page.innerHTML += `
       <div class="sechead"><span>Accounts</span></div>
       <div class="table-wrap"><table>
-        <thead><tr><th>Username</th><th>Role</th><th>Status</th><th>Last Active</th><th>Created</th><th class="num"></th></tr></thead>
+        <thead><tr><th>Username</th><th>Email</th><th>Role</th><th>Status</th><th>Last Active</th><th>Created</th><th class="num"></th></tr></thead>
         <tbody>${users.map(u => `
           <tr style="${u.active ? '' : 'opacity:.55'}">
             <td style="color:var(--ink)">${esc(u.username)}${u.username === me().username ? ' <span style="color:var(--drift);font-size:10px">(you)</span>' : ''}</td>
+            <td style="font-size:11px;color:${u.email ? 'var(--graphite)' : 'var(--warn)'}">${esc(u.email || 'no email')} <button class="btn-sm btn" data-mail="${u.id}" data-name="${esc(u.username)}" data-cur="${esc(u.email || '')}" style="margin-left:4px">✎</button></td>
             <td><span class="role-chip ${u.role}">${u.role}</span></td>
             <td style="font-size:11px;color:var(--drift)">${u.active ? (u.must_change_password ? 'temp password — not yet set' : 'active') : 'deactivated'}</td>
             <td style="font-size:11px;color:var(--drift)">${esc(fmtLA(u.last_active_at))}</td>
@@ -1268,7 +1272,8 @@
       <div class="card" style="max-width:640px;margin-top:18px">
         <div class="sechead" style="border:none;margin-bottom:8px;padding-bottom:0"><span>Add Account</span></div>
         <div style="display:grid;grid-template-columns:1fr 1fr;gap:14px;margin-bottom:14px">
-          <div><label class="lbl">Username</label><input id="t-un" placeholder="e.g. jordan"></div>
+          <div><label class="lbl">Username — permanent, not changeable later</label><input id="t-un" placeholder="e.g. jordan"></div>
+          <div><label class="lbl">Email</label><input id="t-email" type="email" placeholder="jordan@boxxcoffee.com"></div>
           <div><label class="lbl">Role</label><select id="t-role" style="width:100%">
             <option value="staff">Staff — run daily ops</option>
             <option value="owner">Owner — everything + team & pricing</option>
@@ -1290,12 +1295,19 @@
       try {
         await api('/api/team', { method: 'POST', body: JSON.stringify({
           username: document.getElementById('t-un').value,
+          email: document.getElementById('t-email').value,
           role: document.getElementById('t-role').value,
           temp_password: document.getElementById('t-pw').value,
         }) });
         renderTeam();
       } catch (e) { errEl.textContent = e.message; }
     };
+    page.querySelectorAll('[data-mail]').forEach(btn => btn.onclick = async () => {
+      const mail = prompt(`Email for ${btn.dataset.name}:`, btn.dataset.cur);
+      if (mail == null) return;
+      try { await api(`/api/team/${btn.dataset.mail}/email`, { method: 'PUT', body: JSON.stringify({ email: mail }) }); renderTeam(); }
+      catch (e) { alert(e.message); }
+    });
     page.querySelectorAll('[data-reset]').forEach(btn => btn.onclick = async () => {
       const temp = prompt(`New temporary password for ${btn.dataset.name} (10+ characters) — they set their own on next sign-in:`, suggestPw());
       if (!temp) return;

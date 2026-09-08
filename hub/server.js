@@ -160,6 +160,7 @@ db.exec(`
 try { db.exec('ALTER TABLE shops ADD COLUMN email TEXT'); } catch { /* present */ }
 // Sessions predate named accounts — old tokens carry no user and stop working.
 try { db.exec('ALTER TABLE sessions ADD COLUMN user_id INTEGER'); } catch { /* present */ }
+try { db.exec('ALTER TABLE hub_users ADD COLUMN email TEXT'); } catch { /* present */ }
 try { db.exec('ALTER TABLE stock_moves ADD COLUMN created_by TEXT'); } catch { /* present */ }
 for (const col of ['confirmed_by TEXT', 'confirmed_at TEXT', 'shipped_by TEXT', 'shipped_at TEXT']) {
   try { db.exec(`ALTER TABLE orders ADD COLUMN ${col}`); } catch { /* present */ }
@@ -365,6 +366,7 @@ if (!hubUsersExist() && !HUB_PASSWORD) {
 }
 
 const USERNAME_RE = /^[a-z0-9._-]{3,32}$/;
+const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 const PASSWORD_MIN = 10;
 
 function hubHashPassword(pw) {
@@ -438,10 +440,12 @@ app.post('/api/setup-owner', async (req, res) => {
       return res.status(403).json({ error: 'Wrong bootstrap code (the HUB_PASSWORD value on the server)' });
     }
     const uname = String(username || '').trim().toLowerCase();
+    const mail = String((req.body || {}).email || '').trim().toLowerCase();
     if (!USERNAME_RE.test(uname)) return res.status(400).json({ error: 'Username: 3–32 chars, lowercase letters/numbers/._- only' });
+    if (mail && !EMAIL_RE.test(mail)) return res.status(400).json({ error: 'That email does not look valid' });
     if (String(password || '').length < PASSWORD_MIN) return res.status(400).json({ error: `Password must be at least ${PASSWORD_MIN} characters` });
     const hash = await hubHashPassword(password);
-    const r = db.prepare('INSERT INTO hub_users (username, password_hash, role) VALUES (?, ?, ?)').run(uname, hash, 'owner');
+    const r = db.prepare('INSERT INTO hub_users (username, email, password_hash, role) VALUES (?, ?, ?, ?)').run(uname, mail || null, hash, 'owner');
     loginFailures.delete(key);
     db.prepare('INSERT INTO audit_log (username, action) VALUES (?, ?)').run(uname, 'created the first owner account (bootstrap)');
     res.json({ ok: true, token: issueToken(r.lastInsertRowid), user: { username: uname, role: 'owner' }, must_change_password: false });
@@ -812,24 +816,40 @@ app.post('/api/me/password', async (req, res) => {
 
 // ─── Team management (owners) ────────────────────────────────────────────────
 app.get('/api/team', requireOwner, (req, res) => {
-  res.json(db.prepare('SELECT id, username, role, active, must_change_password, last_active_at, created_at FROM hub_users ORDER BY active DESC, username').all());
+  res.json(db.prepare('SELECT id, username, email, role, active, must_change_password, last_active_at, created_at FROM hub_users ORDER BY active DESC, username').all());
 });
 
 app.post('/api/team', requireOwner, async (req, res) => {
   try {
-    const { username, role, temp_password } = req.body || {};
+    const { username, role, temp_password, email } = req.body || {};
     const uname = String(username || '').trim().toLowerCase();
+    const mail = String(email || '').trim().toLowerCase();
     if (!USERNAME_RE.test(uname)) return res.status(400).json({ error: 'Username: 3–32 chars, lowercase letters/numbers/._- only' });
+    if (!EMAIL_RE.test(mail)) return res.status(400).json({ error: 'A valid email is required for every account' });
+    if (db.prepare('SELECT id FROM hub_users WHERE email=?').get(mail)) return res.status(400).json({ error: 'That email is already attached to an account' });
     if (!['owner', 'staff'].includes(role)) return res.status(400).json({ error: 'Role must be owner or staff' });
     if (String(temp_password || '').length < PASSWORD_MIN) return res.status(400).json({ error: `Temporary password must be at least ${PASSWORD_MIN} characters` });
     if (db.prepare('SELECT id FROM hub_users WHERE username=?').get(uname)) return res.status(400).json({ error: 'That username is taken' });
     const hash = await hubHashPassword(temp_password);
-    db.prepare('INSERT INTO hub_users (username, password_hash, role, must_change_password) VALUES (?, ?, ?, 1)').run(uname, hash, role);
-    audit(req, `created ${role} account "${uname}"`);
-    res.json(db.prepare('SELECT id, username, role, active, must_change_password, last_active_at, created_at FROM hub_users WHERE username=?').get(uname));
+    db.prepare('INSERT INTO hub_users (username, email, password_hash, role, must_change_password) VALUES (?, ?, ?, ?, 1)').run(uname, mail, hash, role);
+    audit(req, `created ${role} account "${uname}" (${mail})`);
+    res.json(db.prepare('SELECT id, username, email, role, active, must_change_password, last_active_at, created_at FROM hub_users WHERE username=?').get(uname));
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
+});
+
+// Usernames are immutable once assigned; the attached email is fixable.
+app.put('/api/team/:id/email', requireOwner, (req, res) => {
+  const u = db.prepare('SELECT * FROM hub_users WHERE id=?').get(req.params.id);
+  if (!u) return res.status(404).json({ error: 'No such account' });
+  const mail = String((req.body || {}).email || '').trim().toLowerCase();
+  if (!EMAIL_RE.test(mail)) return res.status(400).json({ error: 'A valid email is required' });
+  const dupe = db.prepare('SELECT id FROM hub_users WHERE email=? AND id != ?').get(mail, u.id);
+  if (dupe) return res.status(400).json({ error: 'That email is already attached to another account' });
+  db.prepare('UPDATE hub_users SET email=? WHERE id=?').run(mail, u.id);
+  audit(req, `changed the email for "${u.username}" to ${mail}`);
+  res.json({ ok: true });
 });
 
 app.post('/api/team/:id/reset', requireOwner, async (req, res) => {
