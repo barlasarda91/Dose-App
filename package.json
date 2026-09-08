@@ -2,9 +2,14 @@
   "name": "dose",
   "version": "1.0.0",
   "scripts": {
-    "install:all": "npm install --prefix backend && npm install --prefix frontend",
+    "install:all": "npm install --prefix backend && npm install --prefix frontend && npm install --prefix hub",
     "build": "npm run build --prefix frontend",
-    "start": "node backend/server.js"
+    "start": "node backend/server.js",
+    "test:unit": "node backend/calc.test.js",
+    "test:shop": "node tests/shop.test.js",
+    "test:hub": "node tests/hub.test.js",
+    "test:ui": "node tests/hub-ui.test.js",
+    "test": "npm run test:unit && npm run test:shop && npm run test:hub && npm run test:ui"
   },
   "engines": {
     "node": ">=18"
