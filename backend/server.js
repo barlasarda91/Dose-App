@@ -795,22 +795,33 @@ async function computeAnalytics(start_date, end_date) {
   const rawOrders = await fetchAllOrders(start_date, end_date, locationIds);
   const { orders: itemList, modifiers } = aggregateOrders(rawOrders);
 
-  // Recipe matching
+  // Recipe matching. Usage is tallied per brew METHOD, then rolled up to the
+  // two ROASTS that stock is actually held in (espresso machine → espresso
+  // roast; batch/cold brew/pour-over → filter roast). Legacy recipes without
+  // a method fall back to their old category.
   const recipes = db.prepare('SELECT * FROM drink_recipes').all();
   const recipeMap = {};
   for (const r of recipes) recipeMap[r.square_item_name.toLowerCase().trim()] = r;
+  const legacyMethod = { espresso: 'espresso', drip: 'batch', coldbrew: 'coldbrew', pourover: 'pourover' };
+  const methodOf = r => r.method || legacyMethod[r.category] || 'espresso';
 
-  const coffeeUsed = { espresso: 0, drip: 0, coldbrew: 0, pourover: 0 };
+  const methodUsed = { espresso: { grams: 0, drinks: 0 }, batch: { grams: 0, drinks: 0 }, coldbrew: { grams: 0, drinks: 0 }, pourover: { grams: 0, drinks: 0 } };
   const matched = {}, unmatched = {};
   for (const { name, qty, milk } of itemList) {
     const r = recipeMap[name.toLowerCase().trim()];
     if (r) {
-      coffeeUsed[r.category] += r.coffee_grams * qty;
+      const m = methodOf(r);
+      methodUsed[m].grams += r.coffee_grams * qty;
+      methodUsed[m].drinks += qty;
       matched[name] = { qty: (matched[name]?.qty || 0) + qty, milk };
     } else {
       unmatched[name] = (unmatched[name] || 0) + qty;
     }
   }
+  const coffeeUsed = {
+    espresso: methodUsed.espresso.grams,
+    filter: methodUsed.batch.grams + methodUsed.coldbrew.grams + methodUsed.pourover.grams,
+  };
 
   // Milk used from modifiers
   const milkUsed = {
@@ -833,11 +844,13 @@ async function computeAnalytics(start_date, end_date) {
     'SELECT * FROM milk_deliveries WHERE delivery_date > ? ORDER BY delivery_date ASC LIMIT 1'
   ).get(end_date);
 
+  // Stock is held per ROAST. New deliveries write filter roast into the drip
+  // columns; older four-pool history folds drip+coldbrew+pourover together.
   const stock = {
     espresso: calcCoffeeStock(coffeeDels, 'espresso_lbs_received', 'espresso_lbs_onhand'),
-    drip:     calcCoffeeStock(coffeeDels, 'drip_lbs_received',     'drip_lbs_onhand'),
-    coldbrew: calcCoffeeStock(coffeeDels, 'coldbrew_lbs_received', 'coldbrew_lbs_onhand'),
-    pourover: calcCoffeeStock(coffeeDels, 'pourover_lbs_received', 'pourover_lbs_onhand'),
+    filter: calcCoffeeStock(coffeeDels, 'drip_lbs_received', 'drip_lbs_onhand')
+      + calcCoffeeStock(coffeeDels, 'coldbrew_lbs_received', 'coldbrew_lbs_onhand')
+      + calcCoffeeStock(coffeeDels, 'pourover_lbs_received', 'pourover_lbs_onhand'),
   };
 
   // Whole milk stock (gallons → ml)
@@ -859,9 +872,9 @@ async function computeAnalytics(start_date, end_date) {
   // Actual remaining from closing delivery on_hand (null if cycle still open)
   const actualRemaining = {
     espresso: closingCoffeeDel ? closingCoffeeDel.espresso_lbs_onhand * LBS_TO_GRAMS : null,
-    drip:     closingCoffeeDel ? closingCoffeeDel.drip_lbs_onhand     * LBS_TO_GRAMS : null,
-    coldbrew: closingCoffeeDel ? closingCoffeeDel.coldbrew_lbs_onhand * LBS_TO_GRAMS : null,
-    pourover: closingCoffeeDel ? closingCoffeeDel.pourover_lbs_onhand * LBS_TO_GRAMS : null,
+    filter: closingCoffeeDel
+      ? (closingCoffeeDel.drip_lbs_onhand + closingCoffeeDel.coldbrew_lbs_onhand + closingCoffeeDel.pourover_lbs_onhand) * LBS_TO_GRAMS
+      : null,
     milk_whole: closingMilkDel ? closingMilkDel.whole_bottles_onhand * GALLONS_TO_ML : null,
   };
 
@@ -884,14 +897,15 @@ async function computeAnalytics(start_date, end_date) {
     },
     cycle_open: cycleOpen,
     closing_delivery_date: closingCoffeeDel?.delivery_date || null,
+    // Usage per brew method (grams + drink counts) — the filter roast's
+    // breakdown into batch / cold brew / pour-over, no extra logging needed.
+    method_usage: methodUsed,
     eff: {
-      espresso:    eff(stock.espresso,    coffeeUsed.espresso,  actualRemaining.espresso),
-      drip:        eff(stock.drip,        coffeeUsed.drip,      actualRemaining.drip),
-      coldbrew:    eff(stock.coldbrew,    coffeeUsed.coldbrew,  actualRemaining.coldbrew),
-      pourover:    eff(stock.pourover,    coffeeUsed.pourover,  actualRemaining.pourover),
-      milk_whole:  eff(milkWholeStock,    milkUsed.whole,       actualRemaining.milk_whole),
-      milk_oat:    eff(milkOatStock,      milkUsed.oat,         null),
-      milk_almond: eff(milkAlmondStock,   milkUsed.almond,      null),
+      espresso:    eff(stock.espresso, coffeeUsed.espresso, actualRemaining.espresso),
+      filter:      eff(stock.filter,   coffeeUsed.filter,   actualRemaining.filter),
+      milk_whole:  eff(milkWholeStock,  milkUsed.whole,     actualRemaining.milk_whole),
+      milk_oat:    eff(milkOatStock,    milkUsed.oat,       null),
+      milk_almond: eff(milkAlmondStock, milkUsed.almond,    null),
     },
   };
 }
@@ -1029,12 +1043,18 @@ app.post('/api/square-items/unignore', (req, res) => {
 app.get('/api/coffee-deliveries', (req, res) => res.json(db.prepare('SELECT * FROM coffee_deliveries ORDER BY delivery_date DESC').all()));
 
 app.post('/api/coffee-deliveries', (req, res) => {
-  const { delivery_date,
+  let { delivery_date,
     espresso_lbs_received, espresso_lbs_onhand,
     drip_lbs_received,     drip_lbs_onhand,
     coldbrew_lbs_received, coldbrew_lbs_onhand,
     pourover_lbs_received, pourover_lbs_onhand,
     notes } = req.body;
+  // Stock is logged per roast now: "filter roast" lands in the drip columns
+  // (the coldbrew/pourover columns only carry pre-roast-era history).
+  if (req.body.filter_lbs_received !== undefined || req.body.filter_lbs_onhand !== undefined) {
+    drip_lbs_received = req.body.filter_lbs_received;
+    drip_lbs_onhand   = req.body.filter_lbs_onhand;
+  }
   const r = db.prepare(`INSERT INTO coffee_deliveries
     (delivery_date, espresso_lbs_received, espresso_lbs_onhand, drip_lbs_received, drip_lbs_onhand,
      coldbrew_lbs_received, coldbrew_lbs_onhand, pourover_lbs_received, pourover_lbs_onhand, notes, created_by)
@@ -1409,13 +1429,17 @@ app.get('/api/order-suggestion', async (req, res) => {
     const a = await computeAnalytics(last.delivery_date, today);
     const horizonDays = 7;
     const pools = {};
-    for (const p of ['espresso', 'drip', 'coldbrew', 'pourover']) {
+    for (const p of ['espresso', 'filter']) {
       const e = a.eff[p];
       const days = Math.max(1, a.period.days);
+      const burnPerDay = e.used / days;
       pools[p] = {
         used_g: e.used,
-        burn_g_per_day: Math.round(e.used / days),
+        burn_g_per_day: Math.round(burnPerDay),
         expected_remaining_g: e.theoretical_remaining,
+        // How long the expected remaining lasts at the current pace.
+        days_left: burnPerDay > 0 && e.theoretical_remaining != null
+          ? Math.max(0, Math.round(e.theoretical_remaining / burnPerDay * 10) / 10) : null,
         suggested_lbs: suggestOrderLbs({
           usedGrams: e.used, days,
           expectedRemainingGrams: e.theoretical_remaining, horizonDays,

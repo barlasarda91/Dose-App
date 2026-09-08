@@ -238,21 +238,22 @@ function generateReport({ analytics, coffeeDels, milkDels, startDate, endDate })
         margin: [0, 0, 0, 0],
       },
 
-      // ── Coffee efficiency ───────────────────────────────────────────────
+      // ── Coffee efficiency (per roast; methods shown as usage split) ─────
       secHdr('Coffee Efficiency'),
       pills([
-        { label: 'Espresso',  eff: eff.espresso,  sub: `${gToKg(eff.espresso?.used)} theoretical` },
-        { label: 'Drip',      eff: eff.drip,       sub: `${gToKg(eff.drip?.used)} theoretical` },
-        { label: 'Cold Brew', eff: eff.coldbrew,   sub: `${gToKg(eff.coldbrew?.used)} theoretical` },
-        { label: 'Pour-Over', eff: eff.pourover,   sub: `${gToKg(eff.pourover?.used)} theoretical` },
+        { label: 'Espresso Roast', eff: eff.espresso, sub: `${gToKg(eff.espresso?.used)} theoretical` },
+        { label: 'Filter Roast',   eff: eff.filter,   sub: `${gToKg(eff.filter?.used)} theoretical` },
       ]),
       noteText('Opening stock = on hand + received at first delivery. Subsequent deliveries add received only.'),
       dataTable(EFF_COLS, [
-        effRow('Espresso',  eff.espresso,  gToKg),
-        effRow('Drip',      eff.drip,      gToKg),
-        effRow('Cold Brew', eff.coldbrew,  gToKg),
-        effRow('Pour-Over', eff.pourover,  gToKg),
+        effRow('Espresso Roast', eff.espresso, gToKg),
+        effRow('Filter Roast',   eff.filter,   gToKg),
       ]),
+      ...(a.method_usage ? [
+        noteText(`Filter roast usage by method — Batch Brew ${gToKg(a.method_usage.batch?.grams)} (${a.method_usage.batch?.drinks || 0} drinks) · `
+          + `Cold Brew ${gToKg(a.method_usage.coldbrew?.grams)} (${a.method_usage.coldbrew?.drinks || 0}) · `
+          + `Pour-Over ${gToKg(a.method_usage.pourover?.grams)} (${a.method_usage.pourover?.drinks || 0})`),
+      ] : []),
 
       // ── Milk efficiency — page break before ────────────────────────────
       secHdr('Milk Efficiency', true),
