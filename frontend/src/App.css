@@ -300,6 +300,11 @@ tbody tr.selected td, tr.selected td { background: rgba(107,110,74,0.12); }
 
 /* ── Mobile layout (the same webpage below 700px — desktop untouched) ── */
 
+/* ─── Stock delivery rows ──────────────────────────────────────────────────── */
+.dl-row { display: grid; grid-template-columns: 120px 1fr 1fr 1fr; gap: 10px; align-items: end; margin-bottom: 10px; }
+.dl-roast { font-family: var(--font-mono); font-size: 13px; color: var(--drift); padding-bottom: 10px; }
+.unmapped-row { display: flex; justify-content: space-between; align-items: center; gap: 12px; padding: 9px 0; border-bottom: 1px solid rgba(184,175,163,.4); flex-wrap: wrap; }
+
 /* ─── Coffee info sheet ────────────────────────────────────────────────────── */
 .isheet-link { display: inline-block; margin-top: 4px; font-size: 10px; letter-spacing: 0.14em; text-transform: uppercase; color: var(--olive); text-decoration: underline; cursor: pointer; }
 .isheet-bg { position: fixed; inset: 0; z-index: 500; background: rgba(26,25,22,0.55); display: flex; align-items: flex-start; justify-content: center; padding: 30px 16px; overflow-y: auto; }
@@ -377,6 +382,16 @@ tbody tr.selected td, tr.selected td { background: rgba(107,110,74,0.12); }
   .btn { padding: 12px 18px; }
   .btn-danger, .btn-sm { padding: 9px 12px; }
   .modal { max-height: 90vh; overflow-y: auto; }
+  .dl-row { grid-template-columns: 1fr 1fr; border: 1px solid var(--stone); padding: 12px 12px 4px; align-items: start; }
+  .dl-roast { grid-column: 1 / -1; padding-bottom: 4px; color: var(--ink); }
+  .dl-total { grid-column: 1 / -1; }
+  .dl-total div { padding-top: 0 !important; }
+  .dl-row .form-group { min-width: 0; }
+  .dl-row .form-lbl { min-height: 2.9em; display: flex; align-items: flex-end; }
+  .dl-row .stepper { width: 100%; }
+  .dl-row .stepper button { width: 38px; flex-shrink: 0; }
+  .dl-row .stepper input { width: auto; flex: 1; min-width: 0; }
+  .unmapped-row { flex-direction: column; align-items: flex-start; gap: 8px; }
   .isheet-facts { grid-template-columns: 1fr 1fr; }
   .isheet-brew { grid-template-columns: 1fr; }
   .tour-card, .tour-card-center { left: 10px !important; right: 10px; bottom: 12px; top: auto !important; width: auto; transform: none !important; }

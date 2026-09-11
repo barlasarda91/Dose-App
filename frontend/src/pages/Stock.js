@@ -83,18 +83,18 @@ export default function Stock() {
             { label: 'Espresso Roast', rec: 'espresso_lbs_received', oh: 'espresso_lbs_onhand' },
             { label: 'Filter Roast',   rec: 'filter_lbs_received',   oh: 'filter_lbs_onhand' },
           ].map(({ label, rec, oh }) => (
-            <div key={label} style={{ display: 'grid', gridTemplateColumns: '120px 1fr 1fr 1fr', gap: 10, alignItems: 'end', marginBottom: 10 }}>
-              <div style={{ fontFamily: 'var(--font-mono)', fontSize: 13, color: 'var(--drift)', paddingBottom: 10 }}>{label}</div>
+            <div key={label} className="dl-row">
+              <div className="dl-roast">{label}</div>
               <div className="form-group">
-                {label === 'Espresso Roast' && <label className="form-lbl">On Hand (lbs) · ±1</label>}
+                <label className="form-lbl">On Hand (lbs) · ±1</label>
                 <Stepper k={oh} inc={1} />
               </div>
               <div className="form-group">
-                {label === 'Espresso Roast' && <label className="form-lbl">Received (lbs) · ±5 (one bag)</label>}
+                <label className="form-lbl">Received (lbs) · ±5</label>
                 <Stepper k={rec} inc={5} />
               </div>
-              <div className="form-group">
-                {label === 'Espresso Roast' && <label className="form-lbl">Total (lbs)</label>}
+              <div className="form-group dl-total">
+                <label className="form-lbl">Total (lbs)</label>
                 <div style={{ fontFamily: 'var(--font-mono)', fontSize: 13, color: 'var(--graphite)', paddingTop: 10, paddingBottom: 10 }}>
                   {((parseFloat(cForm[oh]) || 0) + (parseFloat(cForm[rec]) || 0)).toFixed(1)} lbs
                   <span style={{ color: 'var(--drift)', fontSize: 11, marginLeft: 6 }}>
