@@ -2,6 +2,7 @@ import React, { useState, useEffect, useMemo } from 'react';
 import { apiJson } from '../api';
 import DateField from '../DateField';
 import InfoSheet from '../InfoSheet';
+import { formatNotes } from '../notes';
 
 const TODAY = new Date().toISOString().slice(0, 10);
 
@@ -280,7 +281,7 @@ export default function Order() {
                         {it.badge && <span className="ocard-badge">{it.badge}</span>}
                         {it.low_stock && <span className="ocard-badge low">Low stock</span>}
                       </div>
-                      {it.notes && <div className="ocard-notes">{it.notes}</div>}
+                      {it.notes && <div className="ocard-notes">{formatNotes(it.notes)}</div>}
                       <div className="ocard-price">{money(it.price_per_lb)}/lb wholesale</div>
                       {it.info_sheet && <span className="isheet-link" onClick={() => setSheetItem(it)}>ⓘ Info Sheet</span>}
                     </div>
@@ -330,7 +331,7 @@ export default function Order() {
                           {it.badge && <span style={{ fontSize: 10, letterSpacing: '.14em', textTransform: 'uppercase', border: '1px solid var(--olive)', color: 'var(--olive)', padding: '2px 7px', marginLeft: 8, verticalAlign: 'middle' }}>{it.badge}</span>}
                           {it.low_stock && <span style={{ fontSize: 10, letterSpacing: '.14em', textTransform: 'uppercase', border: '1px solid var(--warn)', color: 'var(--warn)', padding: '2px 7px', marginLeft: 8, verticalAlign: 'middle' }}>Low stock</span>}
                         </div>
-                        {it.notes && <div style={{ fontSize: 11, color: 'var(--drift)', marginTop: 2 }}>{it.notes}</div>}
+                        {it.notes && <div style={{ fontSize: 11, color: 'var(--drift)', marginTop: 2 }}>{formatNotes(it.notes)}</div>}
                         {it.info_sheet && <span className="isheet-link" onClick={() => setSheetItem(it)}>ⓘ Info Sheet</span>}
                       </td>
                       <td style={{ textAlign: 'right', whiteSpace: 'nowrap' }}>
