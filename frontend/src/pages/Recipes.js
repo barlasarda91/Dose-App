@@ -152,13 +152,13 @@ export default function Recipes() {
                   <td>
                     <span style={{ fontWeight: 500 }}>{r.square_item_name}</span>
                     {square.configured && (
-                      <div style={{ fontSize: 10, color: inSquare(r.square_item_name) ? 'var(--olive)' : 'var(--warn)' }}>
+                      <div style={{ fontSize: 10, whiteSpace: 'nowrap', color: inSquare(r.square_item_name) ? 'var(--olive)' : 'var(--warn)' }}>
                         {inSquare(r.square_item_name) ? '✓ linked to Square item' : '⚠ no longer in your Square catalog — sales can’t match it'}
                       </div>
                     )}
                   </td>
                   <td><span style={{ fontSize: 10, letterSpacing: '.12em', textTransform: 'uppercase', border: '1px solid var(--linen)', padding: '3px 8px', color: 'var(--drift)', whiteSpace: 'nowrap' }}>{METHODS[methodOf(r)].label}</span></td>
-                  <td style={{ fontSize: 12 }}>{doseText(r)}</td>
+                  <td style={{ fontSize: 12, whiteSpace: 'nowrap' }}>{doseText(r)}</td>
                   <td style={{ color: 'var(--drift)', fontSize: 12 }}>{r.notes || '—'}</td>
                   <td><div style={{ display: 'flex', gap: 6 }}>
                     <button className="btn btn-secondary btn-sm" onClick={() => openEditor(r.square_item_name)}>Edit</button>
@@ -296,7 +296,7 @@ export default function Recipes() {
             These items have sales but no recipe — their coffee use is invisible until you map them (or ignore drinks with no coffee).
           </div>
           {unmapped.map(s => (
-            <div key={s.name} style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 12, padding: '9px 0', borderBottom: '1px solid rgba(184,175,163,.4)', flexWrap: 'wrap' }}>
+            <div key={s.name} className="unmapped-row">
               <span><span style={{ fontSize: 13, color: 'var(--ink)' }}>{s.name}</span>
                 {s.sold_30d != null && <span style={{ fontSize: 11, color: 'var(--drift)' }}> · {s.sold_30d} sold, last 30 days</span>}</span>
               <span style={{ display: 'inline-flex', gap: 8 }}>
