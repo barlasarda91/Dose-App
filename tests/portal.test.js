@@ -56,6 +56,9 @@ const waitExit = proc => new Promise(r => { proc.on('exit', code => r(code)); se
       DB_PATH: path.join(dir, 'portal.db'), PORT: String(APP), PORTAL_KEY: PKEY,
       DEFAULT_HUB_URL: HUB_API, DOSE_SECRET_KEY: 'portal-test-secret', OPERATOR_KEY: 'op-key-123',
       SQUARE_BASE_URL: `http://127.0.0.1:${SQ}`,
+      // A leftover single-shop credential in the environment must NOT become
+      // every shop's fallback on the portal.
+      SQUARE_ACCESS_TOKEN: 'env-leak-token', RESEND_API_KEY: 'env-leak-resend',
     });
     await waitUp(`${API}/api/auth-status`);
 
@@ -170,6 +173,13 @@ const waitExit = proc => new Promise(r => { proc.on('exit', code => r(code)); se
     raw = await fetch(`${API}/api/operator/backups`, { headers: { 'x-operator-key': 'op-key-123' } });
     const oplist = await raw.json();
     ok(raw.status === 200 && Array.isArray(oplist.files), 'operator key lists backups');
+
+    section('env credentials never become another shop\'s fallback');
+    r = await j('GET', '/api/square-status', null, TB);
+    ok(r.body.configured === false, 'deployment-env Square token ignored — shops without their own token stay unconfigured');
+    r = await j('GET', '/api/settings', null, TA);
+    ok(r.body.square_token_set === false && r.body.resend_configured === false,
+      'Settings reports the truth: no per-shop credential means not configured');
 
     section('legacy single-shop database joins the portal');
     // A deployment that lived as Alpha's own URL: legacy hub mode, data on
