@@ -406,15 +406,15 @@ const passwordPolicyError = role =>
 // Constant-cost dummy so login timing doesn't reveal whether a username exists.
 const DUMMY = hashPasswordSync('dummy-password');
 
-async function createUser(username, password, role) {
+async function createUser(username, password, role, shopId = DEFAULT_SHOP_ID) {
   const { salt, hash } = await hashPassword(password);
-  const r = db.prepare('INSERT INTO users (username, password_hash, salt, role) VALUES (?,?,?,?)')
-    .run(normUsername(username), hash, salt, role);
+  const r = db.prepare('INSERT INTO users (shop_id, username, password_hash, salt, role) VALUES (?,?,?,?,?)')
+    .run(shopId, normUsername(username), hash, salt, role);
   return db.prepare('SELECT * FROM users WHERE id=?').get(r.lastInsertRowid);
 }
 
-async function verifyUser(username, password) {
-  let u = db.prepare('SELECT * FROM users WHERE username=?').get(normUsername(username));
+async function verifyUser(username, password, shopId = DEFAULT_SHOP_ID) {
+  let u = db.prepare('SELECT * FROM users WHERE shop_id=? AND username=?').get(shopId, normUsername(username));
   if (u && u.source === 'hub') u = null; // hub-managed identities never have a local password
   const salt = u ? u.salt : DUMMY.salt;
   const expected = u ? u.password_hash : DUMMY.hash;
@@ -433,29 +433,29 @@ function isHubConfigured(cfg) {
 
 // Hub identities get a local user row so sessions, created_by stamps, and
 // role checks keep working unchanged.
-function upsertHubUser(username, role) {
+function upsertHubUser(username, role, shopId = DEFAULT_SHOP_ID) {
   const uname = normUsername(username);
-  const existing = db.prepare('SELECT * FROM users WHERE username=?').get(uname);
+  const existing = db.prepare('SELECT * FROM users WHERE shop_id=? AND username=?').get(shopId, uname);
   if (existing) {
     if (existing.role !== role || existing.source !== 'hub')
       db.prepare("UPDATE users SET role=?, source='hub' WHERE id=?").run(role, existing.id);
     return db.prepare('SELECT * FROM users WHERE id=?').get(existing.id);
   }
-  const r = db.prepare("INSERT INTO users (username, password_hash, salt, role, source) VALUES (?,?,?,?, 'hub')")
-    .run(uname, 'hub-managed', '00', role);
+  const r = db.prepare("INSERT INTO users (shop_id, username, password_hash, salt, role, source) VALUES (?,?,?,?,?, 'hub')")
+    .run(shopId, uname, 'hub-managed', '00', role);
   return db.prepare('SELECT * FROM users WHERE id=?').get(r.lastInsertRowid);
 }
 
-async function cacheHubLogin(username, password, role) {
+async function cacheHubLogin(username, password, role, shopId = DEFAULT_SHOP_ID) {
   const { salt, hash } = await hashPassword(password);
-  db.prepare(`INSERT OR REPLACE INTO hub_login_cache (username, password_hash, salt, role, verified_at)
-    VALUES (?,?,?,?, datetime('now'))`).run(normUsername(username), hash, salt, role);
+  db.prepare(`INSERT OR REPLACE INTO hub_login_cache (shop_id, username, password_hash, salt, role, verified_at)
+    VALUES (?,?,?,?,?, datetime('now'))`).run(shopId, normUsername(username), hash, salt, role);
 }
 
-async function verifyCachedHubLogin(username, password) {
+async function verifyCachedHubLogin(username, password, shopId = DEFAULT_SHOP_ID) {
   const row = db.prepare(
-    "SELECT * FROM hub_login_cache WHERE username=? AND verified_at > datetime('now','-24 hours')"
-  ).get(normUsername(username));
+    "SELECT * FROM hub_login_cache WHERE shop_id=? AND username=? AND verified_at > datetime('now','-24 hours')"
+  ).get(shopId, normUsername(username));
   if (!row) return null;
   const { hash } = await hashPassword(password, row.salt);
   return crypto.timingSafeEqual(Buffer.from(hash, 'hex'), Buffer.from(row.password_hash, 'hex')) ? row : null;
@@ -545,7 +545,7 @@ app.use('/api', (req, res, next) => {
   if (OPEN_PATHS.has(req.path)) return next();
   const token = req.get('x-dose-key') || '';
   const row = token && db.prepare(
-    `SELECT s.token AS thash, s.expires_at, u.id, u.username, u.role, u.tour_seen_at
+    `SELECT s.token AS thash, s.expires_at, u.id, u.username, u.role, u.tour_seen_at, u.shop_id
      FROM sessions s JOIN users u ON u.id = s.user_id
      WHERE s.token=? AND s.expires_at > datetime('now')`
   ).get(sha256(token));
@@ -554,7 +554,8 @@ app.use('/api', (req, res, next) => {
     if (new Date(row.expires_at + 'Z') - Date.now() < SESSION_RENEW_BELOW_DAYS * 86400_000) {
       db.prepare(`UPDATE sessions SET expires_at = datetime('now', '+${SESSION_DAYS} days') WHERE token=?`).run(row.thash);
     }
-    req.user = { id: row.id, username: row.username, role: row.role, tour_seen_at: row.tour_seen_at };
+    req.user = { id: row.id, username: row.username, role: row.role, tour_seen_at: row.tour_seen_at, shop_id: row.shop_id };
+    req.shopId = row.shop_id; // every scoped query keys off this
     return next();
   }
   res.status(401).json({ error: 'Unauthorized' });
