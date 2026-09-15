@@ -153,6 +153,25 @@ const j = client(API, 'x-hub-key');
     r = await shopAuth(shopUname, 'fresh-after-call');
     ok(r.status === 200, 'reset clears the lockout — new password works immediately');
 
+    section('login telemetry and the wrong-door signpost');
+    r = await j('GET', '/api/shops', null, OWNER);
+    let shopRow = r.body.find(x => x.id === 1);
+    ok(shopRow.last_auth_ok_at && shopRow.last_auth_fail_at && shopRow.auth_fail_count >= 5,
+      `shop card shows login health (ok ${!!shopRow.last_auth_ok_at}, fails ${shopRow.auth_fail_count})`);
+    // shop username typed into the HUB login → signpost, not a dead error
+    r = await j('POST', '/api/login', { username: shopRow.login_username, password: 'whatever-123' });
+    ok(r.status === 401 && /shop account/.test(r.body.error), `hub login signposts the wrong door (${r.body.error.slice(0, 60)}…)`);
+    r = await j('POST', '/api/login', { username: 'total-stranger', password: 'whatever-123' });
+    ok(r.status === 401 && !/shop account/.test(r.body.error), 'unknown usernames still get the plain error (no account probing)');
+    r = await j('GET', '/api/activity', null, OWNER);
+    ok(r.body.some(a => a.username === 'shop' && /set a new password via its invite link/.test(a.action)) === false,
+      'no invite set-password yet in trail (sanity)');
+
+    r = await shopAuth('some-other-shop', 'whatever-123');
+    ok(r.status === 401 && /different shop/.test(r.body.error), 'wrong-deployment login gets the distinct message');
+    r = await shopAuth(shopUname, 'not-the-password-1');
+    ok(r.status === 401 && r.body.error === 'Wrong username or password', 'right shop, wrong password keeps the plain error');
+
     section('archive / restore');
     r = await j('POST', `/api/catalog/${plainId}/archive`, null, STAFF);
     ok(r.status === 403, 'staff cannot archive');

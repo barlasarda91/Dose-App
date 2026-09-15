@@ -168,6 +168,9 @@ for (const col of ['info_country TEXT', 'info_region TEXT', 'info_producer TEXT'
 try { db.exec('ALTER TABLE hub_users ADD COLUMN email TEXT'); } catch { /* present */ }
 try { db.exec('ALTER TABLE stock_moves ADD COLUMN created_by TEXT'); } catch { /* present */ }
 try { db.exec('ALTER TABLE shops ADD COLUMN app_url TEXT'); } catch { /* present */ }
+for (const col of ['last_auth_ok_at TEXT', 'last_auth_fail_at TEXT', 'auth_fail_count INTEGER DEFAULT 0']) {
+  try { db.exec(`ALTER TABLE shops ADD COLUMN ${col}`); } catch { /* present */ }
+}
 for (const col of ['confirmed_by TEXT', 'confirmed_at TEXT', 'shipped_by TEXT', 'shipped_at TEXT']) {
   try { db.exec(`ALTER TABLE orders ADD COLUMN ${col}`); } catch { /* present */ }
 }
@@ -473,6 +476,16 @@ app.post('/api/login', async (req, res) => {
     const okPw = user ? await hubVerifyPassword(password || '', user.password_hash) : (await hubHashPassword('timing-equalizer'), false);
     if (!okPw) {
       recordFailure(ipKey); recordFailure(userKey);
+      // Wrong door: shop accounts don't log in at the hub. Signpost instead
+      // of a dead 'wrong password' (the person typing already knows the name).
+      if (!user) {
+        const asShop = db.prepare('SELECT * FROM shops WHERE login_username=?').get(uname);
+        if (asShop) {
+          return res.status(401).json({
+            error: `This is the roastery sign-in. "${uname}" is a shop account — sign in at your shop's Dose app${asShop.app_url ? `: ${asShop.app_url}` : ' instead'}.`,
+          });
+        }
+      }
       return res.status(401).json({ error: 'Wrong username or password' });
     }
     loginFailures.delete(ipKey); loginFailures.delete(userKey);
@@ -702,11 +715,21 @@ app.post('/api/ingest/auth', async (req, res) => {
     const wait = lockedFor(lockKey);
     if (wait > 0) return res.status(429).json({ error: `Too many attempts — try again in ${wait}s` });
     if (!shop.password_hash) return res.status(409).json({ error: 'no_login_password' });
-    if (username !== (shop.login_username || '') || !(await verifyShopPassword(shop, password))) {
+    if (username !== (shop.login_username || '')) {
+      // Whole-username mismatch: they're almost certainly at the WRONG SHOP's
+      // deployment (credentials are bound to the deployment's API key). Say
+      // so — a plain 'wrong password' sends people chasing password resets.
       recordFailure(lockKey);
+      db.prepare("UPDATE shops SET last_auth_fail_at=datetime('now'), auth_fail_count=COALESCE(auth_fail_count,0)+1 WHERE id=?").run(shop.id);
+      return res.status(401).json({ error: `"${username}" is not the account for this shop's app — this deployment belongs to a different shop. Check you're at the right Dose URL.` });
+    }
+    if (!(await verifyShopPassword(shop, password))) {
+      recordFailure(lockKey);
+      db.prepare("UPDATE shops SET last_auth_fail_at=datetime('now'), auth_fail_count=COALESCE(auth_fail_count,0)+1 WHERE id=?").run(shop.id);
       return res.status(401).json({ error: 'Wrong username or password' });
     }
     loginFailures.delete(lockKey);
+    db.prepare("UPDATE shops SET last_auth_ok_at=datetime('now') WHERE id=?").run(shop.id);
     res.json({ ok: true, username: shop.login_username, role: 'admin', shop_name: shop.name });
   } catch (err) {
     console.error(err);
@@ -772,6 +795,8 @@ app.post('/api/public/set-password', async (req, res) => {
     db.prepare('UPDATE shops SET password_hash=?, salt=?, invite_token_hash=NULL, invite_expires_at=NULL WHERE id=?')
       .run(hash, salt, shop.id);
     clearShopAuthLocks(shop.id);
+    db.prepare('INSERT INTO audit_log (username, action) VALUES (?, ?)')
+      .run('shop', `"${shop.name}" set a new password via its invite link`);
     res.json({ ok: true, login_username: shop.login_username, shop_name: shop.name });
   } catch (err) {
     console.error(err);
@@ -1030,6 +1055,7 @@ app.put('/api/catalog/:id', requireOwner, (req, res) => {
 // ─── Shops management ─────────────────────────────────────────────────────────
 const shopWithStats = s => ({
   id: s.id, name: s.name, email: s.email, login_username: s.login_username, app_url: s.app_url || null,
+  last_auth_ok_at: s.last_auth_ok_at || null, last_auth_fail_at: s.last_auth_fail_at || null, auth_fail_count: s.auth_fail_count || 0,
   has_password: !!s.password_hash,
   invite_pending: !!(s.invite_token_hash && !s.password_hash),
   created_at: s.created_at,
