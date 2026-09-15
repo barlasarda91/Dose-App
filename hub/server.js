@@ -167,6 +167,7 @@ for (const col of ['info_country TEXT', 'info_region TEXT', 'info_producer TEXT'
 }
 try { db.exec('ALTER TABLE hub_users ADD COLUMN email TEXT'); } catch { /* present */ }
 try { db.exec('ALTER TABLE stock_moves ADD COLUMN created_by TEXT'); } catch { /* present */ }
+try { db.exec('ALTER TABLE shops ADD COLUMN app_url TEXT'); } catch { /* present */ }
 for (const col of ['confirmed_by TEXT', 'confirmed_at TEXT', 'shipped_by TEXT', 'shipped_at TEXT']) {
   try { db.exec(`ALTER TABLE orders ADD COLUMN ${col}`); } catch { /* present */ }
 }
@@ -749,7 +750,7 @@ function shopFromInviteToken(token) {
 app.post('/api/public/invite-info', (req, res) => {
   const shop = shopFromInviteToken(req.body && req.body.token);
   if (!shop) return res.status(404).json({ error: 'This link is invalid or has expired — ask the roastery to send a new one.' });
-  res.json({ shop_name: shop.name, login_username: shop.login_username });
+  res.json({ shop_name: shop.name, login_username: shop.login_username, app_url: shop.app_url || null });
 });
 
 app.post('/api/public/set-password', async (req, res) => {
@@ -1018,7 +1019,7 @@ app.put('/api/catalog/:id', requireOwner, (req, res) => {
 
 // ─── Shops management ─────────────────────────────────────────────────────────
 const shopWithStats = s => ({
-  id: s.id, name: s.name, email: s.email, login_username: s.login_username,
+  id: s.id, name: s.name, email: s.email, login_username: s.login_username, app_url: s.app_url || null,
   has_password: !!s.password_hash,
   invite_pending: !!(s.invite_token_hash && !s.password_hash),
   created_at: s.created_at,
@@ -1128,8 +1129,10 @@ app.put('/api/shops/:id', (req, res) => {
   if (!shop) return res.status(404).json({ error: 'Shop not found' });
   const name = req.body.name !== undefined ? String(req.body.name).trim() : shop.name;
   const email = req.body.email !== undefined ? (String(req.body.email).trim() || null) : shop.email;
+  let appUrl = req.body.app_url !== undefined ? (String(req.body.app_url).trim().replace(/\/+$/, '') || null) : shop.app_url;
+  if (appUrl && !/^https?:\/\//.test(appUrl)) return res.status(400).json({ error: 'App URL must start with https:// (or http:// for testing)' });
   if (name.length < 2) return res.status(400).json({ error: 'Shop name required' });
-  db.prepare('UPDATE shops SET name=?, email=? WHERE id=?').run(name, email, shop.id);
+  db.prepare('UPDATE shops SET name=?, email=?, app_url=? WHERE id=?').run(name, email, appUrl, shop.id);
   res.json(shopWithStats(db.prepare('SELECT * FROM shops WHERE id=?').get(shop.id)));
 });
 
