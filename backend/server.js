@@ -222,7 +222,11 @@ function decryptSecret(stored) {
 function getSecret(settingKey, envName, shopId = DEFAULT_SHOP_ID) {
   const v = (getSettings(shopId)[settingKey] || '').trim();
   if (v) return decryptSecret(v);
-  return process.env[envName] || '';
+  // Env fallbacks are a single-shop convenience. On the portal, one env
+  // value would silently become EVERY shop's credential (one shop's
+  // analytics reading another's Square account) — so they are ignored:
+  // portal credentials live only in each shop's Settings, encrypted.
+  return PORTAL_MODE ? '' : (process.env[envName] || '');
 }
 
 // ─── Auth ─────────────────────────────────────────────────────────────────────
@@ -769,6 +773,12 @@ app.post('/api/login', asyncRoute(async (req, res) => {
         return res.status(401).json({ error: err.message || 'Wrong username or password' });
       }
       if (err.hubStatus === 429) return res.status(429).json({ error: err.message });
+      if (err.hubStatus) {
+        // The hub ANSWERED with an error (e.g. 'PORTAL_KEY is not set on the
+        // hub') — say what it said. 'Cannot reach' would send whoever is
+        // debugging down the wrong road entirely.
+        return res.status(502).json({ error: `Roastery hub error: ${err.message}` });
+      }
       // Hub unreachable: accept recently verified credentials from the cache.
       const cached = db.prepare(
         "SELECT * FROM hub_login_cache WHERE username=? AND verified_at > datetime('now','-24 hours')"
@@ -1429,7 +1439,7 @@ async function sendOrderEmail(shopId, order, cfg, items = []) {
   const apiKey = getSecret('resend_api_key', 'RESEND_API_KEY', shopId);
   if (!apiKey) return { sent: false, reason: 'Email not configured — add a Resend API key on the Settings page. Order saved but not emailed.' };
   const to = (cfg.order_email_to || 'hello@boxxcoffee.com').trim();
-  const from = (cfg.order_email_from || '').trim() || process.env.ORDER_EMAIL_FROM || 'Dose Orders <onboarding@resend.dev>';
+  const from = (cfg.order_email_from || '').trim() || (!PORTAL_MODE && process.env.ORDER_EMAIL_FROM) || 'Dose Orders <onboarding@resend.dev>';
   const shopName = (cfg.shop_name || '').trim();
   try {
     const res = await fetch('https://api.resend.com/emails', {

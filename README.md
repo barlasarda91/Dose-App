@@ -60,6 +60,7 @@ Setting `PORTAL_KEY` turns a shop-app deployment into the **Dose Portal**: a sin
 
 1. On the **hub** service: set `PORTAL_KEY`, redeploy.
 2. On the **boxx-dose** service (it becomes the portal): set `PORTAL_KEY`, `DOSE_SECRET_KEY`, `OPERATOR_KEY`, redeploy. Existing data is stamped shop 1 in place; on the first login the deployment links shop 1 to its hub identity through the API key it already holds. Nothing is re-entered.
+   **Credentials-in-env note:** the portal ignores `SQUARE_ACCESS_TOKEN` / `RESEND_API_KEY` / `ORDER_EMAIL_FROM` env fallbacks — one env value must never become every shop's credential. If the old service relied on them, paste those values into that shop's **Settings** once (stored encrypted); the env vars can then be deleted.
 3. Every shop now signs in at the portal URL with their existing hub username/password. New shops need only Hub → Shops → create + password invite — **no new deployment, ever**.
 4. Retire any other per-shop services once their users have moved (their data, if any, stays with those services — export orders from the hub side if needed).
 
