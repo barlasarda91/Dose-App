@@ -134,6 +134,25 @@ const j = client(API, 'x-hub-key');
     r = await fetch(`${API}/api/ingest/catalog`, { headers: { Authorization: `Bearer ${shopKey}` } }).then(x => x.json());
     ok(r.items.find(i => i.id === plainId).info_sheet === null, 'empty sheet syncs as null — no phantom links');
 
+    section('reset clears lockouts — the client-called-you scenario');
+    const shopAuth = async (u, p) => {
+      const res = await fetch(`${API}/api/ingest/auth`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${shopKey}` },
+        body: JSON.stringify({ username: u, password: p }),
+      });
+      return { status: res.status, body: await res.json().catch(() => ({})) };
+    };
+    r = await j('POST', `/api/shops/1/reset-login`, { new_password: 'first-pass-999' }, OWNER);
+    const shopUname = r.body.login_username;
+    for (let i = 0; i < 6; i++) r = await shopAuth(shopUname, 'client-typo-' + i);
+    r = await shopAuth(shopUname, 'first-pass-999');
+    ok(r.status === 429, 'after repeated typos even the right password is rate-limited');
+    r = await j('POST', `/api/shops/1/reset-login`, { new_password: 'fresh-after-call' }, OWNER);
+    ok(r.status === 200, 'roaster resets the login');
+    r = await shopAuth(shopUname, 'fresh-after-call');
+    ok(r.status === 200, 'reset clears the lockout — new password works immediately');
+
     section('archive / restore');
     r = await j('POST', `/api/catalog/${plainId}/archive`, null, STAFF);
     ok(r.status === 403, 'staff cannot archive');

@@ -684,6 +684,14 @@ app.post('/api/ingest/orders', async (req, res) => {
 // Shop deployments verify user logins here. Rate-limited per shop+username.
 // 409 no_login_password lets pre-upgrade deployments fall back to their
 // local accounts until a password is set in the hub.
+// A reset re-establishes identity — stale brute-force lockouts must not
+// keep the freshly-reset password from working.
+function clearShopAuthLocks(shopId) {
+  for (const key of [...loginFailures.keys()]) {
+    if (key.startsWith(`shopauth:${shopId}:`)) loginFailures.delete(key);
+  }
+}
+
 app.post('/api/ingest/auth', async (req, res) => {
   try {
     const shop = shopFromBearer(req);
@@ -763,6 +771,7 @@ app.post('/api/public/set-password', async (req, res) => {
     const { salt, hash } = await hashPassword(password);
     db.prepare('UPDATE shops SET password_hash=?, salt=?, invite_token_hash=NULL, invite_expires_at=NULL WHERE id=?')
       .run(hash, salt, shop.id);
+    clearShopAuthLocks(shop.id);
     res.json({ ok: true, login_username: shop.login_username, shop_name: shop.name });
   } catch (err) {
     console.error(err);
@@ -867,6 +876,7 @@ app.post('/api/team/:id/reset', requireOwner, async (req, res) => {
     const hash = await hubHashPassword(temp);
     db.prepare('UPDATE hub_users SET password_hash=?, must_change_password=1 WHERE id=?').run(hash, u.id);
     db.prepare('DELETE FROM sessions WHERE user_id=?').run(u.id);
+    loginFailures.delete(`u:${u.username}`);
     audit(req, `reset the password for "${u.username}"`);
     res.json({ ok: true });
   } catch (err) {
@@ -1116,6 +1126,7 @@ app.post('/api/shops/:id/reset-login', requireOwner, async (req, res) => {
     const loginUsername = shop.login_username || genLoginUsername(shop.name);
     const { salt, hash } = await hashPassword(password);
     db.prepare('UPDATE shops SET login_username=?, password_hash=?, salt=? WHERE id=?').run(loginUsername, hash, salt, shop.id);
+    clearShopAuthLocks(shop.id);
     audit(req, `reset the shop login for "${shop.name}"`);
     res.json({ ok: true, login_username: loginUsername });
   } catch (err) {

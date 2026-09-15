@@ -581,7 +581,8 @@ app.post('/api/login', asyncRoute(async (req, res) => {
       });
     } catch (err) {
       if (err.hubStatus === 401) {
-        recordFailure(ipKey); recordFailure(userKey);
+        // The hub is the rate limiter for hub logins — counting locally too
+        // left clients locked out even after the roastery reset the password.
         return res.status(401).json({ error: 'Wrong username or password' });
       }
       if (err.hubStatus === 429) return res.status(429).json({ error: err.message });
