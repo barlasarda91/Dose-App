@@ -1039,10 +1039,16 @@
 
     function drawList() {
       document.getElementById('shop-list').innerHTML = shops.length ? `<div class="table-wrap"><table>
-        <thead><tr><th>Shop</th><th>Login</th><th>Email</th><th>Orders</th><th>Last order</th><th></th></tr></thead>
+        <thead><tr><th>Shop</th><th>Login</th><th>Login health</th><th>Email</th><th>Orders</th><th>Last order</th><th></th></tr></thead>
         <tbody>${shops.map(s => `<tr>
           <td style="font-weight:500">${esc(s.name)}</td>
           <td style="color:var(--drift)">${esc(s.login_username || '—')}${s.has_password ? '' : (s.invite_pending ? ' <span class="badge seasonal">Invite pending</span>' : ' <span class="badge low">No login yet</span>')}</td>
+          <td style="font-size:11px;line-height:1.7">${
+            !s.last_auth_ok_at && !s.last_auth_fail_at
+              ? '<span style="color:var(--warn)">no login attempt has ever reached the hub</span>'
+              : `${s.last_auth_ok_at ? `<span style="color:var(--olive)">✓ last success ${esc(fmtLA(s.last_auth_ok_at))}</span>` : '<span style="color:var(--red)">never succeeded</span>'}
+                 ${s.last_auth_fail_at ? `<br><span style="color:var(--drift)">✕ last failure ${esc(fmtLA(s.last_auth_fail_at))} · ${s.auth_fail_count} total</span>` : ''}`
+          }</td>
           <td style="color:var(--drift)">${esc(s.email || '— none —')}</td>
           <td>${s.orders_count}</td>
           <td>${esc(s.last_order_date || '—')}</td>
