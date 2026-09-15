@@ -98,11 +98,13 @@ db.exec(`
   );
 
   CREATE TABLE IF NOT EXISTS hub_login_cache (
-    username TEXT PRIMARY KEY,
+    shop_id INTEGER NOT NULL DEFAULT 1,
+    username TEXT NOT NULL,
     password_hash TEXT NOT NULL,
     salt TEXT NOT NULL,
     role TEXT NOT NULL,
-    verified_at TEXT
+    verified_at TEXT,
+    PRIMARY KEY (shop_id, username)
   );
 
   CREATE TABLE IF NOT EXISTS order_items (
@@ -129,17 +131,23 @@ db.exec(`
   );
 
   CREATE TABLE IF NOT EXISTS settings (
-    key TEXT PRIMARY KEY,
-    value TEXT NOT NULL
+    shop_id INTEGER NOT NULL DEFAULT 1,
+    key TEXT NOT NULL,
+    value TEXT NOT NULL,
+    PRIMARY KEY (shop_id, key)
   );
 
   CREATE TABLE IF NOT EXISTS users (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
-    username TEXT NOT NULL UNIQUE,
+    shop_id INTEGER NOT NULL DEFAULT 1,
+    username TEXT NOT NULL,
     password_hash TEXT NOT NULL,
     salt TEXT NOT NULL,
     role TEXT NOT NULL DEFAULT 'user' CHECK(role IN ('admin','user')),
-    created_at TEXT DEFAULT (datetime('now'))
+    source TEXT DEFAULT 'local',
+    tour_seen_at TEXT,
+    created_at TEXT DEFAULT (datetime('now')),
+    UNIQUE(shop_id, username)
   );
 
   CREATE TABLE IF NOT EXISTS sessions (
@@ -148,24 +156,26 @@ db.exec(`
     expires_at TEXT,
     created_at TEXT DEFAULT (datetime('now'))
   );
-
-  INSERT OR IGNORE INTO settings (key, value) VALUES ('alt_milk_ml_per_modifier', '180');
-  INSERT OR IGNORE INTO settings (key, value) VALUES ('square_location_id', '');
-  INSERT OR IGNORE INTO settings (key, value) VALUES ('numilk_oat_liters_per_day', '0');
-  INSERT OR IGNORE INTO settings (key, value) VALUES ('numilk_almond_liters_per_day', '0');
-  INSERT OR IGNORE INTO settings (key, value) VALUES ('shop_name', '');
-  INSERT OR IGNORE INTO settings (key, value) VALUES ('order_email_to', 'hello@boxxcoffee.com');
-  INSERT OR IGNORE INTO settings (key, value) VALUES ('order_email_from', '');
 `);
 
-function getSettings() {
+// Every per-shop row carries a shop_id. Single-shop deployments only ever
+// have shop 1 — the portal (multi-tenant) build threads real ids through
+// per-request; until then, everything defaults here.
+const DEFAULT_SHOP_ID = 1;
+
+// Deployment-wide settings live under shop_id 0; everything else is per shop.
+const GLOBAL_SETTINGS = new Set(['hub_url']);
+
+function getSettings(shopId = DEFAULT_SHOP_ID) {
   const cfg = {};
-  for (const r of db.prepare('SELECT key, value FROM settings').all()) cfg[r.key] = r.value;
+  for (const r of db.prepare('SELECT key, value FROM settings WHERE shop_id=0').all()) cfg[r.key] = r.value;
+  for (const r of db.prepare('SELECT key, value FROM settings WHERE shop_id=?').all(shopId)) cfg[r.key] = r.value;
   return cfg;
 }
 
-function setSetting(key, value) {
-  db.prepare('INSERT OR REPLACE INTO settings (key, value) VALUES (?,?)').run(key, String(value));
+function setSetting(key, value, shopId = DEFAULT_SHOP_ID) {
+  db.prepare('INSERT OR REPLACE INTO settings (shop_id, key, value) VALUES (?,?,?)')
+    .run(GLOBAL_SETTINGS.has(key) ? 0 : shopId, key, String(value));
 }
 
 // Secrets live in the shop's own database (entered via Settings after login);
@@ -238,7 +248,11 @@ db.exec(`UPDATE drink_recipes SET method = CASE category
   WHERE method IS NULL`);
 
 // Square items deliberately excluded from usage tracking (no coffee in them).
-db.exec('CREATE TABLE IF NOT EXISTS ignored_square_items (name TEXT PRIMARY KEY)');
+db.exec(`CREATE TABLE IF NOT EXISTS ignored_square_items (
+  shop_id INTEGER NOT NULL DEFAULT 1,
+  name TEXT NOT NULL,
+  PRIMARY KEY (shop_id, name)
+)`);
 
 // Widen the roast CHECK from earlier versions (SQLite requires a rebuild).
 // Two generations: pre-retail, and pre-profile-split ('retail_espresso').
@@ -261,6 +275,105 @@ db.exec('CREATE TABLE IF NOT EXISTS ignored_square_items (name TEXT PRIMARY KEY)
     db.exec('DROP TABLE order_items_migr');
     console.log('Migrated order_items schema');
   }
+}
+
+// ─── Multi-tenant groundwork ─────────────────────────────────────────────────
+// One database, many shops: every per-shop table carries a shop_id. Existing
+// single-shop databases are stamped shop 1 in place — zero-touch, reversible
+// (the columns default to 1, so pre-portal code still reads the same rows).
+db.exec(`CREATE TABLE IF NOT EXISTS shops (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  hub_shop_id INTEGER,
+  name TEXT NOT NULL DEFAULT '',
+  active INTEGER NOT NULL DEFAULT 1,
+  created_at TEXT DEFAULT (datetime('now'))
+)`);
+
+// Additive columns: DEFAULT 1 back-stamps all existing rows as shop 1.
+for (const t of ['drink_recipes', 'coffee_deliveries', 'milk_deliveries', 'coffee_orders', 'standing_orders']) {
+  try { db.exec(`ALTER TABLE ${t} ADD COLUMN shop_id INTEGER NOT NULL DEFAULT 1`); } catch { /* already present */ }
+}
+
+// Tables whose PRIMARY KEY / UNIQUE constraint must widen to include shop_id
+// need the SQLite rebuild dance (same pattern as order_items above).
+function rebuildForShopId(table, createSql, copyCols) {
+  const row = db.prepare("SELECT sql FROM sqlite_master WHERE type='table' AND name=?").get(table);
+  if (!row || row.sql.includes('shop_id')) return;
+  db.exec(`ALTER TABLE ${table} RENAME TO ${table}_migr`);
+  db.exec(createSql);
+  db.exec(`INSERT INTO ${table} (shop_id, ${copyCols}) SELECT 1, ${copyCols} FROM ${table}_migr`);
+  db.exec(`DROP TABLE ${table}_migr`);
+  console.log(`Migrated ${table} to per-shop schema`);
+}
+
+rebuildForShopId('users', `CREATE TABLE users (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  shop_id INTEGER NOT NULL DEFAULT 1,
+  username TEXT NOT NULL,
+  password_hash TEXT NOT NULL,
+  salt TEXT NOT NULL,
+  role TEXT NOT NULL DEFAULT 'user' CHECK(role IN ('admin','user')),
+  source TEXT DEFAULT 'local',
+  tour_seen_at TEXT,
+  created_at TEXT DEFAULT (datetime('now')),
+  UNIQUE(shop_id, username)
+)`, 'id, username, password_hash, salt, role, source, tour_seen_at, created_at');
+
+rebuildForShopId('hub_login_cache', `CREATE TABLE hub_login_cache (
+  shop_id INTEGER NOT NULL DEFAULT 1,
+  username TEXT NOT NULL,
+  password_hash TEXT NOT NULL,
+  salt TEXT NOT NULL,
+  role TEXT NOT NULL,
+  verified_at TEXT,
+  PRIMARY KEY (shop_id, username)
+)`, 'username, password_hash, salt, role, verified_at');
+
+rebuildForShopId('ignored_square_items', `CREATE TABLE ignored_square_items (
+  shop_id INTEGER NOT NULL DEFAULT 1,
+  name TEXT NOT NULL,
+  PRIMARY KEY (shop_id, name)
+)`, 'name');
+
+// Settings: (key) → (shop_id, key). hub_url is the one deployment-wide
+// setting (shop_id 0); everything else belongs to the shop that set it.
+{
+  const row = db.prepare("SELECT sql FROM sqlite_master WHERE type='table' AND name='settings'").get();
+  if (row && !row.sql.includes('shop_id')) {
+    db.exec('ALTER TABLE settings RENAME TO settings_migr');
+    db.exec(`CREATE TABLE settings (
+      shop_id INTEGER NOT NULL DEFAULT 1,
+      key TEXT NOT NULL,
+      value TEXT NOT NULL,
+      PRIMARY KEY (shop_id, key)
+    )`);
+    db.exec(`INSERT INTO settings (shop_id, key, value)
+      SELECT CASE WHEN key='hub_url' THEN 0 ELSE 1 END, key, value FROM settings_migr`);
+    db.exec('DROP TABLE settings_migr');
+    console.log('Migrated settings to per-shop schema');
+  }
+}
+
+// Per-shop defaults (fresh installs and migrated databases alike).
+for (const [k, v] of [
+  ['alt_milk_ml_per_modifier', '180'], ['square_location_id', ''],
+  ['numilk_oat_liters_per_day', '0'], ['numilk_almond_liters_per_day', '0'],
+  ['shop_name', ''], ['order_email_to', 'hello@boxxcoffee.com'], ['order_email_from', ''],
+]) db.prepare('INSERT OR IGNORE INTO settings (shop_id, key, value) VALUES (1,?,?)').run(k, v);
+
+db.exec(`
+  CREATE INDEX IF NOT EXISTS idx_recipes_shop    ON drink_recipes(shop_id);
+  CREATE INDEX IF NOT EXISTS idx_cdel_shop_date  ON coffee_deliveries(shop_id, delivery_date);
+  CREATE INDEX IF NOT EXISTS idx_mdel_shop_date  ON milk_deliveries(shop_id, delivery_date);
+  CREATE INDEX IF NOT EXISTS idx_orders_shop_date ON coffee_orders(shop_id, order_date);
+  CREATE INDEX IF NOT EXISTS idx_standing_shop   ON standing_orders(shop_id);
+`);
+
+// Shop 1 always exists — it's this deployment's (only) shop until the portal
+// build syncs the roster from the hub.
+if (db.prepare('SELECT COUNT(*) AS n FROM shops').get().n === 0) {
+  const nameRow = db.prepare("SELECT value FROM settings WHERE shop_id=1 AND key='shop_name'").get();
+  db.prepare('INSERT INTO shops (id, name) VALUES (1, ?)').run((nameRow && nameRow.value) || '');
 }
 
 const { promisify } = require('util');
