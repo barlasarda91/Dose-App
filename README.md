@@ -44,6 +44,27 @@ Track coffee and milk efficiency for your coffee shop by comparing Square POS sa
 6. Settings: paste the shop's Square token, set shop name / order email, create the client's user account(s)
 7. Hand the client the URL and their username + password
 
+## Dose Portal (one URL for every shop)
+
+Setting `PORTAL_KEY` turns a shop-app deployment into the **Dose Portal**: a single multi-tenant service every shop logs into. The username alone decides which shop a login belongs to (resolved at the hub), so the per-shop-deployment failure mode — right password, wrong URL — cannot happen. Every table row carries a `shop_id` and every query runs inside the session's shop; the isolation suite (`npm run test:portal`, 42 checks) hammers the wall between two live shops.
+
+**Portal environment variables** (in addition to the table above):
+
+| Variable | Where | Description |
+|---|---|---|
+| `PORTAL_KEY` | Hub **and** portal | The shared master credential. On the hub it enables `/api/portal/*`; on the shop app it switches on portal mode. Any long random string, same value on both. |
+| `DOSE_SECRET_KEY` | Portal | **Required** in portal mode — the portal refuses to boot without it, since one database holds every shop's Square/Resend credentials. |
+| `OPERATOR_KEY` | Portal | Unlocks `/api/operator/backups*` (list / run / download) via the `x-operator-key` header. In portal mode shop admins lose backup access — one backup file holds every shop's data. |
+
+**Cutover from per-shop deployments** (zero-touch for existing data):
+
+1. On the **hub** service: set `PORTAL_KEY`, redeploy.
+2. On the **boxx-dose** service (it becomes the portal): set `PORTAL_KEY`, `DOSE_SECRET_KEY`, `OPERATOR_KEY`, redeploy. Existing data is stamped shop 1 in place; on the first login the deployment links shop 1 to its hub identity through the API key it already holds. Nothing is re-entered.
+3. Every shop now signs in at the portal URL with their existing hub username/password. New shops need only Hub → Shops → create + password invite — **no new deployment, ever**.
+4. Retire any other per-shop services once their users have moved (their data, if any, stays with those services — export orders from the hub side if needed).
+
+Legacy `/api/ingest/*` (per-shop API key) stays fully supported, so un-migrated deployments keep working during the transition. Shop-local staff accounts also keep working at the portal: they're checked before the hub and their usernames are portal-unique.
+
 ## How it works
 
 - **Dashboard** — opens on the current delivery cycle automatically. The live cycle shows only what's knowable without a stock count: kg used per roast, burn rate (lbs/day), ~days left with a depletion bar, the suggested next order, and where the filter roast goes by brew method (batch / cold brew / pour-over). Waste settles **cycle to cycle**: a Closed Cycles section tables the last three closed cycles per roast (stocked / used / counted / waste with % of opening, red WASTE chip above 5%). Drinks sold that don't match a recipe are called out rather than silently dropped.
@@ -132,7 +153,8 @@ npm test            # everything below, in order
 npm run test:unit   # backend/calc.test.js — pure math (doses, cycles, pricing)
 npm run test:shop   # tests/shop.test.js — real backend vs mock Square + mock hub
 npm run test:hub    # tests/hub.test.js — real hub, full roastery lifecycle
+npm run test:portal # tests/portal.test.js — two shops on one portal, isolation attacks
 npm run test:ui     # tests/hub-ui.test.js — hub dashboard in a real browser
 ```
 
-The pressure suites (`tests/`) boot the actual servers on throwaway databases and attack the seams: LA DST-spanning cycles (asserting the exact offsets sent to Square), same-day and retroactive deliveries, standing-order failure visibility, ingest dedup on retried pushes, roast-fill idempotency and On Hand ledger math, role walls, and the login/bootstrap/forced-password-change flows in a browser. The UI suite needs Playwright + a Chromium (`PW_CHROMIUM` env to point at one) and skips cleanly when absent. No network access is required — Square and the hub are mocked locally.
+The pressure suites (`tests/`) boot the actual servers on throwaway databases and attack the seams: LA DST-spanning cycles (asserting the exact offsets sent to Square), same-day and retroactive deliveries, standing-order failure visibility, ingest dedup on retried pushes, roast-fill idempotency and On Hand ledger math, role walls, two-shop portal isolation (including a legacy database migrating in), and the login/bootstrap/forced-password-change flows in a browser. The UI suite needs Playwright + a Chromium (`PW_CHROMIUM` env to point at one) and skips cleanly when absent. No network access is required — Square and the hub are mocked locally.
