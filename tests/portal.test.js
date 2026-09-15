@@ -23,7 +23,7 @@ const waitExit = proc => new Promise(r => { proc.on('exit', code => r(code)); se
     HUB_DB_PATH: path.join(dir, 'hub.db'), PORT: String(HUB), HUB_PASSWORD: 'ptest-boot',
     PORTAL_KEY: PKEY,
   });
-  let app; let legacy;
+  let app; let legacy; const extras = [];
 
   try {
     await waitUp(`${HUB_API}/api/health`);
@@ -50,6 +50,27 @@ const waitExit = proc => new Promise(r => { proc.on('exit', code => r(code)); se
     });
     const code = await waitExit(bad);
     ok(code !== 0 && code !== null && /DOSE_SECRET_KEY/.test(bad.log), `boot refused, names the missing key (exit ${code})`);
+
+    section('misconfiguration diagnoses itself at the login screen');
+    // Portal key mismatch, and a hub missing PORTAL_KEY entirely — both must
+    // say what is wrong, not hide behind 'cannot reach the hub'.
+    const hubNoKey = startServer('hub', 'server.js', { HUB_DB_PATH: path.join(dir, 'hub-nokey.db'), PORT: '4536', HUB_PASSWORD: 'x' });
+    const appWrongKey = startServer('backend', 'server.js', {
+      DB_PATH: path.join(dir, 'wrongkey.db'), PORT: '4537', PORTAL_KEY: 'not-the-right-key',
+      DEFAULT_HUB_URL: HUB_API, DOSE_SECRET_KEY: 's1',
+    });
+    const appHubNoKey = startServer('backend', 'server.js', {
+      DB_PATH: path.join(dir, 'hubnokey.db'), PORT: '4538', PORTAL_KEY: PKEY,
+      DEFAULT_HUB_URL: 'http://127.0.0.1:4536', DOSE_SECRET_KEY: 's2',
+    });
+    extras.push(hubNoKey, appWrongKey, appHubNoKey);
+    await waitUp('http://127.0.0.1:4536/api/health');
+    await waitUp('http://127.0.0.1:4537/api/auth-status');
+    await waitUp('http://127.0.0.1:4538/api/auth-status');
+    r = await client('http://127.0.0.1:4537', 'x-dose-key')('POST', '/api/login', { username: ALPHA, password: 'alpha-pass-1' });
+    ok(r.status === 401 && /Invalid portal key/.test(r.body.error), `mismatched PORTAL_KEY names itself (${r.body.error})`);
+    r = await client('http://127.0.0.1:4538', 'x-dose-key')('POST', '/api/login', { username: ALPHA, password: 'alpha-pass-1' });
+    ok(r.status === 502 && /PORTAL_KEY is not set on the hub/.test(r.body.error), `hub without PORTAL_KEY names itself (${r.body.error})`);
 
     // ── The portal itself ──
     app = startServer('backend', 'server.js', {
@@ -225,6 +246,7 @@ const waitExit = proc => new Promise(r => { proc.on('exit', code => r(code)); se
     hub.kill();
     if (app) app.kill();
     if (legacy) try { legacy.kill(); } catch { /* already dead */ }
+    for (const p of extras) try { p.kill(); } catch { /* already dead */ }
   }
   finish();
 })();

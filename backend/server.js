@@ -773,6 +773,12 @@ app.post('/api/login', asyncRoute(async (req, res) => {
         return res.status(401).json({ error: err.message || 'Wrong username or password' });
       }
       if (err.hubStatus === 429) return res.status(429).json({ error: err.message });
+      if (err.hubStatus) {
+        // The hub ANSWERED with an error (e.g. 'PORTAL_KEY is not set on the
+        // hub') — say what it said. 'Cannot reach' would send whoever is
+        // debugging down the wrong road entirely.
+        return res.status(502).json({ error: `Roastery hub error: ${err.message}` });
+      }
       // Hub unreachable: accept recently verified credentials from the cache.
       const cached = db.prepare(
         "SELECT * FROM hub_login_cache WHERE username=? AND verified_at > datetime('now','-24 hours')"
