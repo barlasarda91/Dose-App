@@ -12,6 +12,7 @@ const j = client(API, 'x-hub-key');
   const dir = freshDir('hub');
   const server = startServer('hub', 'server.js', {
     HUB_DB_PATH: path.join(dir, 'hub.db'), PORT: String(PORT), HUB_PASSWORD: 'ptest-boot',
+    PORTAL_KEY: 'portal-master-key',
   });
   // Shop ingest uses its own bearer key, captured at shop creation.
   const ingest = async (key, body) => {
@@ -187,6 +188,65 @@ const j = client(API, 'x-hub-key');
     ok(r.items.some(i => i.id === plainId), 'restored coffee reappears for shops');
     r = await j('GET', '/api/activity', null, OWNER);
     ok(r.body.some(a => /archived catalog item "Sheetless Decaf"/.test(a.action)), 'archive audited');
+
+    section('portal API: one key, shop resolved per request');
+    const portal = async (method, p, body, key = 'portal-master-key') => {
+      const res = await fetch(`${API}/api/portal${p}`, {
+        method,
+        headers: { 'Content-Type': 'application/json', ...(key ? { Authorization: `Bearer ${key}` } : {}) },
+        ...(body ? { body: JSON.stringify(body) } : {}),
+      });
+      return { status: res.status, body: await res.json().catch(() => ({})) };
+    };
+    r = await portal('GET', '/shops', null, null);
+    ok(r.status === 401, 'portal without a key rejected');
+    r = await portal('GET', '/shops', null, 'not-the-portal-key');
+    ok(r.status === 401, 'wrong portal key rejected');
+    r = await portal('GET', '/shops');
+    const roster = r.body.find(s => s.id === 1);
+    ok(r.status === 200 && roster && roster.login_username === shopUname && roster.has_password === true,
+      'roster sync carries id, username, and password state');
+
+    r = await portal('POST', '/auth', { username: shopUname, password: 'fresh-after-call' });
+    ok(r.status === 200 && r.body.shop_id === 1 && r.body.shop_name === 'Pressure Shop',
+      'portal login resolves the shop from the username alone');
+    r = await portal('POST', '/auth', { username: shopUname, password: 'wrong-guess-1' });
+    ok(r.status === 401 && r.body.error === 'Wrong username or password', 'wrong password keeps the plain error');
+    r = await portal('POST', '/auth', { username: 'owner1', password: 'whatever-123' });
+    ok(r.status === 401 && /roastery account/.test(r.body.error), 'roastery username at the portal gets the wrong-door signpost');
+    r = await portal('POST', '/auth', { username: 'total-stranger', password: 'whatever-123' });
+    ok(r.status === 401 && !/roastery account/.test(r.body.error), 'unknown usernames keep the plain error (no probing)');
+
+    r = await portal('GET', '/catalog?shop_id=1');
+    ok(r.status === 200 && r.body.items.some(i => i.name === 'Blend No. 1'), 'portal catalog is the shop\'s own price list');
+    r = await portal('GET', '/catalog?shop_id=999');
+    ok(r.status === 404, 'unknown shop_id rejected');
+
+    r = await portal('POST', '/orders', { shop_id: 1, order_date: '2026-06-08', source_order_id: 91, items: [{ coffee_id: coffeeId, roast: 'espresso', lbs: 5 }] });
+    ok(r.status === 200 && r.body.hub_order_id, 'portal order lands');
+    r = await portal('POST', '/orders', { shop_id: 1, order_date: '2026-06-08', source_order_id: 91, items: [{ coffee_id: coffeeId, roast: 'espresso', lbs: 5 }] });
+    ok(r.status === 200 && r.body.duplicate === true, 'portal retry deduped like ingest');
+    r = await j('GET', '/api/orders', null, OWNER);
+    ok(r.body.find(o => o.source_order_id === 91 && o.shop_name === 'Pressure Shop'), 'portal order attributed to the right shop');
+    r = await portal('GET', '/order-status?shop_id=1&ids=91');
+    ok(r.status === 200 && r.body[0] && r.body[0].status === 'new', 'portal order-status polls through');
+
+    r = await portal('POST', '/change-password', { shop_id: 1, username: shopUname, current_password: 'nope-wrong', new_password: 'portal-changed-99' });
+    ok(r.status === 401, 'change-password demands the current password');
+    r = await portal('POST', '/change-password', { shop_id: 1, username: shopUname, current_password: 'fresh-after-call', new_password: 'portal-changed-99' });
+    ok(r.status === 200, 'shop changes its password through the portal');
+    r = await portal('POST', '/auth', { username: shopUname, password: 'portal-changed-99' });
+    ok(r.status === 200, 'new password works at the portal');
+    r = await shopAuth(shopUname, 'portal-changed-99');
+    ok(r.status === 200, 'same credential works on the legacy per-key path — one identity, two doors');
+
+    // The client-called-you scenario, portal edition: lockout dies with the reset.
+    for (let i = 0; i < 6; i++) await portal('POST', '/auth', { username: shopUname, password: 'typo-' + i });
+    r = await portal('POST', '/auth', { username: shopUname, password: 'portal-changed-99' });
+    ok(r.status === 429, 'hammering the portal locks the username');
+    await j('POST', `/api/shops/1/reset-login`, { new_password: 'post-reset-77' }, OWNER);
+    r = await portal('POST', '/auth', { username: shopUname, password: 'post-reset-77' });
+    ok(r.status === 200, 'roaster reset clears the portal lockout too');
 
     section('adjustment guards');
     r = await j('POST', '/api/on-hand/adjust', { coffee_id: coffeeId, profile: 'espresso', delta_lbs: 0 }, STAFF);

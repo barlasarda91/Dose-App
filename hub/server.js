@@ -272,6 +272,12 @@ function cleanEnv(v) {
 }
 const RESEND_KEY = cleanEnv(process.env.RESEND_API_KEY);
 
+// Master credential for the Dose Portal — the single shop-app deployment that
+// serves every shop. It authenticates once with this key and names the shop
+// per request; the per-shop-key /api/ingest/* endpoints stay for legacy
+// single-shop installs.
+const PORTAL_KEY = cleanEnv(process.env.PORTAL_KEY);
+
 // Boot + live diagnostics: which optional config the running process actually
 // has (booleans and lengths only — never values).
 function storageIsPersistent() {
@@ -292,6 +298,7 @@ const configReport = () => ({
   reply_to_set: !!cleanEnv(process.env.HUB_REPLY_TO),
   notify_email_set: !!cleanEnv(process.env.HUB_NOTIFY_EMAIL),
   password_set: !!process.env.HUB_PASSWORD,
+  portal_key_set: !!PORTAL_KEY,
   currency: CURRENCY,
 });
 console.log('Hub config:', JSON.stringify(configReport()));
@@ -631,63 +638,68 @@ app.get('/api/ingest/catalog', (req, res) => {
   res.json({ currency: CURRENCY, shop_name: shop.name, items: shopCatalog(shop.id) });
 });
 
+// The receiving core, shared by the legacy per-key ingest route and the
+// portal route — everything after "which shop is this?" is identical.
+async function receiveShopOrder(shop, b) {
+  if (!b.order_date) return { code: 400, payload: { error: 'order_date required' } };
+
+  let priced = null;
+  const legacyQty = {};
+  if (Array.isArray(b.items) && b.items.length) {
+    // Catalog order: hub validates visibility and computes prices itself.
+    try { priced = priceOrderItems(b.items, shopCatalog(shop.id)); }
+    catch (err) { return { code: 400, payload: { error: err.message } }; }
+  } else {
+    // Legacy pool-based order.
+    for (const k of ['espresso_lbs', 'drip_lbs', 'coldbrew_lbs', 'pourover_lbs']) legacyQty[k] = Math.max(0, parseFloat(b[k]) || 0);
+    if (Object.values(legacyQty).every(v => v === 0)) return { code: 400, payload: { error: 'Order has no quantities' } };
+  }
+
+  const totalLbs = priced ? priced.total_lbs
+    : Math.round(Object.values(legacyQty).reduce((s, v) => s + v, 0) * 10) / 10;
+
+  let orderId;
+  try {
+    const r = db.prepare(`INSERT INTO orders
+      (shop_id, order_date, requested_date, espresso_lbs, drip_lbs, coldbrew_lbs, pourover_lbs, total_lbs, total_cost, notes, placed_by, source_order_id)
+      VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`)
+      .run(shop.id, String(b.order_date),
+        b.requested_date ? String(b.requested_date) : null,
+        legacyQty.espresso_lbs || 0, legacyQty.drip_lbs || 0, legacyQty.coldbrew_lbs || 0, legacyQty.pourover_lbs || 0,
+        totalLbs, priced ? priced.total_cost : null,
+        b.notes ? String(b.notes).slice(0, 500) : null,
+        b.placed_by ? String(b.placed_by).slice(0, 64) : null,
+        b.source_order_id != null ? parseInt(b.source_order_id, 10) : null);
+    orderId = r.lastInsertRowid;
+  } catch (err) {
+    if (String(err.message).includes('UNIQUE')) return { code: 200, payload: { ok: true, duplicate: true } };
+    throw err;
+  }
+
+  if (priced) {
+    const ins = db.prepare('INSERT INTO order_items (order_id, coffee_id, coffee_name, roast, lbs, bags, price_per_lb, line_total) VALUES (?,?,?,?,?,?,?,?)');
+    for (const i of priced.items) ins.run(orderId, i.coffee_id, i.coffee_name, i.roast, i.lbs, i.bags ?? null, i.price_per_lb, i.line_total);
+  }
+
+  // Receipt email to the shop's registered address; copy to the roastery.
+  const order = db.prepare('SELECT * FROM orders WHERE id=?').get(orderId);
+  const items = db.prepare('SELECT * FROM order_items WHERE order_id=?').all(orderId);
+  const receipt = await sendEmail(shop.email, `Order received — ${shop.name} — ${order.order_date}`,
+    orderEmailHtml(order, items, shop, 'Order Received', 'Your order has been received by the roastery. You will get another email when it is confirmed.', { stage: 'Received' }));
+  if (process.env.HUB_NOTIFY_EMAIL) {
+    await sendEmail(process.env.HUB_NOTIFY_EMAIL, `New order — ${shop.name} — ${order.order_date}`,
+      orderEmailHtml(order, items, shop, 'New Order', null));
+  }
+
+  return { code: 200, payload: { ok: true, hub_order_id: orderId, total_lbs: totalLbs, total_cost: priced ? priced.total_cost : null, receipt } };
+}
+
 app.post('/api/ingest/orders', async (req, res) => {
   try {
     const shop = shopFromBearer(req);
     if (!shop) return res.status(401).json({ error: 'Invalid shop API key' });
-
-    const b = req.body || {};
-    if (!b.order_date) return res.status(400).json({ error: 'order_date required' });
-
-    let priced = null;
-    const legacyQty = {};
-    if (Array.isArray(b.items) && b.items.length) {
-      // Catalog order: hub validates visibility and computes prices itself.
-      try { priced = priceOrderItems(b.items, shopCatalog(shop.id)); }
-      catch (err) { return res.status(400).json({ error: err.message }); }
-    } else {
-      // Legacy pool-based order.
-      for (const k of ['espresso_lbs', 'drip_lbs', 'coldbrew_lbs', 'pourover_lbs']) legacyQty[k] = Math.max(0, parseFloat(b[k]) || 0);
-      if (Object.values(legacyQty).every(v => v === 0)) return res.status(400).json({ error: 'Order has no quantities' });
-    }
-
-    const totalLbs = priced ? priced.total_lbs
-      : Math.round(Object.values(legacyQty).reduce((s, v) => s + v, 0) * 10) / 10;
-
-    let orderId;
-    try {
-      const r = db.prepare(`INSERT INTO orders
-        (shop_id, order_date, requested_date, espresso_lbs, drip_lbs, coldbrew_lbs, pourover_lbs, total_lbs, total_cost, notes, placed_by, source_order_id)
-        VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`)
-        .run(shop.id, String(b.order_date),
-          b.requested_date ? String(b.requested_date) : null,
-          legacyQty.espresso_lbs || 0, legacyQty.drip_lbs || 0, legacyQty.coldbrew_lbs || 0, legacyQty.pourover_lbs || 0,
-          totalLbs, priced ? priced.total_cost : null,
-          b.notes ? String(b.notes).slice(0, 500) : null,
-          b.placed_by ? String(b.placed_by).slice(0, 64) : null,
-          b.source_order_id != null ? parseInt(b.source_order_id, 10) : null);
-      orderId = r.lastInsertRowid;
-    } catch (err) {
-      if (String(err.message).includes('UNIQUE')) return res.json({ ok: true, duplicate: true });
-      throw err;
-    }
-
-    if (priced) {
-      const ins = db.prepare('INSERT INTO order_items (order_id, coffee_id, coffee_name, roast, lbs, bags, price_per_lb, line_total) VALUES (?,?,?,?,?,?,?,?)');
-      for (const i of priced.items) ins.run(orderId, i.coffee_id, i.coffee_name, i.roast, i.lbs, i.bags ?? null, i.price_per_lb, i.line_total);
-    }
-
-    // Receipt email to the shop's registered address; copy to the roastery.
-    const order = db.prepare('SELECT * FROM orders WHERE id=?').get(orderId);
-    const items = db.prepare('SELECT * FROM order_items WHERE order_id=?').all(orderId);
-    const receipt = await sendEmail(shop.email, `Order received — ${shop.name} — ${order.order_date}`,
-      orderEmailHtml(order, items, shop, 'Order Received', 'Your order has been received by the roastery. You will get another email when it is confirmed.', { stage: 'Received' }));
-    if (process.env.HUB_NOTIFY_EMAIL) {
-      await sendEmail(process.env.HUB_NOTIFY_EMAIL, `New order — ${shop.name} — ${order.order_date}`,
-        orderEmailHtml(order, items, shop, 'New Order', null));
-    }
-
-    res.json({ ok: true, hub_order_id: orderId, total_lbs: totalLbs, total_cost: priced ? priced.total_cost : null, receipt });
+    const { code, payload } = await receiveShopOrder(shop, req.body || {});
+    res.status(code).json(payload);
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: err.message });
@@ -699,9 +711,10 @@ app.post('/api/ingest/orders', async (req, res) => {
 // local accounts until a password is set in the hub.
 // A reset re-establishes identity — stale brute-force lockouts must not
 // keep the freshly-reset password from working.
-function clearShopAuthLocks(shopId) {
+function clearShopAuthLocks(shop) {
   for (const key of [...loginFailures.keys()]) {
-    if (key.startsWith(`shopauth:${shopId}:`)) loginFailures.delete(key);
+    if (key.startsWith(`shopauth:${shop.id}:`) ||
+        (shop.login_username && key === `shopauth:portal:${shop.login_username}`)) loginFailures.delete(key);
   }
 }
 
@@ -770,6 +783,115 @@ app.get('/api/ingest/order-status', (req, res) => {
   res.json(rows);
 });
 
+// ─── Portal API (single-URL shop app; PORTAL_KEY master credential) ──────────
+// One trusted deployment serves every shop: it authenticates with PORTAL_KEY
+// and names the shop per request. Who a login belongs to is resolved HERE by
+// username — the whole "right password, wrong deployment" failure class from
+// per-shop URLs cannot happen.
+app.use('/api/portal', (req, res, next) => {
+  if (!PORTAL_KEY) return res.status(503).json({ error: 'PORTAL_KEY is not set on the hub' });
+  const auth = req.get('authorization') || '';
+  const key = auth.startsWith('Bearer ') ? auth.slice(7).trim() : '';
+  if (!key || !safeEqual(key, PORTAL_KEY)) return res.status(401).json({ error: 'Invalid portal key' });
+  next();
+});
+
+// Portal requests name their shop by the HUB's shop id (the portal mirrors
+// the roster via /api/portal/shops, so ids always agree).
+function portalShop(req, res) {
+  const id = parseInt(req.query.shop_id ?? (req.body || {}).shop_id, 10);
+  const shop = Number.isFinite(id) ? db.prepare('SELECT * FROM shops WHERE id=?').get(id) : null;
+  if (!shop) res.status(404).json({ error: 'Unknown shop_id' });
+  return shop;
+}
+
+// Roster sync: everything the portal needs to mirror shops locally.
+app.get('/api/portal/shops', (req, res) => {
+  res.json(db.prepare('SELECT * FROM shops ORDER BY id').all().map(s => ({
+    id: s.id, name: s.name, login_username: s.login_username || null,
+    has_password: !!s.password_hash,
+  })));
+});
+
+// Login: the username alone decides which shop this is.
+app.post('/api/portal/auth', async (req, res) => {
+  try {
+    const username = String((req.body && req.body.username) || '').toLowerCase().trim();
+    const password = (req.body && req.body.password) || '';
+    const lockKey = `shopauth:portal:${username}`;
+    const wait = lockedFor(lockKey);
+    if (wait > 0) return res.status(429).json({ error: `Too many attempts — try again in ${wait}s` });
+    const shop = username ? db.prepare('SELECT * FROM shops WHERE login_username=?').get(username) : null;
+    if (shop && !shop.password_hash)
+      return res.status(409).json({ error: 'This shop has no login password yet — ask the roastery to send a password invite.' });
+    const okPw = shop ? await verifyShopPassword(shop, password) : (await hashPassword('timing-equalizer'), false);
+    if (!okPw) {
+      recordFailure(lockKey);
+      if (shop) db.prepare("UPDATE shops SET last_auth_fail_at=datetime('now'), auth_fail_count=COALESCE(auth_fail_count,0)+1 WHERE id=?").run(shop.id);
+      // Wrong door: roastery people sign in at the hub, not the shop portal.
+      if (!shop && db.prepare('SELECT 1 FROM hub_users WHERE username=?').get(username)) {
+        return res.status(401).json({ error: `"${username}" is a roastery account — sign in at the Dose Hub dashboard, not the shop app.` });
+      }
+      return res.status(401).json({ error: 'Wrong username or password' });
+    }
+    loginFailures.delete(lockKey);
+    db.prepare("UPDATE shops SET last_auth_ok_at=datetime('now') WHERE id=?").run(shop.id);
+    res.json({ ok: true, shop_id: shop.id, shop_name: shop.name, username: shop.login_username, role: 'admin' });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.get('/api/portal/catalog', (req, res) => {
+  const shop = portalShop(req, res);
+  if (!shop) return;
+  res.json({ currency: CURRENCY, shop_name: shop.name, items: shopCatalog(shop.id) });
+});
+
+app.post('/api/portal/orders', async (req, res) => {
+  try {
+    const shop = portalShop(req, res);
+    if (!shop) return;
+    const { code, payload } = await receiveShopOrder(shop, req.body || {});
+    res.status(code).json(payload);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.get('/api/portal/order-status', (req, res) => {
+  const shop = portalShop(req, res);
+  if (!shop) return;
+  const ids = String(req.query.ids || '').split(',').map(s => parseInt(s, 10)).filter(Number.isFinite).slice(0, 200);
+  if (!ids.length) return res.json([]);
+  res.json(db.prepare(
+    `SELECT source_order_id, status FROM orders WHERE shop_id=? AND source_order_id IN (${ids.map(() => '?').join(',')})`
+  ).all(shop.id, ...ids));
+});
+
+app.post('/api/portal/change-password', async (req, res) => {
+  try {
+    const shop = portalShop(req, res);
+    if (!shop) return;
+    const { username, current_password, new_password } = req.body || {};
+    if (String(username || '').toLowerCase().trim() !== (shop.login_username || '') ||
+        !(await verifyShopPassword(shop, current_password || ''))) {
+      return res.status(401).json({ error: 'Current password is wrong' });
+    }
+    if (String(new_password || '').length < SHOP_PASSWORD_MIN)
+      return res.status(400).json({ error: `Password must be at least ${SHOP_PASSWORD_MIN} characters` });
+    const { salt, hash } = await hashPassword(new_password);
+    db.prepare('UPDATE shops SET password_hash=?, salt=? WHERE id=?').run(hash, salt, shop.id);
+    clearShopAuthLocks(shop);
+    res.json({ ok: true });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // ─── Public invite endpoints (token-authenticated, no session) ───────────────
 function shopFromInviteToken(token) {
   if (!token) return null;
@@ -794,7 +916,7 @@ app.post('/api/public/set-password', async (req, res) => {
     const { salt, hash } = await hashPassword(password);
     db.prepare('UPDATE shops SET password_hash=?, salt=?, invite_token_hash=NULL, invite_expires_at=NULL WHERE id=?')
       .run(hash, salt, shop.id);
-    clearShopAuthLocks(shop.id);
+    clearShopAuthLocks(shop);
     db.prepare('INSERT INTO audit_log (username, action) VALUES (?, ?)')
       .run('shop', `"${shop.name}" set a new password via its invite link`);
     res.json({ ok: true, login_username: shop.login_username, shop_name: shop.name });
@@ -806,7 +928,7 @@ app.post('/api/public/set-password', async (req, res) => {
 
 // ─── Dashboard auth gate ──────────────────────────────────────────────────────
 app.use('/api', (req, res, next) => {
-  if (['/login', '/setup-owner', '/auth-mode'].includes(req.path) || req.path.startsWith('/ingest/') || req.path.startsWith('/public/')) return next();
+  if (['/login', '/setup-owner', '/auth-mode'].includes(req.path) || req.path.startsWith('/ingest/') || req.path.startsWith('/public/') || req.path.startsWith('/portal/')) return next();
   const token = req.get('x-hub-key') || '';
   const row = token && db.prepare(
     `SELECT u.id, u.username, u.role, u.must_change_password
@@ -1152,7 +1274,7 @@ app.post('/api/shops/:id/reset-login', requireOwner, async (req, res) => {
     const loginUsername = shop.login_username || genLoginUsername(shop.name);
     const { salt, hash } = await hashPassword(password);
     db.prepare('UPDATE shops SET login_username=?, password_hash=?, salt=? WHERE id=?').run(loginUsername, hash, salt, shop.id);
-    clearShopAuthLocks(shop.id);
+    clearShopAuthLocks(db.prepare('SELECT * FROM shops WHERE id=?').get(shop.id)); // fresh row — the username may just have been backfilled
     audit(req, `reset the shop login for "${shop.name}"`);
     res.json({ ok: true, login_username: loginUsername });
   } catch (err) {
