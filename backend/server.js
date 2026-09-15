@@ -381,7 +381,6 @@ function seedShopSettings(shopId) {
   for (const [k, v] of DEFAULT_SHOP_SETTINGS)
     db.prepare('INSERT OR IGNORE INTO settings (shop_id, key, value) VALUES (?,?,?)').run(shopId, k, v);
 }
-seedShopSettings(1);
 
 db.exec(`
   CREATE INDEX IF NOT EXISTS idx_recipes_shop    ON drink_recipes(shop_id);
@@ -391,11 +390,20 @@ db.exec(`
   CREATE INDEX IF NOT EXISTS idx_standing_shop   ON standing_orders(shop_id);
 `);
 
-// Shop 1 always exists — it's this deployment's (only) shop until the portal
-// build syncs the roster from the hub.
-if (db.prepare('SELECT COUNT(*) AS n FROM shops').get().n === 0) {
-  const nameRow = db.prepare("SELECT value FROM settings WHERE shop_id=1 AND key='shop_name'").get();
-  db.prepare('INSERT INTO shops (id, name) VALUES (1, ?)').run((nameRow && nameRow.value) || '');
+// Shop 1 exists on every single-shop deployment, and on any database that
+// migrated into the portal CARRYING data (so its rows keep an owner and the
+// legacy-linking can claim them). A born-portal database seeds nothing —
+// its shops arrive from the hub on first login.
+{
+  const hasShop1Data = ['users', 'drink_recipes', 'coffee_deliveries', 'coffee_orders', 'standing_orders']
+    .some(t => db.prepare(`SELECT COUNT(*) AS n FROM ${t} WHERE shop_id=1`).get().n > 0);
+  if (!PORTAL_MODE || hasShop1Data) {
+    seedShopSettings(1);
+    if (db.prepare('SELECT COUNT(*) AS n FROM shops').get().n === 0) {
+      const nameRow = db.prepare("SELECT value FROM settings WHERE shop_id=1 AND key='shop_name'").get();
+      db.prepare('INSERT INTO shops (id, name) VALUES (1, ?)').run((nameRow && nameRow.value) || '');
+    }
+  }
 }
 
 const { promisify } = require('util');
@@ -731,6 +739,19 @@ app.post('/api/login', asyncRoute(async (req, res) => {
   if (wait > 0) return res.status(429).json({ error: `Too many attempts — try again in ${wait}s` });
 
   if (PORTAL_MODE) {
+    // Shop-local staff accounts (created by a shop admin, not the hub) are
+    // checked first: they are portal-unique by construction, and they keep
+    // working when the hub is down. Failed local checks fall through to the
+    // hub — a hub shop's username is never shadowed by a wrong password.
+    const locals = db.prepare("SELECT * FROM users WHERE username=? AND source='local'").all(uname);
+    if (locals.length === 1) {
+      const cand = locals[0];
+      const { hash } = await hashPassword(password || '', cand.salt);
+      if (crypto.timingSafeEqual(Buffer.from(hash, 'hex'), Buffer.from(cand.password_hash, 'hex'))) {
+        clearFailures(ipKey, userKey);
+        return res.json({ ok: true, token: issueToken(cand.id), user: publicUser(cand) });
+      }
+    }
     // The hub resolves which shop this username belongs to — one URL for
     // everyone, no wrong-deployment failure mode. The hub also rate-limits
     // per username, so nothing is counted locally.
@@ -856,6 +877,10 @@ app.post('/api/users', requireAdmin, asyncRoute(async (req, res) => {
   const r = role === 'admin' ? 'admin' : 'user';
   if (!USERNAME_RE.test(uname)) return res.status(400).json({ error: 'Username: 3–32 chars, letters/numbers/._- only' });
   if (String(password || '').length < PASSWORD_MIN[r]) return res.status(400).json({ error: passwordPolicyError(r) });
+  // On the portal every shop shares one login screen, so staff usernames
+  // must be unique across the whole deployment, not just within the shop.
+  if (PORTAL_MODE && db.prepare('SELECT 1 FROM users WHERE username=?').get(uname))
+    return res.status(400).json({ error: 'Username already taken — pick another (usernames are shared across the whole portal)' });
   try {
     res.json(publicUser(await createUser(uname, password, r, req.shopId)));
   } catch (err) {

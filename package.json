@@ -8,8 +8,9 @@
     "test:unit": "node backend/calc.test.js",
     "test:shop": "node tests/shop.test.js",
     "test:hub": "node tests/hub.test.js",
+    "test:portal": "node tests/portal.test.js",
     "test:ui": "node tests/hub-ui.test.js",
-    "test": "npm run test:unit && npm run test:shop && npm run test:hub && npm run test:ui"
+    "test": "npm run test:unit && npm run test:shop && npm run test:hub && npm run test:portal && npm run test:ui"
   },
   "engines": {
     "node": ">=18"
