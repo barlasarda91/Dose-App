@@ -19,6 +19,14 @@ app.use(express.json());
 // self-hosted setups, but the UI only asks for the key.
 const DEFAULT_HUB_URL = (process.env.DEFAULT_HUB_URL || 'https://dosehub.up.railway.app').replace(/\/+$/, '');
 
+// ─── Portal mode ─────────────────────────────────────────────────────────────
+// With PORTAL_KEY set, this deployment is the Dose Portal: ONE URL serving
+// every shop. Logins resolve their shop at the hub, and every query runs
+// inside the session's shop. Without it, this is a classic single-shop
+// deployment (everything is shop 1) and nothing changes.
+const PORTAL_KEY = (process.env.PORTAL_KEY || '').trim();
+const PORTAL_MODE = !!PORTAL_KEY;
+
 const dbPath = process.env.DB_PATH || '/app/data/dose.db';
 require('fs').mkdirSync(require('path').dirname(dbPath), { recursive: true });
 const db = new Database(dbPath);
@@ -186,6 +194,14 @@ const SECRET_KEY = process.env.DOSE_SECRET_KEY
   ? crypto.createHash('sha256').update(process.env.DOSE_SECRET_KEY).digest()
   : null;
 
+// The portal holds every shop's Square and email credentials in one database
+// — running it without encryption at rest is not an acceptable failure mode.
+if (PORTAL_MODE && !SECRET_KEY) {
+  console.error('FATAL: portal mode (PORTAL_KEY) requires DOSE_SECRET_KEY to be set,');
+  console.error('so per-shop credentials are encrypted at rest. Set DOSE_SECRET_KEY and redeploy.');
+  process.exit(1);
+}
+
 function encryptSecret(plain) {
   if (!SECRET_KEY || !plain) return plain;
   const iv = crypto.randomBytes(12);
@@ -203,8 +219,8 @@ function decryptSecret(stored) {
   return Buffer.concat([decipher.update(Buffer.from(dataB64, 'base64')), decipher.final()]).toString('utf8');
 }
 
-function getSecret(settingKey, envName) {
-  const v = (getSettings()[settingKey] || '').trim();
+function getSecret(settingKey, envName, shopId = DEFAULT_SHOP_ID) {
+  const v = (getSettings(shopId)[settingKey] || '').trim();
   if (v) return decryptSecret(v);
   return process.env[envName] || '';
 }
@@ -354,12 +370,18 @@ rebuildForShopId('ignored_square_items', `CREATE TABLE ignored_square_items (
   }
 }
 
-// Per-shop defaults (fresh installs and migrated databases alike).
-for (const [k, v] of [
+// Per-shop defaults (fresh installs, migrated databases, and shops the
+// portal creates on their first login).
+const DEFAULT_SHOP_SETTINGS = [
   ['alt_milk_ml_per_modifier', '180'], ['square_location_id', ''],
   ['numilk_oat_liters_per_day', '0'], ['numilk_almond_liters_per_day', '0'],
   ['shop_name', ''], ['order_email_to', 'hello@boxxcoffee.com'], ['order_email_from', ''],
-]) db.prepare('INSERT OR IGNORE INTO settings (shop_id, key, value) VALUES (1,?,?)').run(k, v);
+];
+function seedShopSettings(shopId) {
+  for (const [k, v] of DEFAULT_SHOP_SETTINGS)
+    db.prepare('INSERT OR IGNORE INTO settings (shop_id, key, value) VALUES (?,?,?)').run(shopId, k, v);
+}
+seedShopSettings(1);
 
 db.exec(`
   CREATE INDEX IF NOT EXISTS idx_recipes_shop    ON drink_recipes(shop_id);
@@ -427,8 +449,8 @@ async function verifyUser(username, password, shopId = DEFAULT_SHOP_ID) {
 // When a roastery hub is connected, credentials are verified against the hub
 // (the hub is the identity provider). A successful login is cached (hashed)
 // for 24h so a hub outage doesn't lock out people who logged in recently.
-function isHubConfigured(cfg) {
-  return !!hubConn(cfg).key; // the URL always resolves (default hub)
+function isHubConfigured(cfg, shopId = DEFAULT_SHOP_ID) {
+  return PORTAL_MODE || !!hubConn(cfg, shopId).key; // the URL always resolves (default hub)
 }
 
 // Hub identities get a local user row so sessions, created_by stamps, and
@@ -543,6 +565,7 @@ const OPEN_PATHS = new Set(['/login', '/setup', '/auth-status']);
 
 app.use('/api', (req, res, next) => {
   if (OPEN_PATHS.has(req.path)) return next();
+  if (req.path.startsWith('/operator/')) return next(); // operator routes carry their own key check
   const token = req.get('x-dose-key') || '';
   const row = token && db.prepare(
     `SELECT s.token AS thash, s.expires_at, u.id, u.username, u.role, u.tour_seen_at, u.shop_id
@@ -607,25 +630,46 @@ function backupStatus() {
   return { count: files.length, last, age_hours: Math.round((Date.now() - st.mtimeMs) / 36e5 * 10) / 10 };
 }
 
-app.get('/api/backups', requireAdmin, (req, res) => {
+const backupList = (req, res) => {
   const files = listBackups().map(f => {
     const st = fsb.statSync(path.join(BACKUP_DIR, f));
     return { file: f, bytes: st.size, modified: st.mtime.toISOString() };
   });
   res.json({ ...backupStatus(), keep: BACKUP_KEEP, persistent_storage: storageIsPersistent(), files });
-});
-
-app.post('/api/backups/run', requireAdmin, asyncRoute(async (req, res) => {
-  res.json(await runBackup({ force: true }));
-}));
-
-app.get('/api/backups/download', requireAdmin, (req, res) => {
+};
+const backupRun = asyncRoute(async (req, res) => res.json(await runBackup({ force: true })));
+const backupDownload = (req, res) => {
   const files = listBackups();
   if (!files.length) return res.status(404).json({ error: 'No backups yet' });
   const name = req.query.file && BACKUP_RE.test(req.query.file) && files.includes(req.query.file)
     ? req.query.file : files[files.length - 1];
   res.download(path.join(BACKUP_DIR, name), name);
-});
+};
+
+// On the portal, one backup file holds EVERY shop's data — a shop admin must
+// not be able to touch it. Backups become operator-only: the /api/operator/*
+// routes skip the session gate and demand the OPERATOR_KEY header instead.
+const OPERATOR_KEY = (process.env.OPERATOR_KEY || '').trim();
+function requireOperator(req, res, next) {
+  if (!OPERATOR_KEY) return res.status(503).json({ error: 'OPERATOR_KEY is not set on the server' });
+  const given = String(req.get('x-operator-key') || '');
+  const okKey = crypto.timingSafeEqual(
+    crypto.createHash('sha256').update(given).digest(),
+    crypto.createHash('sha256').update(OPERATOR_KEY).digest()
+  );
+  if (!okKey) return res.status(403).json({ error: 'Invalid operator key' });
+  next();
+}
+const shopBackupAccess = (req, res, next) => PORTAL_MODE
+  ? res.status(403).json({ error: 'Backups are operator-only on the portal — use /api/operator/backups with the operator key' })
+  : requireAdmin(req, res, next);
+
+app.get('/api/backups', shopBackupAccess, backupList);
+app.post('/api/backups/run', shopBackupAccess, backupRun);
+app.get('/api/backups/download', shopBackupAccess, backupDownload);
+app.get('/api/operator/backups', requireOperator, backupList);
+app.post('/api/operator/backups/run', requireOperator, backupRun);
+app.get('/api/operator/backups/download', requireOperator, backupDownload);
 
 app.get('/api/auth-status', (req, res) => {
   const hubMode = isHubConfigured(getSettings());
@@ -685,6 +729,40 @@ app.post('/api/login', asyncRoute(async (req, res) => {
   const userKey = `u:${uname}`;
   const wait = Math.max(lockedFor(ipKey), lockedFor(userKey));
   if (wait > 0) return res.status(429).json({ error: `Too many attempts — try again in ${wait}s` });
+
+  if (PORTAL_MODE) {
+    // The hub resolves which shop this username belongs to — one URL for
+    // everyone, no wrong-deployment failure mode. The hub also rate-limits
+    // per username, so nothing is counted locally.
+    try {
+      const auth = await portalFetch('/api/portal/auth', {
+        method: 'POST', body: JSON.stringify({ username: uname, password: password || '' }),
+      });
+      const shopId = await ensureLocalShop(auth.shop_id, auth.shop_name);
+      const u = upsertHubUser(auth.username, auth.role || 'admin', shopId);
+      await cacheHubLogin(auth.username, password || '', auth.role || 'admin', shopId);
+      clearFailures(ipKey, userKey);
+      return res.json({ ok: true, token: issueToken(u.id), user: publicUser(u) });
+    } catch (err) {
+      if (err.hubStatus === 401 || err.hubStatus === 409) {
+        return res.status(401).json({ error: err.message || 'Wrong username or password' });
+      }
+      if (err.hubStatus === 429) return res.status(429).json({ error: err.message });
+      // Hub unreachable: accept recently verified credentials from the cache.
+      const cached = db.prepare(
+        "SELECT * FROM hub_login_cache WHERE username=? AND verified_at > datetime('now','-24 hours')"
+      ).get(uname);
+      if (cached) {
+        const { hash } = await hashPassword(password || '', cached.salt);
+        if (crypto.timingSafeEqual(Buffer.from(hash, 'hex'), Buffer.from(cached.password_hash, 'hex'))) {
+          const u = upsertHubUser(cached.username, cached.role, cached.shop_id);
+          clearFailures(ipKey, userKey);
+          return res.json({ ok: true, token: issueToken(u.id), user: publicUser(u), cached: true });
+        }
+      }
+      return res.status(502).json({ error: 'Cannot reach the roastery hub to verify your login — try again shortly.' });
+    }
+  }
 
   if (hubMode) {
     let hubUser = null;
@@ -749,16 +827,12 @@ app.post('/api/change-password', asyncRoute(async (req, res) => {
   const u = db.prepare('SELECT * FROM users WHERE id=?').get(req.user.id);
 
   if (u.source === 'hub') {
-    const cfg = getSettings();
     try {
-      await hubFetch(cfg, '/api/ingest/change-password', {
-        method: 'POST',
-        body: JSON.stringify({ username: u.username, current_password: current_password || '', new_password: new_password || '' }),
-      });
+      await hubPasswordChange(u.shop_id, { username: u.username, current_password: current_password || '', new_password: new_password || '' });
     } catch (err) {
       return res.status(err.hubStatus === 401 ? 401 : err.hubStatus === 400 ? 400 : 502).json({ error: err.message });
     }
-    await cacheHubLogin(u.username, new_password, u.role);
+    await cacheHubLogin(u.username, new_password, u.role, u.shop_id);
     db.prepare('DELETE FROM sessions WHERE user_id=?').run(u.id);
     return res.json({ ok: true, token: issueToken(u.id) });
   }
@@ -771,9 +845,9 @@ app.post('/api/change-password', asyncRoute(async (req, res) => {
   res.json({ ok: true, token: issueToken(u.id) });
 }));
 
-// ─── User management (admin only) ────────────────────────────────────────────
+// ─── User management (admin only, within the admin's own shop) ───────────────
 app.get('/api/users', requireAdmin, (req, res) => {
-  res.json(db.prepare('SELECT id, username, role, created_at FROM users ORDER BY username').all());
+  res.json(db.prepare('SELECT id, username, role, created_at FROM users WHERE shop_id=? ORDER BY username').all(req.shopId));
 });
 
 app.post('/api/users', requireAdmin, asyncRoute(async (req, res) => {
@@ -783,7 +857,7 @@ app.post('/api/users', requireAdmin, asyncRoute(async (req, res) => {
   if (!USERNAME_RE.test(uname)) return res.status(400).json({ error: 'Username: 3–32 chars, letters/numbers/._- only' });
   if (String(password || '').length < PASSWORD_MIN[r]) return res.status(400).json({ error: passwordPolicyError(r) });
   try {
-    res.json(publicUser(await createUser(uname, password, r)));
+    res.json(publicUser(await createUser(uname, password, r, req.shopId)));
   } catch (err) {
     if (String(err.message).includes('UNIQUE')) return res.status(400).json({ error: 'Username already exists' });
     throw err;
@@ -791,7 +865,7 @@ app.post('/api/users', requireAdmin, asyncRoute(async (req, res) => {
 }));
 
 app.post('/api/users/:id/reset-password', requireAdmin, asyncRoute(async (req, res) => {
-  const target = db.prepare('SELECT * FROM users WHERE id=?').get(req.params.id);
+  const target = db.prepare('SELECT * FROM users WHERE id=? AND shop_id=?').get(req.params.id, req.shopId);
   if (!target) return res.status(404).json({ error: 'User not found' });
   const { new_password } = req.body || {};
   if (String(new_password || '').length < (PASSWORD_MIN[target.role] || 6)) return res.status(400).json({ error: passwordPolicyError(target.role) });
@@ -802,10 +876,10 @@ app.post('/api/users/:id/reset-password', requireAdmin, asyncRoute(async (req, r
 }));
 
 app.delete('/api/users/:id', requireAdmin, (req, res) => {
-  const target = db.prepare('SELECT * FROM users WHERE id=?').get(req.params.id);
+  const target = db.prepare('SELECT * FROM users WHERE id=? AND shop_id=?').get(req.params.id, req.shopId);
   if (!target) return res.status(404).json({ error: 'User not found' });
   if (target.id === req.user.id) return res.status(400).json({ error: 'You cannot delete your own account' });
-  const admins = db.prepare("SELECT COUNT(*) AS n FROM users WHERE role='admin'").get().n;
+  const admins = db.prepare("SELECT COUNT(*) AS n FROM users WHERE role='admin' AND shop_id=?").get(req.shopId).n;
   if (target.role === 'admin' && admins <= 1) return res.status(400).json({ error: 'Cannot delete the last admin' });
   db.prepare('DELETE FROM sessions WHERE user_id=?').run(target.id);
   db.prepare('DELETE FROM users WHERE id=?').run(target.id);
@@ -817,18 +891,19 @@ const SECRET_SETTINGS = ['square_access_token', 'resend_api_key', 'hub_api_key']
 const HIDDEN_SETTINGS = new Set([...SECRET_SETTINGS, 'auth_password_hash', 'auth_salt']);
 
 app.get('/api/settings', (req, res) => {
-  const cfg = getSettings();
+  const cfg = getSettings(req.shopId);
   const s = {};
   for (const [k, v] of Object.entries(cfg)) if (!HIDDEN_SETTINGS.has(k)) s[k] = v;
   // Secrets are reported as configured/not — never echoed back
-  s.square_token_set  = !!getSecret('square_access_token', 'SQUARE_ACCESS_TOKEN');
+  s.square_token_set  = !!getSecret('square_access_token', 'SQUARE_ACCESS_TOKEN', req.shopId);
   s.square_token_source = (cfg.square_access_token || '').trim() ? 'settings'
     : (process.env.SQUARE_ACCESS_TOKEN ? 'env' : null);
-  s.resend_configured = !!getSecret('resend_api_key', 'RESEND_API_KEY');
+  s.resend_configured = !!getSecret('resend_api_key', 'RESEND_API_KEY', req.shopId);
   s.resend_source = (cfg.resend_api_key || '').trim() ? 'settings'
     : (process.env.RESEND_API_KEY ? 'env' : null);
-  s.hub_configured = !!getSecret('hub_api_key', 'HUB_API_KEY');
+  s.hub_configured = isHubConfigured(cfg, req.shopId);
   s.auth_mode = s.hub_configured ? 'hub' : 'local';
+  s.portal_mode = PORTAL_MODE;
   s.password_protected = true; // login is always required
   s.storage_persistent = process.env.NODE_ENV === 'production' ? storageIsPersistent() : true;
   res.json(s);
@@ -847,41 +922,42 @@ app.post('/api/settings', (req, res) => {
   for (const key of allowed) {
     if (req.body[key] === undefined) continue;
     const value = String(req.body[key]).trim();
-    setSetting(key, SECRET_SETTINGS.includes(key) ? encryptSecret(value) : value);
+    setSetting(key, SECRET_SETTINGS.includes(key) ? encryptSecret(value) : value, req.shopId);
   }
-  if (req.body.square_access_token !== undefined) cachedLocations = null; // token changed → re-resolve locations
-  if (req.body.hub_url !== undefined || req.body.hub_api_key !== undefined) catalogCache = { at: 0, data: null };
+  if (req.body.square_access_token !== undefined) locationCaches.delete(req.shopId); // token changed → re-resolve locations
+  if (req.body.hub_url !== undefined || req.body.hub_api_key !== undefined) catalogCaches.delete(req.shopId);
   res.json({ success: true });
 });
 
 // ─── Square helpers ───────────────────────────────────────────────────────────
 // Overridable so integration tests can point the app at a mock Square server.
 const SQUARE_BASE = process.env.SQUARE_BASE_URL || 'https://connect.squareup.com';
-let cachedLocations = null;
+const locationCaches = new Map(); // shopId → active locations
 
-function getSquareToken() {
-  const token = getSecret('square_access_token', 'SQUARE_ACCESS_TOKEN');
+function getSquareToken(shopId) {
+  const token = getSecret('square_access_token', 'SQUARE_ACCESS_TOKEN', shopId);
   if (!token) throw new Error('Square access token not set — add it on the Settings page');
   return token;
 }
 
-async function getLocations() {
-  if (cachedLocations) return cachedLocations;
+async function getLocations(shopId) {
+  if (locationCaches.has(shopId)) return locationCaches.get(shopId);
   const res = await fetch(`${SQUARE_BASE}/v2/locations`, {
-    headers: { 'Authorization': `Bearer ${getSquareToken()}`, 'Square-Version': '2024-01-17' }
+    headers: { 'Authorization': `Bearer ${getSquareToken(shopId)}`, 'Square-Version': '2024-01-17' }
   });
   const data = await res.json();
   if (data.errors) throw new Error(data.errors[0]?.detail || 'Failed to fetch locations');
-  cachedLocations = (data.locations || []).filter(l => l.status === 'ACTIVE');
-  return cachedLocations;
+  const locs = (data.locations || []).filter(l => l.status === 'ACTIVE');
+  locationCaches.set(shopId, locs);
+  return locs;
 }
 
 // Live verdict for the Settings tile: is the saved Square token actually
 // accepted by Square? (Mirrors /api/hub-status for the hub key.)
 app.get('/api/square-status', async (req, res) => {
-  if (!getSecret('square_access_token', 'SQUARE_ACCESS_TOKEN')) return res.json({ configured: false, ok: false });
+  if (!getSecret('square_access_token', 'SQUARE_ACCESS_TOKEN', req.shopId)) return res.json({ configured: false, ok: false });
   try {
-    const locs = await getLocations();
+    const locs = await getLocations(req.shopId);
     res.json({ configured: true, ok: true, locations: locs.length });
   } catch (err) {
     res.json({ configured: true, ok: false, error: err.message });
@@ -890,9 +966,9 @@ app.get('/api/square-status', async (req, res) => {
 
 // The shop's IANA timezone from its Square location, so "a day" means the
 // shop's day rather than a UTC day.
-async function getShopTimezone(locationId) {
+async function getShopTimezone(shopId, locationId) {
   try {
-    const locs = await getLocations();
+    const locs = await getLocations(shopId);
     const loc = locationId ? locs.find(l => l.id === locationId) : locs[0];
     return (loc && loc.timezone) || 'UTC';
   } catch {
@@ -914,8 +990,8 @@ function utcOffset(dateStr, timeZone) {
   }
 }
 
-async function squarePost(endpoint, body) {
-  const token = getSquareToken();
+async function squarePost(shopId, endpoint, body) {
+  const token = getSquareToken(shopId);
   const res = await fetch(`${SQUARE_BASE}/v2${endpoint}`, {
     method: 'POST',
     headers: { 'Authorization': `Bearer ${token}`, 'Content-Type': 'application/json', 'Square-Version': '2024-01-17' },
@@ -924,9 +1000,9 @@ async function squarePost(endpoint, body) {
   return res.json();
 }
 
-async function fetchAllOrders(startDate, endDate, locationIds) {
-  if (!locationIds || locationIds.length === 0) locationIds = (await getLocations()).map(l => l.id);
-  const tz = await getShopTimezone(locationIds.length === 1 ? locationIds[0] : null);
+async function fetchAllOrders(shopId, startDate, endDate, locationIds) {
+  if (!locationIds || locationIds.length === 0) locationIds = (await getLocations(shopId)).map(l => l.id);
+  const tz = await getShopTimezone(shopId, locationIds.length === 1 ? locationIds[0] : null);
   const startOff = utcOffset(startDate, tz);
   const endOff = utcOffset(endDate, tz);
   const all = [];
@@ -943,7 +1019,7 @@ async function fetchAllOrders(startDate, endDate, locationIds) {
       limit: 500,
     };
     if (cursor) body.cursor = cursor;
-    const data = await squarePost('/orders/search', body);
+    const data = await squarePost(shopId, '/orders/search', body);
     if (data.errors) throw new Error(data.errors[0]?.detail || 'Square API error');
     all.push(...(data.orders || []));
     cursor = data.cursor || null;
@@ -971,8 +1047,8 @@ async function fetchAllOrders(startDate, endDate, locationIds) {
 // OPEN cycle (no delivery after end yet): theoretical use vs stock, no verdict.
 //
 // Numilk: daily_rate × days, no closing count available.
-async function computeAnalytics(start_date, end_date) {
-  const cfg = getSettings();
+async function computeAnalytics(shopId, start_date, end_date) {
+  const cfg = getSettings(shopId);
   const mlPerMod = parseFloat(cfg.alt_milk_ml_per_modifier) || 180;
   const locationIds = cfg.square_location_id ? [cfg.square_location_id] : [];
   const oatLitersPerDay    = parseFloat(cfg.numilk_oat_liters_per_day)    || 0;
@@ -983,14 +1059,14 @@ async function computeAnalytics(start_date, end_date) {
   const days = Math.round((new Date(end_date) - new Date(start_date)) / msPerDay) + 1;
 
   // Square orders
-  const rawOrders = await fetchAllOrders(start_date, end_date, locationIds);
+  const rawOrders = await fetchAllOrders(shopId, start_date, end_date, locationIds);
   const { orders: itemList, modifiers } = aggregateOrders(rawOrders);
 
   // Recipe matching. Usage is tallied per brew METHOD, then rolled up to the
   // two ROASTS that stock is actually held in (espresso machine → espresso
   // roast; batch/cold brew/pour-over → filter roast). Legacy recipes without
   // a method fall back to their old category.
-  const recipes = db.prepare('SELECT * FROM drink_recipes').all();
+  const recipes = db.prepare('SELECT * FROM drink_recipes WHERE shop_id=?').all(shopId);
   const recipeMap = {};
   for (const r of recipes) recipeMap[r.square_item_name.toLowerCase().trim()] = r;
   const legacyMethod = { espresso: 'espresso', drip: 'batch', coldbrew: 'coldbrew', pourover: 'pourover' };
@@ -1024,16 +1100,16 @@ async function computeAnalytics(start_date, end_date) {
   // Coffee deliveries in period, sorted oldest first. The closing delivery
   // (first one strictly after end_date) is deliberately NOT in this list.
   const coffeeDels = db.prepare(
-    'SELECT * FROM coffee_deliveries WHERE delivery_date >= ? AND delivery_date <= ? ORDER BY delivery_date ASC'
-  ).all(start_date, end_date);
+    'SELECT * FROM coffee_deliveries WHERE shop_id=? AND delivery_date >= ? AND delivery_date <= ? ORDER BY delivery_date ASC'
+  ).all(shopId, start_date, end_date);
 
   const closingCoffeeDel = db.prepare(
-    'SELECT * FROM coffee_deliveries WHERE delivery_date > ? ORDER BY delivery_date ASC LIMIT 1'
-  ).get(end_date);
+    'SELECT * FROM coffee_deliveries WHERE shop_id=? AND delivery_date > ? ORDER BY delivery_date ASC LIMIT 1'
+  ).get(shopId, end_date);
 
   const closingMilkDel = db.prepare(
-    'SELECT * FROM milk_deliveries WHERE delivery_date > ? ORDER BY delivery_date ASC LIMIT 1'
-  ).get(end_date);
+    'SELECT * FROM milk_deliveries WHERE shop_id=? AND delivery_date > ? ORDER BY delivery_date ASC LIMIT 1'
+  ).get(shopId, end_date);
 
   // Stock is held per ROAST. New deliveries write filter roast into the drip
   // columns; older four-pool history folds drip+coldbrew+pourover together.
@@ -1046,8 +1122,8 @@ async function computeAnalytics(start_date, end_date) {
 
   // Whole milk stock (gallons → ml)
   const milkDels = db.prepare(
-    'SELECT * FROM milk_deliveries WHERE delivery_date >= ? AND delivery_date <= ? ORDER BY delivery_date ASC'
-  ).all(start_date, end_date);
+    'SELECT * FROM milk_deliveries WHERE shop_id=? AND delivery_date >= ? AND delivery_date <= ? ORDER BY delivery_date ASC'
+  ).all(shopId, start_date, end_date);
 
   let milkWholeStock = 0;
   if (milkDels.length > 0) {
@@ -1105,7 +1181,7 @@ app.post('/api/analytics', async (req, res) => {
   try {
     const { start_date, end_date } = req.body;
     if (!start_date || !end_date) return res.status(400).json({ error: 'start_date and end_date required' });
-    res.json(await computeAnalytics(start_date, end_date));
+    res.json(await computeAnalytics(req.shopId, start_date, end_date));
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: err.message });
@@ -1148,15 +1224,15 @@ function recipeFromBody(b) {
   };
 }
 
-app.get('/api/recipes', (req, res) => res.json(db.prepare('SELECT * FROM drink_recipes ORDER BY method, square_item_name').all()));
+app.get('/api/recipes', (req, res) => res.json(db.prepare('SELECT * FROM drink_recipes WHERE shop_id=? ORDER BY method, square_item_name').all(req.shopId)));
 
 app.post('/api/recipes', (req, res) => {
   try {
     const v = recipeFromBody(req.body || {});
     const r = db.prepare(`INSERT INTO drink_recipes
-      (square_item_name, category, method, coffee_grams, batch_grams, yield_mode, yield_cups, yield_liters, serving_oz, milk_whole_ml, notes, created_by)
-      VALUES (?,?,?,?,?,?,?,?,?,0,?,?)`)
-      .run(v.name, v.category, v.method, v.grams, v.batch_grams, v.yield_mode, v.yield_cups, v.yield_liters, v.serving_oz, v.notes, req.user.username);
+      (shop_id, square_item_name, category, method, coffee_grams, batch_grams, yield_mode, yield_cups, yield_liters, serving_oz, milk_whole_ml, notes, created_by)
+      VALUES (?,?,?,?,?,?,?,?,?,?,0,?,?)`)
+      .run(req.shopId, v.name, v.category, v.method, v.grams, v.batch_grams, v.yield_mode, v.yield_cups, v.yield_liters, v.serving_oz, v.notes, req.user.username);
     res.json(db.prepare('SELECT * FROM drink_recipes WHERE id=?').get(r.lastInsertRowid));
   } catch (err) { res.status(400).json({ error: err.message }); }
 });
@@ -1164,20 +1240,21 @@ app.post('/api/recipes', (req, res) => {
 app.put('/api/recipes/:id', (req, res) => {
   try {
     const v = recipeFromBody(req.body || {});
-    db.prepare(`UPDATE drink_recipes SET square_item_name=?, category=?, method=?, coffee_grams=?,
-      batch_grams=?, yield_mode=?, yield_cups=?, yield_liters=?, serving_oz=?, notes=?, updated_at=datetime('now') WHERE id=?`)
-      .run(v.name, v.category, v.method, v.grams, v.batch_grams, v.yield_mode, v.yield_cups, v.yield_liters, v.serving_oz, v.notes, req.params.id);
+    const hit = db.prepare(`UPDATE drink_recipes SET square_item_name=?, category=?, method=?, coffee_grams=?,
+      batch_grams=?, yield_mode=?, yield_cups=?, yield_liters=?, serving_oz=?, notes=?, updated_at=datetime('now') WHERE id=? AND shop_id=?`)
+      .run(v.name, v.category, v.method, v.grams, v.batch_grams, v.yield_mode, v.yield_cups, v.yield_liters, v.serving_oz, v.notes, req.params.id, req.shopId);
+    if (!hit.changes) return res.status(404).json({ error: 'Recipe not found' });
     res.json(db.prepare('SELECT * FROM drink_recipes WHERE id=?').get(req.params.id));
   } catch (err) { res.status(400).json({ error: err.message }); }
 });
 
-app.delete('/api/recipes/:id', (req, res) => { db.prepare('DELETE FROM drink_recipes WHERE id=?').run(req.params.id); res.json({ success: true }); });
+app.delete('/api/recipes/:id', (req, res) => { db.prepare('DELETE FROM drink_recipes WHERE id=? AND shop_id=?').run(req.params.id, req.shopId); res.json({ success: true }); });
 
 // ─── Square catalog items (for the recipe picker) ─────────────────────────────
 // The shop's real Square menu, so recipes are picked rather than typed. Sales
 // counts for the last 30 days are best-effort; the item list is the contract.
-async function fetchSquareCatalogItems() {
-  const token = getSquareToken();
+async function fetchSquareCatalogItems(shopId) {
+  const token = getSquareToken(shopId);
   const names = new Set();
   let cursor;
   do {
@@ -1194,16 +1271,16 @@ async function fetchSquareCatalogItems() {
 }
 
 app.get('/api/square-items', async (req, res) => {
-  const ignored = db.prepare('SELECT name FROM ignored_square_items ORDER BY name').all().map(r => r.name);
-  if (!getSecret('square_access_token', 'SQUARE_ACCESS_TOKEN')) return res.json({ configured: false, items: [], ignored });
+  const ignored = db.prepare('SELECT name FROM ignored_square_items WHERE shop_id=? ORDER BY name').all(req.shopId).map(r => r.name);
+  if (!getSecret('square_access_token', 'SQUARE_ACCESS_TOKEN', req.shopId)) return res.json({ configured: false, items: [], ignored });
   try {
-    const names = await fetchSquareCatalogItems();
+    const names = await fetchSquareCatalogItems(req.shopId);
     const sold = {};
     try {
-      const cfg = getSettings();
+      const cfg = getSettings(req.shopId);
       const end = new Date().toISOString().slice(0, 10);
       const start = new Date(Date.now() - 29 * 86400000).toISOString().slice(0, 10);
-      const raw = await fetchAllOrders(start, end, cfg.square_location_id ? [cfg.square_location_id] : []);
+      const raw = await fetchAllOrders(req.shopId, start, end, cfg.square_location_id ? [cfg.square_location_id] : []);
       for (const o of aggregateOrders(raw).orders) sold[o.name.toLowerCase().trim()] = o.qty;
     } catch { /* sales counts are optional garnish */ }
     res.json({
@@ -1220,18 +1297,18 @@ app.get('/api/square-items', async (req, res) => {
 app.post('/api/square-items/ignore', (req, res) => {
   const name = String((req.body || {}).name || '').trim();
   if (!name) return res.status(400).json({ error: 'name required' });
-  db.prepare('INSERT OR IGNORE INTO ignored_square_items (name) VALUES (?)').run(name);
+  db.prepare('INSERT OR IGNORE INTO ignored_square_items (shop_id, name) VALUES (?,?)').run(req.shopId, name);
   res.json({ ok: true });
 });
 
 app.post('/api/square-items/unignore', (req, res) => {
   const name = String((req.body || {}).name || '').trim();
-  db.prepare('DELETE FROM ignored_square_items WHERE name=?').run(name);
+  db.prepare('DELETE FROM ignored_square_items WHERE shop_id=? AND name=?').run(req.shopId, name);
   res.json({ ok: true });
 });
 
 // ─── Coffee Deliveries CRUD ───────────────────────────────────────────────────
-app.get('/api/coffee-deliveries', (req, res) => res.json(db.prepare('SELECT * FROM coffee_deliveries ORDER BY delivery_date DESC').all()));
+app.get('/api/coffee-deliveries', (req, res) => res.json(db.prepare('SELECT * FROM coffee_deliveries WHERE shop_id=? ORDER BY delivery_date DESC').all(req.shopId)));
 
 app.post('/api/coffee-deliveries', (req, res) => {
   let { delivery_date,
@@ -1247,10 +1324,10 @@ app.post('/api/coffee-deliveries', (req, res) => {
     drip_lbs_onhand   = req.body.filter_lbs_onhand;
   }
   const r = db.prepare(`INSERT INTO coffee_deliveries
-    (delivery_date, espresso_lbs_received, espresso_lbs_onhand, drip_lbs_received, drip_lbs_onhand,
+    (shop_id, delivery_date, espresso_lbs_received, espresso_lbs_onhand, drip_lbs_received, drip_lbs_onhand,
      coldbrew_lbs_received, coldbrew_lbs_onhand, pourover_lbs_received, pourover_lbs_onhand, notes, created_by)
-    VALUES (?,?,?,?,?,?,?,?,?,?,?)`)
-    .run(delivery_date,
+    VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`)
+    .run(req.shopId, delivery_date,
       espresso_lbs_received||0, espresso_lbs_onhand||0,
       drip_lbs_received||0,     drip_lbs_onhand||0,
       coldbrew_lbs_received||0, coldbrew_lbs_onhand||0,
@@ -1259,19 +1336,19 @@ app.post('/api/coffee-deliveries', (req, res) => {
   res.json(db.prepare('SELECT * FROM coffee_deliveries WHERE id=?').get(r.lastInsertRowid));
 });
 
-app.delete('/api/coffee-deliveries/:id', (req, res) => { db.prepare('DELETE FROM coffee_deliveries WHERE id=?').run(req.params.id); res.json({ success: true }); });
+app.delete('/api/coffee-deliveries/:id', (req, res) => { db.prepare('DELETE FROM coffee_deliveries WHERE id=? AND shop_id=?').run(req.params.id, req.shopId); res.json({ success: true }); });
 
 // ─── Milk Deliveries CRUD ─────────────────────────────────────────────────────
-app.get('/api/milk-deliveries', (req, res) => res.json(db.prepare('SELECT * FROM milk_deliveries ORDER BY delivery_date DESC').all()));
+app.get('/api/milk-deliveries', (req, res) => res.json(db.prepare('SELECT * FROM milk_deliveries WHERE shop_id=? ORDER BY delivery_date DESC').all(req.shopId)));
 
 app.post('/api/milk-deliveries', (req, res) => {
   const { delivery_date, whole_bottles_received, whole_bottles_onhand, notes } = req.body;
-  const r = db.prepare('INSERT INTO milk_deliveries (delivery_date,whole_bottles_received,whole_bottles_onhand,notes,created_by) VALUES (?,?,?,?,?)')
-    .run(delivery_date, whole_bottles_received||0, whole_bottles_onhand||0, notes||null, req.user.username);
+  const r = db.prepare('INSERT INTO milk_deliveries (shop_id,delivery_date,whole_bottles_received,whole_bottles_onhand,notes,created_by) VALUES (?,?,?,?,?,?)')
+    .run(req.shopId, delivery_date, whole_bottles_received||0, whole_bottles_onhand||0, notes||null, req.user.username);
   res.json(db.prepare('SELECT * FROM milk_deliveries WHERE id=?').get(r.lastInsertRowid));
 });
 
-app.delete('/api/milk-deliveries/:id', (req, res) => { db.prepare('DELETE FROM milk_deliveries WHERE id=?').run(req.params.id); res.json({ success: true }); });
+app.delete('/api/milk-deliveries/:id', (req, res) => { db.prepare('DELETE FROM milk_deliveries WHERE id=? AND shop_id=?').run(req.params.id, req.shopId); res.json({ success: true }); });
 
 // ─── Coffee Orders ────────────────────────────────────────────────────────────
 const ORDER_POOLS = [
@@ -1323,8 +1400,8 @@ function orderEmailHtml(order, shopName, items = []) {
   </div>`;
 }
 
-async function sendOrderEmail(order, cfg, items = []) {
-  const apiKey = getSecret('resend_api_key', 'RESEND_API_KEY');
+async function sendOrderEmail(shopId, order, cfg, items = []) {
+  const apiKey = getSecret('resend_api_key', 'RESEND_API_KEY', shopId);
   if (!apiKey) return { sent: false, reason: 'Email not configured — add a Resend API key on the Settings page. Order saved but not emailed.' };
   const to = (cfg.order_email_to || 'hello@boxxcoffee.com').trim();
   const from = (cfg.order_email_from || '').trim() || process.env.ORDER_EMAIL_FROM || 'Dose Orders <onboarding@resend.dev>';
@@ -1349,16 +1426,14 @@ async function sendOrderEmail(order, cfg, items = []) {
 }
 
 // ─── Hub connection ──────────────────────────────────────────────────────────
-function hubConn(cfg) {
+function hubConn(cfg, shopId = DEFAULT_SHOP_ID) {
   return {
     url: (cfg.hub_url || '').trim().replace(/\/+$/, '') || DEFAULT_HUB_URL,
-    key: getSecret('hub_api_key', 'HUB_API_KEY'),
+    key: getSecret('hub_api_key', 'HUB_API_KEY', shopId),
   };
 }
 
-async function hubFetch(cfg, path, opts = {}, timeoutMs = 6000) {
-  const { url, key } = hubConn(cfg);
-  if (!url || !key) throw new Error('Hub not configured');
+async function rawHubFetch(url, key, path, opts = {}, timeoutMs = 6000) {
   const controller = new AbortController();
   const t = setTimeout(() => controller.abort(), timeoutMs);
   try {
@@ -1379,13 +1454,89 @@ async function hubFetch(cfg, path, opts = {}, timeoutMs = 6000) {
   }
 }
 
-// The shop's personalized price list, proxied so the hub API key never
-// reaches the browser. Cached for 60s.
-let catalogCache = { at: 0, data: null };
-async function getHubCatalog(cfg, fresh = false) {
-  if (!fresh && catalogCache.data && Date.now() - catalogCache.at < 60_000) return catalogCache.data;
-  const data = await hubFetch(cfg, '/api/ingest/catalog');
-  catalogCache = { at: Date.now(), data };
+// Legacy transport: this shop's own API key identifies it to the hub.
+async function hubFetch(cfg, path, opts = {}, timeoutMs = 6000, shopId = DEFAULT_SHOP_ID) {
+  const { url, key } = hubConn(cfg, shopId);
+  if (!url || !key) throw new Error('Hub not configured');
+  return rawHubFetch(url, key, path, opts, timeoutMs);
+}
+
+// Portal transport: one master key, the shop named per request by ITS HUB ID.
+async function portalFetch(path, opts = {}, timeoutMs = 6000) {
+  const url = (getSettings(0).hub_url || '').trim().replace(/\/+$/, '') || DEFAULT_HUB_URL;
+  return rawHubFetch(url, PORTAL_KEY, path, opts, timeoutMs);
+}
+
+function hubShopIdOf(shopId) {
+  const s = db.prepare('SELECT * FROM shops WHERE id=?').get(shopId);
+  if (!s || s.hub_shop_id == null) throw new Error('This shop is not linked to the hub yet — sign out and back in');
+  return s.hub_shop_id;
+}
+
+// Operation-level helpers: each call site names the LOCAL shop; whether that
+// travels as a per-shop key (legacy) or a portal request is decided here.
+async function hubCatalogFetch(shopId) {
+  if (PORTAL_MODE) return portalFetch(`/api/portal/catalog?shop_id=${hubShopIdOf(shopId)}`);
+  return hubFetch(getSettings(shopId), '/api/ingest/catalog', {}, 6000, shopId);
+}
+async function hubOrderPush(shopId, body) {
+  if (PORTAL_MODE) return portalFetch('/api/portal/orders', { method: 'POST', body: JSON.stringify({ ...body, shop_id: hubShopIdOf(shopId) }) });
+  return hubFetch(getSettings(shopId), '/api/ingest/orders', { method: 'POST', body: JSON.stringify(body) }, 6000, shopId);
+}
+async function hubOrderStatuses(shopId, ids) {
+  if (PORTAL_MODE) return portalFetch(`/api/portal/order-status?shop_id=${hubShopIdOf(shopId)}&ids=${ids.join(',')}`, {}, 3000);
+  return hubFetch(getSettings(shopId), `/api/ingest/order-status?ids=${ids.join(',')}`, {}, 3000, shopId);
+}
+async function hubPasswordChange(shopId, body) {
+  if (PORTAL_MODE) return portalFetch('/api/portal/change-password', { method: 'POST', body: JSON.stringify({ ...body, shop_id: hubShopIdOf(shopId) }) });
+  return hubFetch(getSettings(shopId), '/api/ingest/change-password', { method: 'POST', body: JSON.stringify(body) }, 6000, shopId);
+}
+
+// Pre-portal local shops don't know their hub id. Their stored API key does:
+// the hub's catalog response names the shop it belongs to, so linking is
+// zero-touch on the first portal login after cutover.
+async function linkLegacyShops() {
+  for (const s of db.prepare('SELECT * FROM shops WHERE hub_shop_id IS NULL').all()) {
+    const key = getSecret('hub_api_key', 'HUB_API_KEY', s.id);
+    if (!key) continue;
+    try {
+      const data = await hubFetch(getSettings(s.id), '/api/ingest/catalog', {}, 6000, s.id);
+      if (data.shop_id != null) {
+        db.prepare("UPDATE shops SET hub_shop_id=?, name=COALESCE(NULLIF(?, ''), name) WHERE id=?")
+          .run(data.shop_id, data.shop_name || '', s.id);
+        console.log(`Linked local shop ${s.id} to hub shop ${data.shop_id} (${data.shop_name || 'unnamed'})`);
+      }
+    } catch (err) {
+      console.error(`Could not link local shop ${s.id} to the hub: ${err.message}`);
+    }
+  }
+}
+
+// A hub shop's local mirror row, created on its first portal login.
+async function ensureLocalShop(hubShopId, name) {
+  let s = db.prepare('SELECT * FROM shops WHERE hub_shop_id=?').get(hubShopId);
+  if (!s) {
+    await linkLegacyShops(); // the migrated single-shop row may be this very shop
+    s = db.prepare('SELECT * FROM shops WHERE hub_shop_id=?').get(hubShopId);
+  }
+  if (!s) {
+    const r = db.prepare('INSERT INTO shops (hub_shop_id, name) VALUES (?,?)').run(hubShopId, name || '');
+    seedShopSettings(r.lastInsertRowid);
+    console.log(`New shop provisioned locally: "${name}" (local ${r.lastInsertRowid}, hub ${hubShopId})`);
+    return Number(r.lastInsertRowid);
+  }
+  if (name && s.name !== name) db.prepare('UPDATE shops SET name=? WHERE id=?').run(name, s.id);
+  return s.id;
+}
+
+// The shop's personalized price list, proxied so hub credentials never reach
+// the browser. Cached for 60s per shop.
+const catalogCaches = new Map(); // shopId → { at, data }
+async function getHubCatalog(shopId, fresh = false) {
+  const c = catalogCaches.get(shopId);
+  if (!fresh && c && Date.now() - c.at < 60_000) return c.data;
+  const data = await hubCatalogFetch(shopId);
+  catalogCaches.set(shopId, { at: Date.now(), data });
   return data;
 }
 
@@ -1393,10 +1544,9 @@ async function getHubCatalog(cfg, fresh = false) {
 // belongs to. Settings uses it to show a real verdict instead of just
 // "a key is saved".
 app.get('/api/hub-status', async (req, res) => {
-  const cfg = getSettings();
-  if (!isHubConfigured(cfg)) return res.json({ configured: false });
+  if (!isHubConfigured(getSettings(req.shopId), req.shopId)) return res.json({ configured: false });
   try {
-    const data = await getHubCatalog(cfg, true);
+    const data = await getHubCatalog(req.shopId, true);
     res.json({ configured: true, ok: true, shop_name: data.shop_name || null, items: (data.items || []).length });
   } catch (err) {
     res.json({ configured: true, ok: false, error: err.message });
@@ -1404,11 +1554,9 @@ app.get('/api/hub-status', async (req, res) => {
 });
 
 app.get('/api/hub-catalog', async (req, res) => {
-  const cfg = getSettings();
-  const { url, key } = hubConn(cfg);
-  if (!url || !key) return res.json({ configured: false, items: [] });
+  if (!isHubConfigured(getSettings(req.shopId), req.shopId)) return res.json({ configured: false, items: [] });
   try {
-    const data = await getHubCatalog(cfg);
+    const data = await getHubCatalog(req.shopId);
     res.json({ configured: true, currency: data.currency || '$', items: data.items || [] });
   } catch (err) {
     res.json({ configured: true, error: err.message, items: [] });
@@ -1417,7 +1565,7 @@ app.get('/api/hub-catalog', async (req, res) => {
 
 // Push a sent order to the roastery hub. Email and hub are independent
 // transports — the order is always saved locally first.
-async function pushOrderToHub(order, cfg, items = []) {
+async function pushOrderToHub(shopId, order, items = []) {
   try {
     const body = {
       order_date: order.order_date,
@@ -1429,7 +1577,7 @@ async function pushOrderToHub(order, cfg, items = []) {
       body.espresso_lbs = order.espresso_lbs; body.drip_lbs = order.drip_lbs;
       body.coldbrew_lbs = order.coldbrew_lbs; body.pourover_lbs = order.pourover_lbs;
     }
-    const data = await hubFetch(cfg, '/api/ingest/orders', { method: 'POST', body: JSON.stringify(body) });
+    const data = await hubOrderPush(shopId, body);
     return { pushed: true, receipt: data.receipt || null };
   } catch (err) {
     return { pushed: false, reason: err.message === 'Hub not configured' ? 'Hub not configured' : err.message };
@@ -1442,43 +1590,42 @@ const orderWithItems = o => ({
 });
 
 // Reflect roastery confirmations (from the hub) into local hub_status.
-async function syncHubStatuses(cfg) {
-  const pending = db.prepare("SELECT id FROM coffee_orders WHERE hub_status IN ('sent','confirmed')").all().map(r => r.id);
+async function syncHubStatuses(shopId) {
+  const pending = db.prepare("SELECT id FROM coffee_orders WHERE shop_id=? AND hub_status IN ('sent','confirmed')").all(shopId).map(r => r.id);
   if (!pending.length) return;
-  const statuses = await hubFetch(cfg, `/api/ingest/order-status?ids=${pending.join(',')}`, {}, 3000);
-  const upd = db.prepare('UPDATE coffee_orders SET hub_status=? WHERE id=? AND hub_status IS NOT ?');
+  const statuses = await hubOrderStatuses(shopId, pending);
+  const upd = db.prepare('UPDATE coffee_orders SET hub_status=? WHERE id=? AND shop_id=? AND hub_status IS NOT ?');
   for (const s of statuses) {
     const mapped = s.status === 'new' ? 'sent' : s.status; // hub 'new' = delivered-to-hub
-    upd.run(mapped, s.source_order_id, mapped);
+    upd.run(mapped, s.source_order_id, shopId, mapped);
   }
 }
 
 app.get('/api/orders', async (req, res) => {
-  const cfg = getSettings();
-  await syncHubStatuses(cfg).catch(() => { /* hub unreachable — show last known */ });
-  res.json(db.prepare('SELECT * FROM coffee_orders ORDER BY order_date DESC, id DESC').all().map(orderWithItems));
+  await syncHubStatuses(req.shopId).catch(() => { /* hub unreachable — show last known */ });
+  res.json(db.prepare('SELECT * FROM coffee_orders WHERE shop_id=? ORDER BY order_date DESC, id DESC').all(req.shopId).map(orderWithItems));
 });
 
 // Place a catalog (line-item) order: price from the hub's list, store
 // locally, push to the hub. Used by the order form and the standing-order
 // scheduler.
-async function placeCatalogOrder({ order_date, requested_date, notes, rawItems, username }) {
-  const cfg = getSettings();
-  const catalog = await getHubCatalog(cfg, true);
+async function placeCatalogOrder({ shopId, order_date, requested_date, notes, rawItems, username }) {
+  const cfg = getSettings(shopId);
+  const catalog = await getHubCatalog(shopId, true);
   const priced = priceItemsFromCatalog(rawItems, catalog.items || []);
 
-  const r = db.prepare(`INSERT INTO coffee_orders (order_date, requested_date, total_lbs, total_cost, notes, created_by)
-    VALUES (?,?,?,?,?,?)`)
-    .run(order_date, requested_date || null, priced.total_lbs, priced.total_cost, notes || null, username);
+  const r = db.prepare(`INSERT INTO coffee_orders (shop_id, order_date, requested_date, total_lbs, total_cost, notes, created_by)
+    VALUES (?,?,?,?,?,?,?)`)
+    .run(shopId, order_date, requested_date || null, priced.total_lbs, priced.total_cost, notes || null, username);
   const ins = db.prepare('INSERT INTO order_items (order_id, coffee_id, coffee_name, roast, lbs, bags, price_per_lb, line_total) VALUES (?,?,?,?,?,?,?,?)');
   for (const i of priced.items) ins.run(r.lastInsertRowid, i.coffee_id, i.coffee_name, i.roast, i.lbs, i.bags ?? null, i.price_per_lb, i.line_total);
   const order = db.prepare('SELECT * FROM coffee_orders WHERE id=?').get(r.lastInsertRowid);
 
   // The hub emails the receipt itself; shop-side email is only the fallback
   // when the push fails.
-  const hub = await pushOrderToHub(order, cfg, priced.items);
+  const hub = await pushOrderToHub(shopId, order, priced.items);
   let email = null;
-  if (!hub.pushed) email = await sendOrderEmail(order, cfg, priced.items);
+  if (!hub.pushed) email = await sendOrderEmail(shopId, order, cfg, priced.items);
 
   db.prepare('UPDATE coffee_orders SET status=?, sent_to=?, sent_at=?, hub_status=? WHERE id=?')
     .run((hub.pushed || email?.sent) ? 'sent' : 'email_failed',
@@ -1494,12 +1641,12 @@ app.post('/api/orders', async (req, res) => {
   try {
     const { order_date, requested_date, notes, items: rawItems } = req.body;
     if (!order_date) return res.status(400).json({ error: 'order_date required' });
-    const cfg = getSettings();
+    const cfg = getSettings(req.shopId);
 
     // ── Catalog order: line items priced from the hub's price list ──
     if (Array.isArray(rawItems) && rawItems.length) {
       try {
-        return res.json(await placeCatalogOrder({ order_date, requested_date, notes, rawItems, username: req.user.username }));
+        return res.json(await placeCatalogOrder({ shopId: req.shopId, order_date, requested_date, notes, rawItems, username: req.user.username }));
       } catch (err) {
         const gateway = /Could not|Hub error|abort|network|fetch failed|Hub not configured/i.test(err.message);
         return res.status(gateway ? 502 : 400).json({ error: err.message });
@@ -1517,12 +1664,12 @@ app.post('/api/orders', async (req, res) => {
       return res.status(400).json({ error: 'Order must include at least one quantity' });
 
     const totalLbs = Math.round(Object.values(qty).reduce((s, v) => s + v, 0) * 10) / 10;
-    const r = db.prepare(`INSERT INTO coffee_orders (order_date, requested_date, espresso_lbs, drip_lbs, coldbrew_lbs, pourover_lbs, total_lbs, notes, created_by)
-      VALUES (?,?,?,?,?,?,?,?,?)`)
-      .run(order_date, requested_date || null, qty.espresso_lbs, qty.drip_lbs, qty.coldbrew_lbs, qty.pourover_lbs, totalLbs, notes || null, req.user.username);
+    const r = db.prepare(`INSERT INTO coffee_orders (shop_id, order_date, requested_date, espresso_lbs, drip_lbs, coldbrew_lbs, pourover_lbs, total_lbs, notes, created_by)
+      VALUES (?,?,?,?,?,?,?,?,?,?)`)
+      .run(req.shopId, order_date, requested_date || null, qty.espresso_lbs, qty.drip_lbs, qty.coldbrew_lbs, qty.pourover_lbs, totalLbs, notes || null, req.user.username);
     const order = db.prepare('SELECT * FROM coffee_orders WHERE id=?').get(r.lastInsertRowid);
 
-    const [email, hub] = await Promise.all([sendOrderEmail(order, cfg), pushOrderToHub(order, cfg)]);
+    const [email, hub] = await Promise.all([sendOrderEmail(req.shopId, order, cfg), pushOrderToHub(req.shopId, order)]);
     db.prepare('UPDATE coffee_orders SET status=?, sent_to=?, sent_at=?, hub_status=? WHERE id=?')
       .run((email.sent || hub.pushed) ? 'sent' : 'email_failed',
            email.sent ? email.to : null,
@@ -1538,8 +1685,10 @@ app.post('/api/orders', async (req, res) => {
 });
 
 app.delete('/api/orders/:id', (req, res) => {
-  db.prepare('DELETE FROM order_items WHERE order_id=?').run(req.params.id);
-  db.prepare('DELETE FROM coffee_orders WHERE id=?').run(req.params.id);
+  const order = db.prepare('SELECT id FROM coffee_orders WHERE id=? AND shop_id=?').get(req.params.id, req.shopId);
+  if (!order) return res.status(404).json({ error: 'Order not found' });
+  db.prepare('DELETE FROM order_items WHERE order_id=?').run(order.id);
+  db.prepare('DELETE FROM coffee_orders WHERE id=?').run(order.id);
   res.json({ success: true });
 });
 
@@ -1561,7 +1710,7 @@ const standingOrderPublic = s => ({
 });
 
 app.get('/api/standing-orders', (req, res) =>
-  res.json(db.prepare('SELECT * FROM standing_orders WHERE active=1 ORDER BY next_date').all().map(standingOrderPublic)));
+  res.json(db.prepare('SELECT * FROM standing_orders WHERE shop_id=? AND active=1 ORDER BY next_date').all(req.shopId).map(standingOrderPublic)));
 
 app.post('/api/standing-orders', async (req, res) => {
   try {
@@ -1570,12 +1719,12 @@ app.post('/api/standing-orders', async (req, res) => {
     if (!Array.isArray(items) || !items.length) return res.status(400).json({ error: 'Standing order needs at least one item' });
     // Validate items against the current catalog so broken standing orders
     // can't be created.
-    const catalog = await getHubCatalog(getSettings(), true);
+    const catalog = await getHubCatalog(req.shopId, true);
     priceItemsFromCatalog(items, catalog.items || []);
     const today = new Date().toISOString().slice(0, 10);
     const nextDate = (start_date && start_date > today) ? start_date : advanceDate(today, frequency);
-    const r = db.prepare('INSERT INTO standing_orders (frequency, items_json, notes, next_date, created_by) VALUES (?,?,?,?,?)')
-      .run(frequency, JSON.stringify(items), notes || null, nextDate, req.user.username);
+    const r = db.prepare('INSERT INTO standing_orders (shop_id, frequency, items_json, notes, next_date, created_by) VALUES (?,?,?,?,?,?)')
+      .run(req.shopId, frequency, JSON.stringify(items), notes || null, nextDate, req.user.username);
     res.json(standingOrderPublic(db.prepare('SELECT * FROM standing_orders WHERE id=?').get(r.lastInsertRowid)));
   } catch (err) {
     res.status(400).json({ error: err.message });
@@ -1583,7 +1732,7 @@ app.post('/api/standing-orders', async (req, res) => {
 });
 
 app.delete('/api/standing-orders/:id', (req, res) => {
-  db.prepare('UPDATE standing_orders SET active=0 WHERE id=?').run(req.params.id);
+  db.prepare('UPDATE standing_orders SET active=0 WHERE id=? AND shop_id=?').run(req.params.id, req.shopId);
   res.json({ success: true });
 });
 
@@ -1592,11 +1741,13 @@ app.delete('/api/standing-orders/:id', (req, res) => {
 // saved order shows a failed status rather than retry-storming the hub).
 async function runStandingOrders() {
   const today = new Date().toISOString().slice(0, 10);
+  // Every shop's due orders in one pass — each placed within its own shop.
   const due = db.prepare('SELECT * FROM standing_orders WHERE active=1 AND next_date <= ?').all(today);
   for (const so of due) {
     let result;
     try {
       const placed = await placeCatalogOrder({
+        shopId: so.shop_id,
         order_date: today,
         requested_date: null,
         notes: so.notes ? `${so.notes} (standing order)` : 'standing order',
@@ -1621,16 +1772,16 @@ setInterval(runStandingOrders, 60 * 60 * 1000).unref();
 // Run due standing orders now (admin) — used by tests and for catch-up.
 app.post('/api/standing-orders/run', requireAdmin, asyncRoute(async (req, res) => {
   await runStandingOrders();
-  res.json(db.prepare('SELECT * FROM standing_orders ORDER BY id').all().map(standingOrderPublic));
+  res.json(db.prepare('SELECT * FROM standing_orders WHERE shop_id=? ORDER BY id').all(req.shopId).map(standingOrderPublic));
 }));
 
 // Suggested order quantities from the current open cycle's burn rate.
 app.get('/api/order-suggestion', async (req, res) => {
   try {
-    const last = db.prepare('SELECT * FROM coffee_deliveries ORDER BY delivery_date DESC LIMIT 1').get();
+    const last = db.prepare('SELECT * FROM coffee_deliveries WHERE shop_id=? ORDER BY delivery_date DESC LIMIT 1').get(req.shopId);
     if (!last) return res.json({ available: false, reason: 'No deliveries logged yet' });
     const today = new Date().toISOString().slice(0, 10);
-    const a = await computeAnalytics(last.delivery_date, today);
+    const a = await computeAnalytics(req.shopId, last.delivery_date, today);
     const horizonDays = 7;
     const pools = {};
     for (const p of ['espresso', 'filter']) {
@@ -1662,15 +1813,15 @@ app.post('/api/report', async (req, res) => {
     const { start_date, end_date } = req.body;
     if (!start_date || !end_date) return res.status(400).json({ error: 'start_date and end_date required' });
 
-    const analytics = await computeAnalytics(start_date, end_date);
+    const analytics = await computeAnalytics(req.shopId, start_date, end_date);
 
     const coffeeDels = db.prepare(
-      'SELECT * FROM coffee_deliveries WHERE delivery_date >= ? AND delivery_date <= ? ORDER BY delivery_date ASC'
-    ).all(start_date, end_date);
+      'SELECT * FROM coffee_deliveries WHERE shop_id=? AND delivery_date >= ? AND delivery_date <= ? ORDER BY delivery_date ASC'
+    ).all(req.shopId, start_date, end_date);
 
     const milkDels = db.prepare(
-      'SELECT * FROM milk_deliveries WHERE delivery_date >= ? AND delivery_date <= ? ORDER BY delivery_date ASC'
-    ).all(start_date, end_date);
+      'SELECT * FROM milk_deliveries WHERE shop_id=? AND delivery_date >= ? AND delivery_date <= ? ORDER BY delivery_date ASC'
+    ).all(req.shopId, start_date, end_date);
 
     const doc = generateReport({ analytics, coffeeDels, milkDels, startDate: start_date, endDate: end_date });
 

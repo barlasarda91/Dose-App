@@ -635,7 +635,9 @@ function shopCatalog(shopId) {
 app.get('/api/ingest/catalog', (req, res) => {
   const shop = shopFromBearer(req);
   if (!shop) return res.status(401).json({ error: 'Invalid shop API key' });
-  res.json({ currency: CURRENCY, shop_name: shop.name, items: shopCatalog(shop.id) });
+  // shop_id lets a portal deployment link a legacy shop's data to its hub
+  // identity from nothing but the API key it already holds.
+  res.json({ currency: CURRENCY, shop_id: shop.id, shop_name: shop.name, items: shopCatalog(shop.id) });
 });
 
 // The receiving core, shared by the legacy per-key ingest route and the
