@@ -1108,8 +1108,10 @@
         if (name === null) return;
         const email = window.prompt('Registered email (receipts + confirmations):', shop.email || '');
         if (email === null) return;
+        const appUrl = window.prompt("Shop's Dose app URL (the page they log in at — used by password links):", shop.app_url || 'https://');
+        if (appUrl === null) return;
         try {
-          const updated = await api(`/api/shops/${shop.id}`, { method: 'PUT', body: JSON.stringify({ name, email }) });
+          const updated = await api(`/api/shops/${shop.id}`, { method: 'PUT', body: JSON.stringify({ name, email, app_url: appUrl === 'https://' ? '' : appUrl }) });
           shops = shops.map(s => s.id === updated.id ? updated : s);
           drawList();
         } catch (e) { alert(e.message); }
@@ -1338,9 +1340,23 @@
       }
       try {
         const done = await api('/api/public/set-password', { method: 'POST', body: JSON.stringify({ token, password: pw }) });
+        const appUrl = info.app_url;
         shell(`<div class="ok" style="margin:0;line-height:1.8">
-          ✓ Password set. Sign in to your shop's Dose app as <strong>${esc(done.login_username)}</strong> with your new password.
-          You can close this page.</div>`);
+          ✓ Password set. Sign in to your shop's Dose app as <strong>${esc(done.login_username)}</strong> with your new password.</div>
+          ${appUrl
+            ? `<a class="btn" href="${esc(appUrl)}" style="display:block;text-align:center;margin-top:16px;text-decoration:none">Sign In →</a>
+               <div style="font-size:10px;color:var(--drift);margin-top:10px;text-align:center" id="sp-count">Taking you there in 5…</div>`
+            : `<div style="font-size:11px;color:var(--drift);margin-top:12px">You can close this page.</div>`}`);
+        if (appUrl) {
+          let n = 5;
+          const t = setInterval(() => {
+            n -= 1;
+            const el = document.getElementById('sp-count');
+            if (!el) { clearInterval(t); return; }
+            if (n <= 0) { clearInterval(t); window.location.href = appUrl; }
+            else el.textContent = `Taking you there in ${n}…`;
+          }, 1000);
+        }
       } catch (err) {
         document.getElementById('sp-err').textContent = err.message;
       }

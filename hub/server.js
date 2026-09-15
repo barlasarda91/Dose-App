@@ -167,6 +167,7 @@ for (const col of ['info_country TEXT', 'info_region TEXT', 'info_producer TEXT'
 }
 try { db.exec('ALTER TABLE hub_users ADD COLUMN email TEXT'); } catch { /* present */ }
 try { db.exec('ALTER TABLE stock_moves ADD COLUMN created_by TEXT'); } catch { /* present */ }
+try { db.exec('ALTER TABLE shops ADD COLUMN app_url TEXT'); } catch { /* present */ }
 for (const col of ['confirmed_by TEXT', 'confirmed_at TEXT', 'shipped_by TEXT', 'shipped_at TEXT']) {
   try { db.exec(`ALTER TABLE orders ADD COLUMN ${col}`); } catch { /* present */ }
 }
@@ -683,6 +684,14 @@ app.post('/api/ingest/orders', async (req, res) => {
 // Shop deployments verify user logins here. Rate-limited per shop+username.
 // 409 no_login_password lets pre-upgrade deployments fall back to their
 // local accounts until a password is set in the hub.
+// A reset re-establishes identity — stale brute-force lockouts must not
+// keep the freshly-reset password from working.
+function clearShopAuthLocks(shopId) {
+  for (const key of [...loginFailures.keys()]) {
+    if (key.startsWith(`shopauth:${shopId}:`)) loginFailures.delete(key);
+  }
+}
+
 app.post('/api/ingest/auth', async (req, res) => {
   try {
     const shop = shopFromBearer(req);
@@ -749,7 +758,7 @@ function shopFromInviteToken(token) {
 app.post('/api/public/invite-info', (req, res) => {
   const shop = shopFromInviteToken(req.body && req.body.token);
   if (!shop) return res.status(404).json({ error: 'This link is invalid or has expired — ask the roastery to send a new one.' });
-  res.json({ shop_name: shop.name, login_username: shop.login_username });
+  res.json({ shop_name: shop.name, login_username: shop.login_username, app_url: shop.app_url || null });
 });
 
 app.post('/api/public/set-password', async (req, res) => {
@@ -762,6 +771,7 @@ app.post('/api/public/set-password', async (req, res) => {
     const { salt, hash } = await hashPassword(password);
     db.prepare('UPDATE shops SET password_hash=?, salt=?, invite_token_hash=NULL, invite_expires_at=NULL WHERE id=?')
       .run(hash, salt, shop.id);
+    clearShopAuthLocks(shop.id);
     res.json({ ok: true, login_username: shop.login_username, shop_name: shop.name });
   } catch (err) {
     console.error(err);
@@ -866,6 +876,7 @@ app.post('/api/team/:id/reset', requireOwner, async (req, res) => {
     const hash = await hubHashPassword(temp);
     db.prepare('UPDATE hub_users SET password_hash=?, must_change_password=1 WHERE id=?').run(hash, u.id);
     db.prepare('DELETE FROM sessions WHERE user_id=?').run(u.id);
+    loginFailures.delete(`u:${u.username}`);
     audit(req, `reset the password for "${u.username}"`);
     res.json({ ok: true });
   } catch (err) {
@@ -1018,7 +1029,7 @@ app.put('/api/catalog/:id', requireOwner, (req, res) => {
 
 // ─── Shops management ─────────────────────────────────────────────────────────
 const shopWithStats = s => ({
-  id: s.id, name: s.name, email: s.email, login_username: s.login_username,
+  id: s.id, name: s.name, email: s.email, login_username: s.login_username, app_url: s.app_url || null,
   has_password: !!s.password_hash,
   invite_pending: !!(s.invite_token_hash && !s.password_hash),
   created_at: s.created_at,
@@ -1115,6 +1126,7 @@ app.post('/api/shops/:id/reset-login', requireOwner, async (req, res) => {
     const loginUsername = shop.login_username || genLoginUsername(shop.name);
     const { salt, hash } = await hashPassword(password);
     db.prepare('UPDATE shops SET login_username=?, password_hash=?, salt=? WHERE id=?').run(loginUsername, hash, salt, shop.id);
+    clearShopAuthLocks(shop.id);
     audit(req, `reset the shop login for "${shop.name}"`);
     res.json({ ok: true, login_username: loginUsername });
   } catch (err) {
@@ -1128,8 +1140,10 @@ app.put('/api/shops/:id', (req, res) => {
   if (!shop) return res.status(404).json({ error: 'Shop not found' });
   const name = req.body.name !== undefined ? String(req.body.name).trim() : shop.name;
   const email = req.body.email !== undefined ? (String(req.body.email).trim() || null) : shop.email;
+  let appUrl = req.body.app_url !== undefined ? (String(req.body.app_url).trim().replace(/\/+$/, '') || null) : shop.app_url;
+  if (appUrl && !/^https?:\/\//.test(appUrl)) return res.status(400).json({ error: 'App URL must start with https:// (or http:// for testing)' });
   if (name.length < 2) return res.status(400).json({ error: 'Shop name required' });
-  db.prepare('UPDATE shops SET name=?, email=? WHERE id=?').run(name, email, shop.id);
+  db.prepare('UPDATE shops SET name=?, email=?, app_url=? WHERE id=?').run(name, email, appUrl, shop.id);
   res.json(shopWithStats(db.prepare('SELECT * FROM shops WHERE id=?').get(shop.id)));
 });
 
