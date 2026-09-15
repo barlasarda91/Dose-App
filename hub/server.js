@@ -715,7 +715,15 @@ app.post('/api/ingest/auth', async (req, res) => {
     const wait = lockedFor(lockKey);
     if (wait > 0) return res.status(429).json({ error: `Too many attempts — try again in ${wait}s` });
     if (!shop.password_hash) return res.status(409).json({ error: 'no_login_password' });
-    if (username !== (shop.login_username || '') || !(await verifyShopPassword(shop, password))) {
+    if (username !== (shop.login_username || '')) {
+      // Whole-username mismatch: they're almost certainly at the WRONG SHOP's
+      // deployment (credentials are bound to the deployment's API key). Say
+      // so — a plain 'wrong password' sends people chasing password resets.
+      recordFailure(lockKey);
+      db.prepare("UPDATE shops SET last_auth_fail_at=datetime('now'), auth_fail_count=COALESCE(auth_fail_count,0)+1 WHERE id=?").run(shop.id);
+      return res.status(401).json({ error: `"${username}" is not the account for this shop's app — this deployment belongs to a different shop. Check you're at the right Dose URL.` });
+    }
+    if (!(await verifyShopPassword(shop, password))) {
       recordFailure(lockKey);
       db.prepare("UPDATE shops SET last_auth_fail_at=datetime('now'), auth_fail_count=COALESCE(auth_fail_count,0)+1 WHERE id=?").run(shop.id);
       return res.status(401).json({ error: 'Wrong username or password' });

@@ -167,6 +167,11 @@ const j = client(API, 'x-hub-key');
     ok(r.body.some(a => a.username === 'shop' && /set a new password via its invite link/.test(a.action)) === false,
       'no invite set-password yet in trail (sanity)');
 
+    r = await shopAuth('some-other-shop', 'whatever-123');
+    ok(r.status === 401 && /different shop/.test(r.body.error), 'wrong-deployment login gets the distinct message');
+    r = await shopAuth(shopUname, 'not-the-password-1');
+    ok(r.status === 401 && r.body.error === 'Wrong username or password', 'right shop, wrong password keeps the plain error');
+
     section('archive / restore');
     r = await j('POST', `/api/catalog/${plainId}/archive`, null, STAFF);
     ok(r.status === 403, 'staff cannot archive');
