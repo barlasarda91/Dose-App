@@ -282,6 +282,59 @@ const j = client(API, 'x-hub-key');
     ok(pat.fil.Winey.share === 100 && !pat.fil.Buttery, 'filter palate only sees filter pounds');
     ok(r.body.untagged.length === 0, 'everything tagged — the nudge list clears');
 
+    section('product-doc import: parse walls and apply semantics');
+    const DOC = [
+      '# Draft Coffees', '',
+      '## Colombia – Finca El Encanto / Papayo', '',
+      '#### Intro', 'Brandon selected this lot for two courses.', '',
+      '#### Country - Colombia', 'Colombia story paragraph.', '',
+      '#### Region - Huila, Pitalito', 'This lot comes from 1,230 to 1,250 meters above sea level.', '',
+      '#### Farm - Finca El Encanto', 'A family farm in Pitalito.', '',
+      '#### Variety - Papayo', 'Rare variety found almost exclusively in Huila.', '',
+      '#### Process - Thermal Shock Anaerobic Natural', 'Cherries are harvested selectively.', '',
+      '# Active coffees', '',
+      '# Ethiopia – Anasora Site', '',
+      '## Intro', 'A standout natural.', '',
+      '## Country', 'Ethiopia story — heading carries no value.', '',
+      '## Region – Guji', 'Farms sit high in Guji.', '',
+      '## Processing Station – Anasora Site', 'Station story.', '',
+      '## Process – Natural', 'Dried on raised beds.', '',
+      '# Past Coffees', '',
+      '# Peru – Old Lot', '',
+      '# Intro', 'A coffee from two seasons ago.',
+    ].join('\n');
+    r = await j('POST', '/api/import-doc', { text: DOC }, STAFF);
+    ok(r.status === 403, 'staff cannot run the import');
+    r = await j('POST', '/api/import-doc', { text: '' }, OWNER);
+    ok(r.status === 400, 'empty input rejected');
+    // A coffee whose name should match the first doc page by token overlap.
+    r = await j('POST', '/api/catalog', { name: 'El Encanto Papayo', price_per_lb: 18 }, OWNER);
+    const encId = r.body.id;
+    await j('PUT', `/api/catalog/${encId}/sheet`, { profile_tags: ['Jammy'], brew_espresso: '18g in, 44g out.' }, OWNER);
+    r = await j('POST', '/api/import-doc', { text: DOC }, OWNER);
+    ok(r.status === 200 && r.body.coffees.length === 3, `heading-size chaos still parses (${r.body.coffees.length} coffees)`);
+    const [enc, ana, past] = r.body.coffees;
+    ok(enc.facts.country === 'Colombia' && enc.facts.producer === 'Finca El Encanto' && enc.facts.process === 'Thermal Shock Anaerobic Natural',
+      'facts lifted from heading suffixes');
+    ok(enc.facts.altitude === '1,230–1,250 masl', `altitude fished out of the Region prose (${enc.facts.altitude})`);
+    ok(enc.sections.length === 6 && enc.sections[0].title === 'Intro', 'story sections kept in doc order');
+    ok(enc.match_id === encId, 'catalog match suggested by name overlap');
+    ok(ana.facts.country === 'Ethiopia' && ana.facts.producer === 'Anasora Site',
+      'bare Country falls back to the title; Processing Station counts as producer');
+    ok(ana.match_id === null, 'no fuzzy match invented for an unknown coffee');
+    ok(/past/i.test(past.group), 'doc grouping survives (Past flagged for default-unchecked)');
+
+    r = await j('POST', '/api/import-doc/apply', { items: [{ coffee_id: encId, facts: enc.facts, sections: enc.sections }, { coffee_id: 9999, facts: {}, sections: [] }] }, OWNER);
+    ok(r.status === 200 && r.body.applied === 1 && r.body.results[1].ok === false, 'apply writes the real target, names the bogus one');
+    r = await j('GET', '/api/catalog', null, OWNER);
+    const encFull = r.body.find(i => i.id === encId);
+    ok(encFull.info_country === 'Colombia' && encFull.info_altitude === '1,230–1,250 masl' && encFull.info_sections.length === 6,
+      'sheet lands: facts + sections');
+    ok(JSON.stringify(encFull.profile_tags) === '["Jammy"]' && encFull.brew_espresso === '18g in, 44g out.',
+      'cup profile and brew notes untouched by the import');
+    r = await j('GET', '/api/activity', null, OWNER);
+    ok(r.body.some(a => /imported the info sheet for "El Encanto Papayo" from the product doc/.test(a.action)), 'import audited per coffee');
+
     section('adjustment guards');
     r = await j('POST', '/api/on-hand/adjust', { coffee_id: coffeeId, profile: 'espresso', delta_lbs: 0 }, STAFF);
     ok(r.status === 400, 'zero-delta adjustment rejected');
