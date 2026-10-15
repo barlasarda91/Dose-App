@@ -379,7 +379,7 @@ rebuildForShopId('ignored_square_items', `CREATE TABLE ignored_square_items (
 const DEFAULT_SHOP_SETTINGS = [
   ['alt_milk_ml_per_modifier', '180'], ['square_location_id', ''],
   ['numilk_oat_liters_per_day', '0'], ['numilk_almond_liters_per_day', '0'],
-  ['shop_name', ''], ['order_email_to', 'hello@boxxcoffee.com'], ['order_email_from', ''],
+  ['shop_name', ''], ['order_email_to', 'hello@boxxcoffee.la'], ['order_email_from', ''],
 ];
 function seedShopSettings(shopId) {
   for (const [k, v] of DEFAULT_SHOP_SETTINGS)
@@ -1438,7 +1438,7 @@ function orderEmailHtml(order, shopName, items = []) {
 async function sendOrderEmail(shopId, order, cfg, items = []) {
   const apiKey = getSecret('resend_api_key', 'RESEND_API_KEY', shopId);
   if (!apiKey) return { sent: false, reason: 'Email not configured — add a Resend API key on the Settings page. Order saved but not emailed.' };
-  const to = (cfg.order_email_to || 'hello@boxxcoffee.com').trim();
+  const to = (cfg.order_email_to || 'hello@boxxcoffee.la').trim();
   const from = (cfg.order_email_from || '').trim() || (!PORTAL_MODE && process.env.ORDER_EMAIL_FROM) || 'Dose Orders <onboarding@resend.dev>';
   const shopName = (cfg.shop_name || '').trim();
   try {
