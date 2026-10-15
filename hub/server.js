@@ -510,8 +510,8 @@ async function sendEmail(to, subject, html) {
   if (!to) return { sent: false, reason: 'No recipient email registered for this shop' };
   const from = cleanEnv(process.env.HUB_EMAIL_FROM) || 'Dose Hub <onboarding@resend.dev>';
   // The from-address must live on the verified sending domain (e.g.
-  // order@send.boxxcoffee.com), which usually isn't a real inbox — replies
-  // route to HUB_REPLY_TO (e.g. order@boxxcoffee.com) when set.
+  // order@send.boxxcoffee.la), which usually isn't a real inbox — replies
+  // route to HUB_REPLY_TO (e.g. order@boxxcoffee.la) when set.
   const replyTo = cleanEnv(process.env.HUB_REPLY_TO);
   try {
     const res = await fetch('https://api.resend.com/emails', {

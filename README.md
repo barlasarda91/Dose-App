@@ -60,6 +60,7 @@ Setting `PORTAL_KEY` turns a shop-app deployment into the **Dose Portal**: a sin
 
 1. On the **hub** service: set `PORTAL_KEY`, redeploy.
 2. On the **boxx-dose** service (it becomes the portal): set `PORTAL_KEY`, `DOSE_SECRET_KEY`, `OPERATOR_KEY`, redeploy. Existing data is stamped shop 1 in place; on the first login the deployment links shop 1 to its hub identity through the API key it already holds. Nothing is re-entered.
+   **Credentials-in-env note:** the portal ignores `SQUARE_ACCESS_TOKEN` / `RESEND_API_KEY` / `ORDER_EMAIL_FROM` env fallbacks — one env value must never become every shop's credential. If the old service relied on them, paste those values into that shop's **Settings** once (stored encrypted); the env vars can then be deleted.
 3. Every shop now signs in at the portal URL with their existing hub username/password. New shops need only Hub → Shops → create + password invite — **no new deployment, ever**.
 4. Retire any other per-shop services once their users have moved (their data, if any, stays with those services — export orders from the hub side if needed).
 
@@ -69,7 +70,7 @@ Legacy `/api/ingest/*` (per-shop API key) stays fully supported, so un-migrated 
 
 - **Dashboard** — opens on the current delivery cycle automatically. The live cycle shows only what's knowable without a stock count: kg used per roast, burn rate (lbs/day), ~days left with a depletion bar, the suggested next order, and where the filter roast goes by brew method (batch / cold brew / pour-over). Waste settles **cycle to cycle**: a Closed Cycles section tables the last three closed cycles per roast (stocked / used / counted / waste with % of opening, red WASTE chip above 5%). Drinks sold that don't match a recipe are called out rather than silently dropped.
 - **Stock Log** — log coffee deliveries per roast (Espresso Roast / Filter Roast) and milk deliveries / Numilk rates
-- **Order** — place a coffee order with the roastery, emailed to the configured address (default `hello@boxxcoffee.com`). Includes a suggested order computed from the current cycle's burn rate, a one-click **Duplicate Last Order**, and a full order history.
+- **Order** — place a coffee order with the roastery, emailed to the configured address (default `hello@boxxcoffee.la`). Includes a suggested order computed from the current cycle's burn rate, a one-click **Duplicate Last Order**, and a full order history.
 - **Drink Recipes** — each recipe is **picked from the shop's live Square catalog** (with 30-day sold counts), never typed, so names always match sales data. The editor asks *how is it brewed* — Espresso Machine, Batch Brew, Cold Brew, or Pour-Over — and the method decides the roast. Batch methods take batch inputs (coffee per batch + yield as cups served, or liters + serving oz) and the per-cup dose is computed server-side; espresso and pour-over keep a per-drink dose. Square items with no recipe are surfaced with **Map It** or **No coffee — ignore**. Starts empty — nothing is pre-seeded.
 - **Settings** — Square access token + Location ID, ordering config, and user management (all admin-only), plus own-password change for everyone. Secret fields are write-only: they show configured/not-configured, never the value.
 - **App Tour** — every user's first sign-in opens a guided, click-through walkthrough of the real app (spotlight steps, in adoption order: log a delivery → connect Square → add recipes), ending with buttons that jump straight to those actions. Seen-state is per user, server-side; replayable from Settings → Help.
@@ -117,7 +118,7 @@ The `hub/` directory contains a separate service for the roastery:
 - **Shops** — create a shop with its registered email to mint its API key (shown once, stored hashed); edit, rotate keys.
 - **Patterns** — per shop: volume, spend, espresso/filter roast mix, top coffees, cadence, 12-week trend.
 
-**Hub environment variables:** `HUB_PASSWORD` (roastery login, required), `HUB_DB_PATH=/app/data/hub.db`, `RESEND_API_KEY` + `HUB_EMAIL_FROM` (sender — must be on the Resend-verified domain, e.g. `Dose Hub <order@send.boxxcoffee.com>`), `HUB_REPLY_TO` (where shop replies land, e.g. `order@boxxcoffee.com`), `HUB_NOTIFY_EMAIL` (your copy of new orders), `HUB_CURRENCY` (default `$`).
+**Hub environment variables:** `HUB_PASSWORD` (roastery login, required), `HUB_DB_PATH=/app/data/hub.db`, `RESEND_API_KEY` + `HUB_EMAIL_FROM` (sender — must be on the Resend-verified domain, e.g. `Dose Hub <order@send.boxxcoffee.la>`), `HUB_REPLY_TO` (where shop replies land, e.g. `order@boxxcoffee.la`), `HUB_NOTIFY_EMAIL` (your copy of new orders), `HUB_CURRENCY` (default `$`).
 
 **Deploy** (own Railway service, same repo): New service → same GitHub repo → **Root Directory `/hub`** → variables above → volume at `/app/data`.
 
