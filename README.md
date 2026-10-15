@@ -116,7 +116,7 @@ The `hub/` directory contains a separate service for the roastery:
 - **Fulfillment** — one bucket card per confirmed order, grouped by customer and sorted by requested delivery. Items stay greyed "awaiting roast" until their coffee is marked roasted, then get checked off as they're physically packed (wholesale shown as 5-lb bags, retail as 12oz bags). A **4×6 packing slip** prints per order, and a fully packed order ships with one click — which sends the "Shipped" email and updates the shop's order history.
 - **Reports** — roasted coffee per client, rolled up automatically at the close of each week and month. Orders are kept forever (storage is negligible).
 - **Shops** — create a shop with its registered email to mint its API key (shown once, stored hashed); edit, rotate keys.
-- **Patterns** — per shop: volume, spend, espresso/filter roast mix, top coffees, cadence, 12-week trend.
+- **Patterns** — per shop: volume, spend, espresso/filter roast mix, top coffees, cadence, 12-week trend. Plus **cup profiles**: each coffee carries up to three house-vocabulary tags (Juicy, Winey, Buttery, Bright, …) set in its info sheet; Patterns turns 90 days of orders into each shop's palate per roast (bars in the shop drill-in) and a shops×profiles matrix with an espresso/filter toggle. Untagged coffees are excluded and named, never silently skipped.
 
 **Hub environment variables:** `HUB_PASSWORD` (roastery login, required), `HUB_DB_PATH=/app/data/hub.db`, `RESEND_API_KEY` + `HUB_EMAIL_FROM` (sender — must be on the Resend-verified domain, e.g. `Dose Hub <order@send.boxxcoffee.la>`), `HUB_REPLY_TO` (where shop replies land, e.g. `order@boxxcoffee.la`), `HUB_NOTIFY_EMAIL` (your copy of new orders), `HUB_CURRENCY` (default `$`).
 

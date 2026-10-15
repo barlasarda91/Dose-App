@@ -52,6 +52,8 @@ function catalogForShop(items, shopId, exclusiveGrants, rules) {
     .map(i => {
       let sections = [];
       try { sections = i.info_sections ? (Array.isArray(i.info_sections) ? i.info_sections : JSON.parse(i.info_sections)) : []; } catch { sections = []; }
+      let profile = [];
+      try { profile = i.profile_tags ? (Array.isArray(i.profile_tags) ? i.profile_tags : JSON.parse(i.profile_tags)) : []; } catch { profile = []; }
       const sheet = {
         country: i.info_country || null, region: i.info_region || null, producer: i.info_producer || null,
         variety: i.info_variety || null, process: i.info_process || null, altitude: i.info_altitude || null,
@@ -66,6 +68,7 @@ function catalogForShop(items, shopId, exclusiveGrants, rules) {
         low_stock: !!i.low_stock,
         price_per_lb: effectivePrice(i, shopId, rules),
         retail_price: i.retail_price != null && i.retail_price > 0 ? Math.round(i.retail_price * 100) / 100 : null,
+        profile,
         info_sheet: hasSheet ? sheet : null,
       };
     });

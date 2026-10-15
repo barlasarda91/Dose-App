@@ -184,6 +184,8 @@ try { db.exec('ALTER TABLE catalog ADD COLUMN retail_price REAL'); } catch { /* 
 for (const col of ['bags INTEGER', 'roasted INTEGER DEFAULT 0', 'roasted_at TEXT', 'packed INTEGER DEFAULT 0', 'packed_at TEXT']) {
   try { db.exec(`ALTER TABLE order_items ADD COLUMN ${col}`); } catch { /* present */ }
 }
+// Cup profile: up to three house-vocabulary tags per coffee (JSON array).
+try { db.exec('ALTER TABLE catalog ADD COLUMN profile_tags TEXT'); } catch { /* present */ }
 
 // Widen CHECK constraints from earlier versions (SQLite requires a rebuild).
 function rebuildTable(table, needle, createSql, columns) {
@@ -1086,11 +1088,20 @@ function catalogItemFull(id) {
   if (!item) return null;
   item.exclusive_shop_ids = db.prepare('SELECT shop_id FROM catalog_visibility WHERE coffee_id=?').all(id).map(r => r.shop_id);
   try { item.info_sections = item.info_sections ? JSON.parse(item.info_sections) : []; } catch { item.info_sections = []; }
+  try { item.profile_tags = item.profile_tags ? JSON.parse(item.profile_tags) : []; } catch { item.profile_tags = []; }
   return item;
 }
 
 // The info sheet is edited on its own — the story lives apart from pricing.
 const SHEET_FACTS = ['info_country', 'info_region', 'info_producer', 'info_variety', 'info_process', 'info_altitude'];
+
+// The cup-profile house vocabulary. Fixed on purpose: free-text tags would
+// splinter into "fruity"/"fruit-forward"/"fruity!" and kill the cross-shop
+// analysis. Three per coffee at most — a coffee that is everything is nothing.
+const PROFILE_VOCAB = ['Juicy', 'Winey', 'Buttery', 'Bright', 'Chocolatey', 'Clean', 'Nutty', 'Floral', 'Jammy', 'Funky'];
+const PROFILE_MAX = 3;
+
+app.get('/api/profile-vocab', (req, res) => res.json({ vocab: PROFILE_VOCAB, max: PROFILE_MAX }));
 // Archive / restore: archived coffees vanish from every shop's price list
 // instantly but keep their history (orders reference them by id). Deleting
 // a catalog item is deliberately not a thing.
@@ -1122,10 +1133,25 @@ app.put('/api/catalog/:id/sheet', requireOwner, (req, res) => {
   const sections = raw
     .map(x => ({ title: String((x || {}).title || '').slice(0, 120).trim(), body: String((x || {}).body || '').slice(0, 8000).trim() }))
     .filter(x => x.title || x.body);
+
+  // Cup profile tags ride with the sheet: omitted = unchanged; [] = cleared.
+  let tagsJson = item.profile_tags || null;
+  if (b.profile_tags !== undefined) {
+    const given = Array.isArray(b.profile_tags) ? b.profile_tags : [];
+    const canon = [];
+    for (const t of given) {
+      const hit = PROFILE_VOCAB.find(v => v.toLowerCase() === String(t).toLowerCase().trim());
+      if (!hit) return res.status(400).json({ error: `"${t}" is not in the house profile vocabulary (${PROFILE_VOCAB.join(', ')})` });
+      if (!canon.includes(hit)) canon.push(hit);
+    }
+    if (canon.length > PROFILE_MAX) return res.status(400).json({ error: `Pick at most ${PROFILE_MAX} profile tags — a coffee that is everything is nothing` });
+    tagsJson = canon.length ? JSON.stringify(canon) : null;
+  }
+
   db.prepare(`UPDATE catalog SET info_country=?, info_region=?, info_producer=?, info_variety=?, info_process=?, info_altitude=?,
-    brew_filter=?, brew_espresso=?, info_sections=? WHERE id=?`)
+    brew_filter=?, brew_espresso=?, info_sections=?, profile_tags=? WHERE id=?`)
     .run(facts.info_country, facts.info_region, facts.info_producer, facts.info_variety, facts.info_process, facts.info_altitude,
-      brewFilter, brewEspresso, sections.length ? JSON.stringify(sections) : null, req.params.id);
+      brewFilter, brewEspresso, sections.length ? JSON.stringify(sections) : null, tagsJson, req.params.id);
   audit(req, `updated the info sheet for "${item.name}"`);
   res.json(catalogItemFull(req.params.id));
 });
@@ -1833,6 +1859,52 @@ app.get('/api/analytics/shop/:id', (req, res) => {
     avg_interval_days: avgInterval,
     roast_mix: { espresso: Math.round(mix.esp * 10) / 10, filter: Math.round(mix.flt * 10) / 10 },
     coffees, weekly, recent,
+  });
+});
+
+// ─── Cup-profile patterns ────────────────────────────────────────────────────
+// Each shop's palate in numbers, split by roast: every pound ordered in the
+// last 90 days carries its coffee's profile tags. Shares are of the shop's
+// TAGGED volume within that roast; untagged coffees are excluded and named,
+// so the gap is visible instead of silently skewing the read. Retail bags
+// count with their roast; pre-split legacy 'retail' rows are skipped.
+app.get('/api/profile-patterns', (req, res) => {
+  const tagsOf = new Map();
+  const untagged = [];
+  for (const c of db.prepare('SELECT id, name, profile_tags, active FROM catalog').all()) {
+    let tags = [];
+    try { tags = c.profile_tags ? JSON.parse(c.profile_tags) : []; } catch { tags = []; }
+    tagsOf.set(c.id, tags);
+    if (c.active && !tags.length) untagged.push(c.name);
+  }
+  const rows = db.prepare(
+    `SELECT o.shop_id, s.name shop_name, oi.coffee_id, oi.roast, SUM(oi.lbs) lbs
+     FROM order_items oi JOIN orders o ON o.id = oi.order_id JOIN shops s ON s.id = o.shop_id
+     WHERE o.order_date >= date('now', '-90 days') AND oi.roast != 'retail'
+     GROUP BY o.shop_id, oi.coffee_id, oi.roast`).all();
+  const byShop = new Map();
+  for (const r of rows) {
+    const tags = tagsOf.get(r.coffee_id) || [];
+    if (!tags.length) continue;
+    const pool = (r.roast === 'espresso' || r.roast === 'retail_espresso') ? 'esp' : 'fil';
+    const sh = byShop.get(r.shop_id) || { shop_id: r.shop_id, shop_name: r.shop_name, esp: {}, fil: {}, esp_lbs: 0, fil_lbs: 0 };
+    sh[`${pool}_lbs`] += r.lbs;
+    for (const t of tags) sh[pool][t] = (sh[pool][t] || 0) + r.lbs;
+    byShop.set(r.shop_id, sh);
+  }
+  const pct = (bucket, total) => Object.fromEntries(
+    Object.entries(bucket)
+      .sort((a, b) => b[1] - a[1])
+      .map(([t, lbs]) => [t, { lbs: r2(lbs), share: total ? Math.round(lbs / total * 100) : 0 }]));
+  res.json({
+    vocab: PROFILE_VOCAB, days: 90, untagged: untagged.sort(),
+    shops: [...byShop.values()]
+      .sort((a, b) => a.shop_name.localeCompare(b.shop_name))
+      .map(sh => ({
+        shop_id: sh.shop_id, shop_name: sh.shop_name,
+        esp_lbs: r2(sh.esp_lbs), fil_lbs: r2(sh.fil_lbs),
+        esp: pct(sh.esp, sh.esp_lbs), fil: pct(sh.fil, sh.fil_lbs),
+      })),
   });
 });
 

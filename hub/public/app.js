@@ -811,8 +811,8 @@
   async function renderCatalog() {
     const page = document.getElementById('page');
     page.innerHTML = header('Roastery', 'Catalog', 'The coffee list shops order from. Exclusive coffees are only visible to the shops you pick.');
-    let items = [], shops = [];
-    try { [items, shops] = await Promise.all([api('/api/catalog'), api('/api/shops')]); }
+    let items = [], shops = [], vocab = { vocab: [], max: 3 };
+    try { [items, shops, vocab] = await Promise.all([api('/api/catalog'), api('/api/shops'), api('/api/profile-vocab')]); }
     catch (e) { if (e.message !== 'Unauthorized') page.innerHTML += `<div class="err">${esc(e.message)}</div>`; return; }
 
     const formEl = document.createElement('div');
@@ -888,10 +888,13 @@
         i.badge ? `<span class="badge seasonal">${esc(i.badge)}</span>` : '',
         i.low_stock ? '<span class="badge low">Low stock</span>' : '',
       ].join('');
+      const profLine = i => (i.profile_tags || []).length
+        ? `<div style="margin-top:4px">${i.profile_tags.map(t => `<span class="pchip on">${esc(t)}</span>`).join('')}</div>`
+        : (i.active ? '<div class="pchip-none">no profile yet — not counted in Patterns</div>' : '');
       const row = i => `
           <tr style="${i.active ? '' : 'opacity:.65'}">
             <td><span style="font-family:var(--serif);font-size:13px;color:var(--ink)">${esc(i.name)}</span>${badge(i)}
-              <div style="font-size:10px;color:var(--drift)">${esc(fmtTastingNotes(i.notes))}</div></td>
+              <div style="font-size:10px;color:var(--drift)">${esc(fmtTastingNotes(i.notes))}</div>${profLine(i)}</td>
             <td class="num">${money(i.price_per_lb)}</td>
             <td class="num">${i.retail_price != null ? money(i.retail_price) : '—'}</td>
             <td style="font-size:11px;color:var(--drift)">${i.visibility === 'exclusive'
@@ -947,6 +950,7 @@
     // roastery's own sections in its own order.
     function sheetEditor(item) {
       let sections = (item.info_sections || []).map(x => ({ ...x }));
+      let tags = [...(item.profile_tags || [])];
       const wrap = document.createElement('div');
       wrap.className = 'modal-bg show';
       document.body.appendChild(wrap);
@@ -956,6 +960,10 @@
         wrap.innerHTML = `<div class="modal" style="width:680px">
           <div class="modal-title">Info Sheet — ${esc(item.name)}</div>
           <div class="modal-body">
+            <div class="lbl" style="margin-bottom:8px">Cup Profile — up to ${vocab.max}, feeds the Patterns tab</div>
+            <div style="display:flex;gap:5px;flex-wrap:wrap;margin-bottom:16px">
+              ${vocab.vocab.map(v => `<button type="button" class="pchip ${tags.includes(v) ? 'on' : ''}" data-tag="${esc(v)}">${esc(v)}</button>`).join('')}
+            </div>
             <div class="lbl" style="margin-bottom:8px">Label Facts</div>
             <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:10px;margin-bottom:16px">
               ${FACTS.map(([k, l]) => `<div><label class="lbl">${l}</label><input data-fact="${k}" value="${esc(item[k] || '')}"></div>`).join('')}
@@ -990,6 +998,14 @@
             body: wrap.querySelector(`[data-sec-body="${idx}"]`).value,
           }));
         };
+        wrap.querySelectorAll('[data-tag]').forEach(b => b.onclick = () => {
+          collect();
+          const t = b.dataset.tag;
+          if (tags.includes(t)) tags = tags.filter(x => x !== t);
+          else if (tags.length >= vocab.max) { wrap.querySelector('#sh-err').textContent = `${vocab.max} is the cap — drop one first. A coffee that is everything is nothing.`; return; }
+          else tags.push(t);
+          draw();
+        });
         wrap.querySelector('#sh-add').onclick = () => { collect(); sections.push({ title: '', body: '' }); draw(); };
         wrap.querySelectorAll('[data-sec-del]').forEach(b => b.onclick = () => { collect(); sections.splice(parseInt(b.dataset.secDel, 10), 1); draw(); });
         wrap.querySelectorAll('[data-sec-up]').forEach(b => b.onclick = () => { collect(); const i2 = parseInt(b.dataset.secUp, 10); [sections[i2 - 1], sections[i2]] = [sections[i2], sections[i2 - 1]]; draw(); });
@@ -997,7 +1013,7 @@
         wrap.querySelector('#sh-cancel').onclick = () => wrap.remove();
         wrap.querySelector('#sh-save').onclick = async () => {
           collect();
-          const body = { brew_filter: wrap.querySelector('#sh-bf').value, brew_espresso: wrap.querySelector('#sh-be').value, info_sections: sections };
+          const body = { brew_filter: wrap.querySelector('#sh-bf').value, brew_espresso: wrap.querySelector('#sh-be').value, info_sections: sections, profile_tags: tags };
           wrap.querySelectorAll('[data-fact]').forEach(el => { body[el.dataset.fact] = el.value; });
           try {
             const saved = await api(`/api/catalog/${item.id}/sheet`, { method: 'PUT', body: JSON.stringify(body) });
@@ -1238,17 +1254,68 @@
       </div>`;
     }).join('')}</div>`;
     page.querySelectorAll('[data-shop]').forEach(el => el.onclick = () => renderShopDetail(el.dataset.shop));
+
+    // Cup-profile matrix: shops × house vocabulary, share of tagged volume
+    // within the chosen roast. The dark cells are each shop's palate.
+    let pp = null;
+    try { pp = await api('/api/profile-patterns'); } catch { /* optional garnish */ }
+    if (pp && pp.shops.length && pp.shops.some(s => s.esp_lbs || s.fil_lbs)) {
+      const sec = document.createElement('div');
+      page.appendChild(sec);
+      let roast = 'esp';
+      const cellCls = v => v === 0 ? 'mxcell0' : v < 25 ? 'mxcell1' : v < 45 ? 'mxcell2' : 'mxcell3';
+      const drawMx = () => {
+        sec.innerHTML = `
+          <div class="sechead"><span>Cup Profiles · share of tagged volume, last ${pp.days} days</span></div>
+          <div class="mxswitch">
+            <button data-mx="esp" class="${roast === 'esp' ? 'on' : ''}">Espresso roast</button>
+            <button data-mx="fil" class="${roast === 'fil' ? 'on' : ''}">Filter roast</button>
+          </div>
+          <div class="table-wrap"><table>
+            <thead><tr><th>Shop</th>${pp.vocab.map(v => `<th class="num">${esc(v)}</th>`).join('')}</tr></thead>
+            <tbody>${pp.shops.map(s => `<tr>
+              <td style="font-family:var(--serif);font-size:13px;white-space:nowrap">${esc(s.shop_name)}
+                <div style="font-size:10px;color:var(--drift)">${s[`${roast}_lbs`]} lbs tagged</div></td>
+              ${pp.vocab.map(v => {
+                const e = s[roast][v];
+                return `<td class="num ${cellCls(e ? e.share : 0)}" title="${e ? `${e.lbs} lbs` : 'none'}">${e ? e.share + '%' : '—'}</td>`;
+              }).join('')}
+            </tr>`).join('')}</tbody>
+          </table></div>
+          ${pp.untagged.length ? `<div class="stat-line" style="margin-top:8px;color:var(--warn)">Not counted — no profile set: ${pp.untagged.map(esc).join(', ')} (Catalog → Info Sheet)</div>` : ''}`;
+        sec.querySelectorAll('[data-mx]').forEach(b => b.onclick = () => { roast = b.dataset.mx; drawMx(); });
+      };
+      drawMx();
+    }
   }
 
   async function renderShopDetail(shopId) {
     const page = document.getElementById('page');
-    let s;
+    let s, pp = null;
     try { s = await api(`/api/analytics/shop/${shopId}`); }
     catch (e) { if (e.message !== 'Unauthorized') page.innerHTML = `<div class="err">${esc(e.message)}</div>`; return; }
+    try { pp = await api('/api/profile-patterns'); } catch { /* optional garnish */ }
+    const prof = pp && pp.shops.find(x => String(x.shop_id) === String(shopId));
     CURRENCY = s.currency || CURRENCY;
     const mixTotal = Math.max(0.001, s.roast_mix.espresso + s.roast_mix.filter);
     const maxWeek = Math.max(1, ...s.weekly.map(w => w.lbs));
     const maxCoffee = Math.max(1, ...s.coffees.map(c => c.lbs));
+    // Palate bars: shares of tagged volume per roast, from /api/profile-patterns.
+    const profBars = (bucket, color) => Object.entries(bucket || {}).map(([t, v]) => `
+      <div style="display:grid;grid-template-columns:92px 1fr 42px;gap:8px;align-items:center;margin-top:6px;font-size:11px">
+        <span style="text-transform:uppercase;letter-spacing:.08em;font-size:10px;color:var(--graphite)">${esc(t)}</span>
+        <div style="height:10px;background:var(--stone)"><div style="height:100%;width:${v.share}%;background:${color}"></div></div>
+        <span class="num" style="color:var(--drift)">${v.share}%</span>
+      </div>`).join('') || '<div class="stat-line" style="margin-top:4px">no tagged volume in this roast</div>';
+    const profileCard = prof && (prof.esp_lbs || prof.fil_lbs) ? `
+          <div class="sechead"><span>Cup Profile · last ${pp.days} days</span></div>
+          <div class="card" style="margin:0 0 16px">
+            <div class="lbl">Espresso roast — ${prof.esp_lbs} lbs tagged</div>
+            ${profBars(prof.esp, '#6B6E4A')}
+            <div class="lbl" style="margin-top:14px">Filter roast — ${prof.fil_lbs} lbs tagged</div>
+            ${profBars(prof.fil, '#C4833A')}
+            <div class="stat-line" style="margin-top:8px">what this shop's palate is, per roast — untagged coffees not counted</div>
+          </div>` : '';
     page.innerHTML = `
       <span class="backlink" id="pat-back">← All shops</span>
       ${header('Account', esc(s.shop.name), 'Everything this account has ordered, and how they order it.')}
@@ -1280,6 +1347,7 @@
             </div>
             <div class="stat-line" style="margin-top:6px">retail bags counted with their roast profile</div>
           </div>
+          ${profileCard}
         </div>
         <div>
           <div class="sechead" style="margin-top:0"><span>Coffees they buy</span></div>

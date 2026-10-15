@@ -75,6 +75,15 @@ tr:last-child td{border-bottom:none}
 .badge{display:inline-block;font-size:9px;letter-spacing:.14em;text-transform:uppercase;border:1px solid var(--linen);padding:2px 7px;color:var(--drift);margin-left:8px;vertical-align:middle}
 .badge.seasonal{color:var(--olive);border-color:var(--olive)}
 .badge.low{color:var(--warn);border-color:var(--warn)}
+.pchip{display:inline-block;font-size:9px;letter-spacing:.1em;text-transform:uppercase;border:1px solid var(--linen);border-radius:999px;padding:2px 9px;color:var(--graphite);margin:2px 4px 0 0;background:transparent;font-family:var(--mono);cursor:default}
+button.pchip{cursor:pointer}
+button.pchip:hover{border-color:var(--drift)}
+.pchip.on{background:var(--olive);border-color:var(--olive);color:var(--parch)}
+.pchip-none{font-size:10px;color:var(--warn);margin-top:4px}
+.mxcell0{color:var(--linen)} .mxcell1{background:#EDE6D8} .mxcell2{background:#D9D6BE} .mxcell3{background:var(--olive);color:var(--parch);font-weight:600}
+.mxswitch{display:inline-flex;border:1px solid var(--stone);margin-bottom:10px}
+.mxswitch button{border:0;background:transparent;font-family:var(--mono);font-size:10px;letter-spacing:.12em;text-transform:uppercase;padding:7px 14px;cursor:pointer;color:var(--drift)}
+.mxswitch button.on{background:var(--ink);color:var(--parch)}
 .pool-mix{display:flex;height:8px;border:1px solid var(--linen);margin-top:10px;overflow:hidden}
 .pool-mix>div{height:100%}
 .legend{display:flex;gap:12px;font-size:10px;color:var(--drift);margin-top:6px;flex-wrap:wrap}
@@ -194,6 +203,6 @@ tbody tr.covered td{background:rgba(107,110,74,.13)}
   </div>
   <div class="slip-dim">4 in × 6 in label</div>
 </div></div>
-<script src="/app.js?v=16"></script>
+<script src="/app.js?v=17"></script>
 </body>
 </html>
