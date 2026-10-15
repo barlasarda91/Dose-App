@@ -8,6 +8,7 @@ const crypto = require('crypto');
 const Database = require('better-sqlite3');
 const path = require('path');
 const { BAG_LBS, isRetail, catalogForShop, priceOrderItems } = require('./pricing');
+const { parseProductDoc, suggestMatch } = require('./docimport');
 
 const app = express();
 app.set('trust proxy', 1); // Railway proxy — needed for req.protocol/req.ip
@@ -186,6 +187,8 @@ for (const col of ['bags INTEGER', 'roasted INTEGER DEFAULT 0', 'roasted_at TEXT
 }
 // Cup profile: up to three house-vocabulary tags per coffee (JSON array).
 try { db.exec('ALTER TABLE catalog ADD COLUMN profile_tags TEXT'); } catch { /* present */ }
+// Odd settings that belong to the hub itself (e.g. the product-doc URL).
+db.exec('CREATE TABLE IF NOT EXISTS hub_meta (key TEXT PRIMARY KEY, value TEXT)');
 
 // Widen CHECK constraints from earlier versions (SQLite requires a rebuild).
 function rebuildTable(table, needle, createSql, columns) {
@@ -1158,6 +1161,76 @@ app.put('/api/catalog/:id/sheet', requireOwner, (req, res) => {
 
 app.get('/api/catalog', (req, res) => {
   res.json(db.prepare('SELECT * FROM catalog ORDER BY active DESC, name').all().map(i => catalogItemFull(i.id)));
+});
+
+// ─── Product-doc import ──────────────────────────────────────────────────────
+// Pull the roastery's product-pages Google Doc, parse each coffee's page into
+// info-sheet fields, and show a preview — nothing is written until the owner
+// applies, per coffee, against an explicit catalog match. Import fills
+// SHEETS only: pricing, brew notes, and cup profiles are never touched.
+const metaGet = k => (db.prepare('SELECT value FROM hub_meta WHERE key=?').get(k) || {}).value || '';
+const metaSet = (k, v) => db.prepare('INSERT OR REPLACE INTO hub_meta (key, value) VALUES (?,?)').run(k, String(v));
+
+app.get('/api/import-doc', requireOwner, (req, res) => res.json({ doc_url: metaGet('product_doc_url') }));
+
+app.post('/api/import-doc', requireOwner, async (req, res) => {
+  try {
+    const b = req.body || {};
+    let text = typeof b.text === 'string' ? b.text : '';
+    const docUrl = String(b.doc_url || '').trim();
+    if (!text && docUrl) {
+      const m = docUrl.match(/\/document\/d\/([a-zA-Z0-9_-]{20,})/);
+      if (!m) return res.status(400).json({ error: 'That does not look like a Google Doc link (expected …/document/d/…)' });
+      // The markdown export keeps headings; needs "anyone with the link" sharing.
+      const controller = new AbortController();
+      const t = setTimeout(() => controller.abort(), 12000);
+      try {
+        const r = await fetch(`https://docs.google.com/document/d/${m[1]}/export?format=markdown`, {
+          signal: controller.signal, redirect: 'follow',
+        });
+        if (!r.ok) {
+          return res.status(400).json({ error: `Google would not hand the doc over (HTTP ${r.status}) — is it shared "Anyone with the link — Viewer"? You can paste the doc text instead.` });
+        }
+        text = await r.text();
+      } catch (err) {
+        return res.status(502).json({ error: `Could not reach Google Docs: ${err.message}. You can paste the doc text instead.` });
+      } finally {
+        clearTimeout(t);
+      }
+      metaSet('product_doc_url', docUrl);
+    }
+    if (!text.trim()) return res.status(400).json({ error: 'Give the doc link or paste its text' });
+    const coffees = parseProductDoc(text).slice(0, 100);
+    if (!coffees.length) return res.status(400).json({ error: 'No coffee pages found — the parser keys on your section headings (Intro, Relationship, Country, Region, Farm, Variety, Process)' });
+    const items = db.prepare('SELECT id, name FROM catalog WHERE active=1').all();
+    audit(req, `previewed a product-doc import (${coffees.length} coffee page${coffees.length === 1 ? '' : 's'} parsed)`);
+    res.json({ coffees: coffees.map(c => ({ ...c, match_id: suggestMatch(c.title, items) })) });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.post('/api/import-doc/apply', requireOwner, (req, res) => {
+  const given = Array.isArray((req.body || {}).items) ? req.body.items.slice(0, 100) : [];
+  if (!given.length) return res.status(400).json({ error: 'Nothing selected to apply' });
+  const results = [];
+  for (const it of given) {
+    const item = db.prepare('SELECT * FROM catalog WHERE id=?').get(parseInt((it || {}).coffee_id, 10) || -1);
+    if (!item) { results.push({ coffee_id: it && it.coffee_id, ok: false, error: 'No such coffee' }); continue; }
+    const f = it.facts || {};
+    const fact = v => v ? String(v).slice(0, 160).trim() || null : null;
+    const sections = (Array.isArray(it.sections) ? it.sections : []).slice(0, 12)
+      .map(x => ({ title: String((x || {}).title || '').slice(0, 120).trim(), body: String((x || {}).body || '').slice(0, 8000).trim() }))
+      .filter(x => x.title || x.body);
+    db.prepare(`UPDATE catalog SET info_country=?, info_region=?, info_producer=?, info_variety=?, info_process=?, info_altitude=?,
+      info_sections=? WHERE id=?`)
+      .run(fact(f.country), fact(f.region), fact(f.producer), fact(f.variety), fact(f.process), fact(f.altitude),
+        sections.length ? JSON.stringify(sections) : null, item.id);
+    audit(req, `imported the info sheet for "${item.name}" from the product doc`);
+    results.push({ coffee_id: item.id, name: item.name, ok: true });
+  }
+  res.json({ applied: results.filter(r => r.ok).length, results });
 });
 
 const BADGES = ['Blend', 'Single Origin', 'Single Farm', 'Single Lot', 'Decaf'];
