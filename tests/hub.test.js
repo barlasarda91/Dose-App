@@ -248,6 +248,40 @@ const j = client(API, 'x-hub-key');
     r = await portal('POST', '/auth', { username: shopUname, password: 'post-reset-77' });
     ok(r.status === 200, 'roaster reset clears the portal lockout too');
 
+    section('cup profiles: vocabulary walls and the palate math');
+    r = await j('PUT', `/api/catalog/${coffeeId}/sheet`, { profile_tags: ['Juicy'] }, STAFF);
+    ok(r.status === 403, 'staff cannot set profile tags');
+    r = await j('PUT', `/api/catalog/${coffeeId}/sheet`, { profile_tags: ['juicy', 'Winey', 'JUICY'] }, OWNER);
+    ok(r.status === 200 && JSON.stringify(r.body.profile_tags) === '["Juicy","Winey"]',
+      `tags canonicalized and deduped (${JSON.stringify(r.body.profile_tags)})`);
+    r = await j('PUT', `/api/catalog/${coffeeId}/sheet`, { profile_tags: ['Juicy', 'Winey', 'Bright', 'Funky'] }, OWNER);
+    ok(r.status === 400 && /at most 3/.test(r.body.error), 'four tags rejected');
+    r = await j('PUT', `/api/catalog/${coffeeId}/sheet`, { profile_tags: ['Oaky'] }, OWNER);
+    ok(r.status === 400 && /"Oaky"/.test(r.body.error), 'off-vocabulary tag rejected by name');
+    r = await j('PUT', `/api/catalog/${coffeeId}/sheet`, { info_country: 'Ethiopia' }, OWNER);
+    ok(JSON.stringify(r.body.profile_tags) === '["Juicy","Winey"]', 'sheet save without tags leaves them unchanged');
+    r = await j('GET', '/api/profile-patterns', null, STAFF);
+    ok(r.body.untagged.includes('Sheetless Decaf'), 'untagged active coffee is named, not silently skipped');
+    await j('PUT', `/api/catalog/${plainId}/sheet`, { profile_tags: ['Buttery'] }, OWNER);
+    r = await fetch(`${API}/api/ingest/catalog`, { headers: { Authorization: `Bearer ${shopKey}` } }).then(x => x.json());
+    ok(JSON.stringify(r.items.find(i => i.id === coffeeId).profile) === '["Juicy","Winey"]', 'profile rides the shop catalog sync');
+
+    // A fresh order inside the 90-day window: 10 lb Juicy/Winey espresso +
+    // 5 lb Buttery espresso + 5 lb Juicy/Winey filter.
+    const today = new Date().toISOString().slice(0, 10);
+    r = await ingest(shopKey, { order_date: today, source_order_id: 777, items: [
+      { coffee_id: coffeeId, roast: 'espresso', lbs: 10 },
+      { coffee_id: plainId, roast: 'espresso', lbs: 5 },
+      { coffee_id: coffeeId, roast: 'filter', lbs: 5 },
+    ] });
+    ok(r.status === 200, 'tagged order lands');
+    r = await j('GET', '/api/profile-patterns', null, STAFF);
+    const pat = r.body.shops.find(x => x.shop_name === 'Pressure Shop');
+    ok(pat && pat.esp_lbs === 15 && pat.fil_lbs === 5, `tagged lbs split by roast (esp ${pat && pat.esp_lbs}, fil ${pat && pat.fil_lbs})`);
+    ok(pat.esp.Juicy.share === 67 && pat.esp.Buttery.share === 33, `espresso palate shares right (Juicy ${pat.esp.Juicy.share}%, Buttery ${pat.esp.Buttery.share}%)`);
+    ok(pat.fil.Winey.share === 100 && !pat.fil.Buttery, 'filter palate only sees filter pounds');
+    ok(r.body.untagged.length === 0, 'everything tagged — the nudge list clears');
+
     section('adjustment guards');
     r = await j('POST', '/api/on-hand/adjust', { coffee_id: coffeeId, profile: 'espresso', delta_lbs: 0 }, STAFF);
     ok(r.status === 400, 'zero-delta adjustment rejected');
