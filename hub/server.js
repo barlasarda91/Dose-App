@@ -193,10 +193,16 @@ db.exec('CREATE TABLE IF NOT EXISTS hub_meta (key TEXT PRIMARY KEY, value TEXT)'
 function rebuildTable(table, needle, createSql, columns) {
   const row = db.prepare("SELECT sql FROM sqlite_master WHERE type='table' AND name=?").get(table);
   if (!row || row.sql.includes(needle)) return;
+  // legacy_alter_table: RENAME must NOT rewrite other tables' FK references
+  // to point at the throwaway _migr name (they'd dangle after the DROP).
+  db.pragma('foreign_keys = OFF');
+  db.pragma('legacy_alter_table = ON');
   db.exec(`ALTER TABLE ${table} RENAME TO ${table}_migr`);
   db.exec(createSql);
   db.exec(`INSERT INTO ${table} (${columns}) SELECT ${columns} FROM ${table}_migr`);
   db.exec(`DROP TABLE ${table}_migr`);
+  db.pragma('legacy_alter_table = OFF');
+  db.pragma('foreign_keys = ON');
   console.log(`Migrated ${table} schema`);
 }
 rebuildTable('orders', "'shipped'", `CREATE TABLE orders (
@@ -238,6 +244,8 @@ db.prepare("INSERT OR IGNORE INTO roast_math (coffee_id, profile, green_in, roas
   const row = db.prepare("SELECT sql FROM sqlite_master WHERE type='table' AND name='shops'").get();
   if (row && row.sql.includes('api_key_hash')) {
     const cols = 'id, name, email, app_url, login_username, password_hash, salt, invite_token_hash, invite_expires_at, last_auth_ok_at, last_auth_fail_at, auth_fail_count, created_at';
+    db.pragma('foreign_keys = OFF');
+  db.pragma('legacy_alter_table = ON'); // keep orders/price_rules FK text pointing at "shops"
     db.exec('ALTER TABLE shops RENAME TO shops_migr');
     db.exec(`CREATE TABLE shops (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -256,6 +264,8 @@ db.prepare("INSERT OR IGNORE INTO roast_math (coffee_id, profile, green_in, roas
     )`);
     db.exec(`INSERT INTO shops (${cols}) SELECT ${cols} FROM shops_migr`);
     db.exec('DROP TABLE shops_migr');
+    db.pragma('legacy_alter_table = OFF');
+  db.pragma('foreign_keys = ON');
     console.log('Migrated shops schema — per-shop API keys removed');
   }
 }
