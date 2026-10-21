@@ -169,6 +169,35 @@ const waitExit = proc => new Promise(r => { proc.on('exit', code => r(code)); se
     r = await j('GET', '/api/users', null, TB);
     ok(!r.body.some(u => u.username === 'barista.a'), "Bravo's user list doesn't show Alpha's staff");
 
+    section('chain owner: one login, many stores, a switcher');
+    r = await jh('POST', '/api/shops', { name: 'Alpha Cafe Venice', email: 'venice@alpha.example.com' }, OWNER);
+    const venHubId = r.body.shop.id;
+    r = await jh('GET', '/api/shops', null, OWNER);
+    const alphaOwner = r.body.find(x => x.id === alphaHubId).logins.find(l => l.role === 'owner');
+    r = await jh('POST', `/api/logins/${alphaOwner.id}/grant`, { shop_id: venHubId }, OWNER);
+    ok(r.status === 200, 'hub grants Alpha the second store');
+    r = await j('POST', '/api/login', { username: ALPHA, password: 'alpha-pass-1' });
+    const TA2 = r.body.token;
+    r = await j('GET', '/api/me', null, TA2);
+    ok(r.body.shops.length === 2 && r.body.shops.filter(x => x.active).length === 1,
+      `owner sees both stores, one active (${r.body.shops.map(x => x.name).join(' / ')})`);
+    ok(r.body.shops.find(x => x.active).name === 'Alpha Cafe', 'login lands in the store they last worked in');
+    const ven = r.body.shops.find(x => !x.active);
+    r = await j('POST', '/api/me/switch-shop', { shop_id: ven.shop_id }, TA2);
+    const TV = r.body.token;
+    ok(r.status === 200 && !!TV, 'switch issues a session for the other store');
+    r = await j('GET', '/api/recipes', null, TV);
+    ok(r.body.length === 0, 'the new store opens empty — nothing bleeds across the chain');
+    await j('POST', '/api/recipes', { square_item_name: 'Venice Flat White', method: 'espresso', coffee_grams: 17 }, TV);
+    r = await j('GET', '/api/recipes', null, TA2);
+    ok(r.body.length === 1 && r.body[0].square_item_name === 'Alpha Latte', 'the first store is untouched by the second');
+    r = await j('GET', '/api/me', null, TB);
+    ok(r.body.shops.length === 1, 'a single-store owner gets no switcher fodder');
+    r = await j('POST', '/api/me/switch-shop', { shop_id: ven.shop_id }, TB);
+    ok(r.status === 404, "nobody switches into another chain's store");
+    r = await j('GET', '/api/me', null, TV);
+    ok(r.body.role === 'admin' && /Venice/.test(r.body.shop_name), 'the switched session knows where it is');
+
     section('standing orders stay in their shop');
     r = await j('POST', '/api/standing-orders', { frequency: 'weekly', items: [{ coffee_id: houseId, roast: 'espresso', lbs: 5 }] }, TA);
     const soId = r.body.id;
