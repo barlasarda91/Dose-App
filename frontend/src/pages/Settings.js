@@ -114,13 +114,11 @@ export default function Settings({ me, onReplayTour }) {
   const [shopName, setShopName]     = useState('');
   // Secret inputs are write-only: blank = keep current value
   const [squareToken, setSquareToken] = useState('');
-  const [hubApiKey, setHubApiKey]     = useState('');
   const [status, setStatus] = useState({ tokenSet: false, tokenSource: null, resendConfigured: false, resendSource: null, hubConfigured: false, authMode: 'local' });
   const [saved, setSaved]   = useState(false);
   const [hub, setHub] = useState({ loading: true });
   const [square, setSquare] = useState({ loading: true });
   const [sqFlash, setSqFlash]   = useState(null);
-  const [hubFlash, setHubFlash] = useState(null);
   const [pwForm, setPwForm] = useState({ current: '', next: '', confirm: '' });
   const [pwMsg, setPwMsg]   = useState(null);
 
@@ -160,15 +158,6 @@ export default function Settings({ me, onReplayTour }) {
     setTimeout(() => setSqFlash(null), 3500);
     await load().catch(() => {});
     checkSquare();
-  }
-  async function saveHubKey() {
-    if (!hubApiKey.trim()) return;
-    await apiJson('/api/settings', { method: 'POST', body: JSON.stringify({ hub_api_key: hubApiKey.trim() }) });
-    setHubApiKey('');
-    setHubFlash('✓ Saved just now');
-    setTimeout(() => setHubFlash(null), 3500);
-    await load().catch(() => {});
-    checkHub();
   }
   async function saveShopInfo() {
     const body = { shop_name: shopName };
@@ -272,26 +261,18 @@ export default function Settings({ me, onReplayTour }) {
           <div className="section-title">Ordering</div>
           {(() => {
             const state = hub.loading ? 'unset' : !hub.configured ? 'unset' : hub.ok ? 'ok' : 'bad';
-            const verdict = hub.loading ? '… verifying key with the hub'
-              : !hub.configured ? '✕ Not connected — enter the API key from the roastery'
-              : hub.ok ? `● Key verified — the hub recognizes this shop as “${hub.shop_name || 'unnamed shop'}” · ${hub.items} coffee${hub.items === 1 ? '' : 's'} on your price list`
-              : `✕ Key saved but not working: ${hub.error}`;
+            const verdict = hub.loading ? '… checking the connection to the roastery hub'
+              : !hub.configured ? '✕ This deployment is not connected to a roastery hub'
+              : hub.ok ? `● Connected — the hub recognizes this shop as “${hub.shop_name || 'unnamed shop'}” · ${hub.items} coffee${hub.items === 1 ? '' : 's'} on your price list`
+              : `✕ Connection problem: ${hub.error}`;
             return (
               <div className={`apitile ${state}`}>
                 <div className="apitile-head">
-                  <span className="apitile-name">Roastery Hub API Key</span>
+                  <span className="apitile-name">Roastery Hub</span>
                   <span className={`verdict ${state}`}>{verdict}</span>
                 </div>
-                <div className="apirow">
-                  <input type="password" placeholder={status.hubConfigured ? '•••••••• (leave blank to keep current)' : 'dose_… (API key from the roastery)'}
-                    value={hubApiKey} onChange={e => setHubApiKey(e.target.value)} autoComplete="new-password" />
-                  <button className="btn btn-primary" onClick={saveHubKey} disabled={!hubApiKey.trim()}>
-                    {status.hubConfigured ? 'Replace Key' : 'Save Key'}
-                  </button>
-                  {hubFlash && <span className="conn-status ok" style={{ marginTop: 0 }}>{hubFlash}</span>}
-                </div>
                 <div className="settings-field-hint">
-                  The roastery creates this shop in their Dose Hub and gives you this key — it's all you need. Receipts and confirmations are emailed by the hub to your registered address.
+                  Your shop signs in with its account — no keys to manage. Orders go straight to the roastery, and receipts and confirmations are emailed to your registered address.
                 </div>
               </div>
             );

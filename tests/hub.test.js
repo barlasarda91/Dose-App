@@ -1,6 +1,6 @@
-// Hub pressure tests: ingest dedup, order-status transitions, edit guards,
-// roast-fill idempotency and On Hand math, delete semantics, role walls.
-// Boots the real hub against a throwaway database.
+// Hub pressure tests: portal order intake + dedup, order-status transitions,
+// edit guards, roast-fill idempotency and On Hand math, delete semantics,
+// role walls. Boots the real hub against a throwaway database.
 const path = require('path');
 const { ok, near, section, finish, freshDir, client, startServer, waitUp } = require('./helpers');
 
@@ -14,15 +14,18 @@ const j = client(API, 'x-hub-key');
     HUB_DB_PATH: path.join(dir, 'hub.db'), PORT: String(PORT), HUB_PASSWORD: 'ptest-boot',
     PORTAL_KEY: 'portal-master-key',
   });
-  // Shop ingest uses its own bearer key, captured at shop creation.
-  const ingest = async (key, body) => {
-    const res = await fetch(`${API}/api/ingest/orders`, {
+  // Orders arrive through the portal: one master key, shop named per request.
+  const PKEY = 'portal-master-key';
+  const ingest = async (shopId, body, key = PKEY) => {
+    const res = await fetch(`${API}/api/portal/orders`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${key}` },
-      body: JSON.stringify(body),
+      body: JSON.stringify({ ...body, shop_id: shopId }),
     });
     return { status: res.status, body: await res.json().catch(() => ({})) };
   };
+  const portalCatalog = async (shopId) =>
+    fetch(`${API}/api/portal/catalog?shop_id=${shopId}`, { headers: { Authorization: `Bearer ${PKEY}` } }).then(x => x.json());
 
   try {
     await waitUp(`${API}/api/health`);
@@ -41,20 +44,19 @@ const j = client(API, 'x-hub-key');
     r = await j('POST', '/api/catalog', { name: 'Blend No. 1', price_per_lb: 14.5, retail_price: 12.5 }, OWNER);
     const coffeeId = r.body.id;
     r = await j('POST', '/api/shops', { name: 'Pressure Shop', email: 'shop@example.com' }, OWNER);
-    const shopKey = r.body.api_key;
-    ok(!!shopKey, 'shop provisioned with API key');
+    ok(r.body.shop && r.body.api_key === undefined, 'shop provisioned — no API key exists anywhere');
 
-    section('ingest: dedup and validation');
-    r = await ingest(shopKey, { order_date: '2026-06-01', source_order_id: 42, items: [{ coffee_id: coffeeId, roast: 'espresso', lbs: 35 }] });
-    ok(r.status === 200, 'order ingested');
-    r = await ingest(shopKey, { order_date: '2026-06-01', source_order_id: 42, items: [{ coffee_id: coffeeId, roast: 'espresso', lbs: 35 }] });
+    section('portal order intake: dedup and validation');
+    r = await ingest(1, { order_date: '2026-06-01', source_order_id: 42, items: [{ coffee_id: coffeeId, roast: 'espresso', lbs: 35 }] });
+    ok(r.status === 200, 'order lands');
+    r = await ingest(1, { order_date: '2026-06-01', source_order_id: 42, items: [{ coffee_id: coffeeId, roast: 'espresso', lbs: 35 }] });
     ok(r.status === 200 && r.body.duplicate === true, 'retried push flagged as duplicate, not re-created');
     r = await j('GET', '/api/orders', null, STAFF);
     ok(r.body.filter(o => o.source_order_id === 42).length === 1, 'exactly one order exists after the retry');
     const orderId = r.body[0].id;
-    r = await ingest('dose_wrongkey', { order_date: '2026-06-01', items: [{ coffee_id: coffeeId, roast: 'espresso', lbs: 5 }] });
-    ok(r.status === 401, 'bad shop key rejected');
-    r = await ingest(shopKey, { order_date: '2026-06-02', items: [] });
+    r = await ingest(1, { order_date: '2026-06-01', items: [{ coffee_id: coffeeId, roast: 'espresso', lbs: 5 }] }, 'not-the-portal-key');
+    ok(r.status === 401, 'wrong portal key rejected');
+    r = await ingest(1, { order_date: '2026-06-02', items: [] });
     ok(r.status === 400, 'empty order rejected');
 
     section('status transitions and edit guards');
@@ -89,7 +91,7 @@ const j = client(API, 'x-hub-key');
     ok(row && near(row.lbs, 12.2, 0.01), 'shelf unchanged after the refused refill');
 
     // Fill-from-stock: a second order small enough to cover from the shelf.
-    await ingest(shopKey, { order_date: '2026-06-03', source_order_id: 43, items: [{ coffee_id: coffeeId, roast: 'espresso', lbs: 10 }] });
+    await ingest(1, { order_date: '2026-06-03', source_order_id: 43, items: [{ coffee_id: coffeeId, roast: 'espresso', lbs: 10 }] });
     r = await j('GET', '/api/orders', null, STAFF);
     const o2 = r.body.find(o => o.source_order_id === 43);
     await j('PATCH', `/api/orders/${o2.id}`, { status: 'confirmed' }, STAFF);
@@ -122,7 +124,7 @@ const j = client(API, 'x-hub-key');
       info_sections: [{ title: 'Intro', body: 'Creamy body, blueberry sweetness.' }, { title: '', body: '' }, 'garbage'],
     }, OWNER);
     ok(r.status === 200 && r.body.info_sections.length === 1, 'sheet saved; empty/garbage sections dropped');
-    r = await fetch(`${API}/api/ingest/catalog`, { headers: { Authorization: `Bearer ${shopKey}` } }).then(x => x.json());
+    r = await portalCatalog(1);
     const synced = r.items.find(i => i.id === coffeeId);
     ok(synced.info_sheet && synced.info_sheet.country === 'Ethiopia' && synced.info_sheet.brew_espresso === '18g in, 40g out.',
       'sheet flows to the shop through catalog sync');
@@ -132,14 +134,14 @@ const j = client(API, 'x-hub-key');
     // a coffee with nothing filled in syncs with info_sheet null
     r = await j('POST', '/api/catalog', { name: 'Sheetless Decaf', price_per_lb: 13 }, OWNER);
     const plainId = r.body.id;
-    r = await fetch(`${API}/api/ingest/catalog`, { headers: { Authorization: `Bearer ${shopKey}` } }).then(x => x.json());
+    r = await portalCatalog(1);
     ok(r.items.find(i => i.id === plainId).info_sheet === null, 'empty sheet syncs as null — no phantom links');
 
     section('reset clears lockouts — the client-called-you scenario');
     const shopAuth = async (u, p) => {
-      const res = await fetch(`${API}/api/ingest/auth`, {
+      const res = await fetch(`${API}/api/portal/auth`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${shopKey}` },
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${PKEY}` },
         body: JSON.stringify({ username: u, password: p }),
       });
       return { status: res.status, body: await res.json().catch(() => ({})) };
@@ -168,8 +170,6 @@ const j = client(API, 'x-hub-key');
     ok(r.body.some(a => a.username === 'shop' && /set a new password via its invite link/.test(a.action)) === false,
       'no invite set-password yet in trail (sanity)');
 
-    r = await shopAuth('some-other-shop', 'whatever-123');
-    ok(r.status === 401 && /different shop/.test(r.body.error), 'wrong-deployment login gets the distinct message');
     r = await shopAuth(shopUname, 'not-the-password-1');
     ok(r.status === 401 && r.body.error === 'Wrong username or password', 'right shop, wrong password keeps the plain error');
 
@@ -178,13 +178,13 @@ const j = client(API, 'x-hub-key');
     ok(r.status === 403, 'staff cannot archive');
     r = await j('POST', `/api/catalog/${plainId}/archive`, null, OWNER);
     ok(r.status === 200 && r.body.active === 0, 'owner archives a coffee');
-    r = await fetch(`${API}/api/ingest/catalog`, { headers: { Authorization: `Bearer ${shopKey}` } }).then(x => x.json());
+    r = await portalCatalog(1);
     ok(!r.items.some(i => i.id === plainId), 'archived coffee vanishes from the shop price list');
-    r = await ingest(shopKey, { order_date: '2026-06-05', items: [{ coffee_id: plainId, roast: 'espresso', lbs: 5 }] });
+    r = await ingest(1, { order_date: '2026-06-05', items: [{ coffee_id: plainId, roast: 'espresso', lbs: 5 }] });
     ok(r.status === 400, 'ordering an archived coffee refused');
     r = await j('POST', `/api/catalog/${plainId}/restore`, null, OWNER);
     ok(r.status === 200 && r.body.active === 1, 'restore brings it back');
-    r = await fetch(`${API}/api/ingest/catalog`, { headers: { Authorization: `Bearer ${shopKey}` } }).then(x => x.json());
+    r = await portalCatalog(1);
     ok(r.items.some(i => i.id === plainId), 'restored coffee reappears for shops');
     r = await j('GET', '/api/activity', null, OWNER);
     ok(r.body.some(a => /archived catalog item "Sheetless Decaf"/.test(a.action)), 'archive audited');
@@ -263,13 +263,13 @@ const j = client(API, 'x-hub-key');
     r = await j('GET', '/api/profile-patterns', null, STAFF);
     ok(r.body.untagged.includes('Sheetless Decaf'), 'untagged active coffee is named, not silently skipped');
     await j('PUT', `/api/catalog/${plainId}/sheet`, { profile_tags: ['Buttery'] }, OWNER);
-    r = await fetch(`${API}/api/ingest/catalog`, { headers: { Authorization: `Bearer ${shopKey}` } }).then(x => x.json());
+    r = await portalCatalog(1);
     ok(JSON.stringify(r.items.find(i => i.id === coffeeId).profile) === '["Juicy","Winey"]', 'profile rides the shop catalog sync');
 
     // A fresh order inside the 90-day window: 10 lb Juicy/Winey espresso +
     // 5 lb Buttery espresso + 5 lb Juicy/Winey filter.
     const today = new Date().toISOString().slice(0, 10);
-    r = await ingest(shopKey, { order_date: today, source_order_id: 777, items: [
+    r = await ingest(1, { order_date: today, source_order_id: 777, items: [
       { coffee_id: coffeeId, roast: 'espresso', lbs: 10 },
       { coffee_id: plainId, roast: 'espresso', lbs: 5 },
       { coffee_id: coffeeId, roast: 'filter', lbs: 5 },

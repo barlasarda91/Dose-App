@@ -4,9 +4,9 @@ Track coffee and milk efficiency for your coffee shop by comparing Square POS sa
 
 ## Setup
 
-**Accounts are issued by the roastery hub.** Creating a shop in the hub creates its account: a login username (derived from the shop name, e.g. `boxx-kadikoy`), a registered email, a password, and the deployment's API key — all in one step. The shop app verifies logins **against the hub**, with a 24-hour cached-credential fallback so a hub outage doesn't lock out anyone who logged in recently (active sessions are never affected). There is no self-registration anywhere.
+**Accounts are issued by the roastery hub.** Creating a shop in the hub creates its account: a login username (derived from the shop name, e.g. `boxx-kadikoy`), a registered email, and a password invite — all in one step. There are no per-shop API keys anywhere: people sign in with accounts, and the portal authenticates to the hub with the single `PORTAL_KEY` service credential. Logins are verified **against the hub**, with a 24-hour cached-credential fallback so a hub outage doesn't lock out anyone who logged in recently (active sessions are never affected). There is no self-registration anywhere.
 
-**Provisioning a shop:** create the shop in the hub → deploy the shop app → open its URL → the first-run screen (gated by the setup code from the server logs) connects it to the hub with the API key → hand the client the URL + their hub-issued username/password. Passwords are changed from the shop app (proxied to the hub) or reset by the roastery (Hub → Shops → Reset Login).
+**Provisioning a shop:** Hub → Shops → create (name + registered email) → the invite email lets the shop set its own password → hand the client the portal URL and their username. No deployment, no keys. Passwords are changed from the shop app (proxied to the hub) or reset by the roastery (Hub → Shops → Reset Login / Send Password Reset).
 
 **Standalone mode** remains for shops without a hub: the first-run screen can instead create a local admin who manages local user accounts (`admin`/`user` roles) from Settings → Users, exactly as before. A hub-connected deployment that predates hub logins keeps its local accounts working until a hub password is set.
 
@@ -59,12 +59,12 @@ Setting `PORTAL_KEY` turns a shop-app deployment into the **Dose Portal**: a sin
 **Cutover from per-shop deployments** (zero-touch for existing data):
 
 1. On the **hub** service: set `PORTAL_KEY`, redeploy.
-2. On the **boxx-dose** service (it becomes the portal): set `PORTAL_KEY`, `DOSE_SECRET_KEY`, `OPERATOR_KEY`, redeploy. Existing data is stamped shop 1 in place; on the first login the deployment links shop 1 to its hub identity through the API key it already holds. Nothing is re-entered.
+2. On the **boxx-dose** service (it becomes the portal): set `PORTAL_KEY`, `DOSE_SECRET_KEY`, `OPERATOR_KEY`, redeploy. Existing data is stamped shop 1 in place. (Completed in production Oct 2026.)
    **Credentials-in-env note:** the portal ignores `SQUARE_ACCESS_TOKEN` / `RESEND_API_KEY` / `ORDER_EMAIL_FROM` env fallbacks — one env value must never become every shop's credential. If the old service relied on them, paste those values into that shop's **Settings** once (stored encrypted); the env vars can then be deleted.
 3. Every shop now signs in at the portal URL with their existing hub username/password. New shops need only Hub → Shops → create + password invite — **no new deployment, ever**.
 4. Retire any other per-shop services once their users have moved (their data, if any, stays with those services — export orders from the hub side if needed).
 
-Legacy `/api/ingest/*` (per-shop API key) stays fully supported, so un-migrated deployments keep working during the transition. Shop-local staff accounts also keep working at the portal: they're checked before the hub and their usernames are portal-unique.
+Per-shop API keys and the legacy `/api/ingest/*` endpoints are **gone** — the portal is the only hub-connected mode (standalone local-admin mode remains for hubless use). Shop-local staff accounts keep working at the portal: they're checked before the hub and their usernames are portal-unique.
 
 ## How it works
 
@@ -116,7 +116,7 @@ The `hub/` directory contains a separate service for the roastery:
 - **Roast Math** — what one batch *is*, per roast profile: lbs green in → lbs roasted out (loss % computed, never typed). Roastery-wide defaults plus per-coffee overrides.
 - **Fulfillment** — one bucket card per confirmed order, grouped by customer and sorted by requested delivery. Items stay greyed "awaiting roast" until their coffee is marked roasted, then get checked off as they're physically packed (wholesale shown as 5-lb bags, retail as 12oz bags). A **4×6 packing slip** prints per order, and a fully packed order ships with one click — which sends the "Shipped" email and updates the shop's order history.
 - **Reports** — roasted coffee per client, rolled up automatically at the close of each week and month. Orders are kept forever (storage is negligible).
-- **Shops** — create a shop with its registered email to mint its API key (shown once, stored hashed); edit, rotate keys.
+- **Shops** — create a shop with its registered email; the invite email lets the shop set its own password. Edit, reset logins, watch login health.
 - **Patterns** — per shop: volume, spend, espresso/filter roast mix, top coffees, cadence, 12-week trend. Plus **cup profiles**: each coffee carries up to three house-vocabulary tags (Juicy, Winey, Buttery, Bright, …) set in its info sheet; Patterns turns 90 days of orders into each shop's palate per roast (bars in the shop drill-in) and a shops×profiles matrix with an espresso/filter toggle. Untagged coffees are excluded and named, never silently skipped.
 
 **Hub environment variables:** `HUB_PASSWORD` (roastery login, required), `HUB_DB_PATH=/app/data/hub.db`, `RESEND_API_KEY` + `HUB_EMAIL_FROM` (sender — must be on the Resend-verified domain, e.g. `Dose Hub <order@send.boxxcoffee.la>`), `HUB_REPLY_TO` (where shop replies land, e.g. `order@boxxcoffee.la`), `HUB_NOTIFY_EMAIL` (your copy of new orders), `HUB_CURRENCY` (default `$`).
@@ -124,11 +124,11 @@ The `hub/` directory contains a separate service for the roastery:
 **Deploy** (own Railway service, same repo): New service → same GitHub repo → **Root Directory `/hub`** → variables above → volume at `/app/data`.
 
 **Connect a shop:**
-1. Hub → Shops → Add Shop (name + registered email + login password) → copy the API key. The shop's login username is generated from its name and shown after creation.
-2. Fresh deployment: enter hub URL + API key on the first-run screen. Existing deployment: Settings → Ordering → Roastery Hub.
-3. The shop's Order page switches from pool quantities to the live price list (their personalized view, including 12oz retail bags where offered), supports **standing orders** (weekly / bi-weekly / monthly, placed automatically at live prices), logins are verified by the hub, and roastery confirm/ship/deliver statuses appear in the shop's order history automatically. The hub URL is fixed app-wide (`DEFAULT_HUB_URL` env to override) — shops only ever enter their API key. Orders are priced server-side at order time — later price changes never rewrite history.
+1. Hub → Shops → Add Shop (name + registered email). The login username is generated from the name; the invite email lets the shop set its password.
+2. The shop signs in at the portal URL. Nothing to configure on their side.
+3. The shop's Order page shows the live price list (their personalized view, including 12oz retail bags where offered), supports **standing orders** (weekly / bi-weekly / monthly, placed automatically at live prices), logins are verified by the hub, and roastery confirm/ship/deliver statuses appear in the shop's order history automatically. Orders are priced server-side at order time — later price changes never rewrite history.
 
-Shop pushes are authenticated per shop (`Bearer dose_…`), re-priced and re-validated by the hub on ingest, and deduplicated (a retried push never duplicates an order).
+Order pushes travel portal→hub under `PORTAL_KEY`, are re-priced and re-validated by the hub on intake, and deduplicated (a retried push never duplicates an order).
 
 **Hub accounts** — every roastery person signs in with their own username + password (salted scrypt, per-user and per-IP lockouts, expiring hashed session tokens — the shop app's security model). `HUB_PASSWORD` is not a login: on a fresh hub it acts once, as the bootstrap code that creates the first **owner** account, then never works again. Two roles: **owners** additionally manage the Team tab (add accounts with a temporary password that must be replaced on first sign-in, reset, deactivate — deactivation signs that person out everywhere), catalog and price rules, shop credentials, and order deletion; **staff** run daily ops. Every consequential action lands in an append-only, signed **audit trail** (Team → Activity), orders show who confirmed and shipped them, and stock movements show who made them.
 
@@ -159,4 +159,4 @@ npm run test:portal # tests/portal.test.js — two shops on one portal, isolatio
 npm run test:ui     # tests/hub-ui.test.js — hub dashboard in a real browser
 ```
 
-The pressure suites (`tests/`) boot the actual servers on throwaway databases and attack the seams: LA DST-spanning cycles (asserting the exact offsets sent to Square), same-day and retroactive deliveries, standing-order failure visibility, ingest dedup on retried pushes, roast-fill idempotency and On Hand ledger math, role walls, two-shop portal isolation (including a legacy database migrating in), and the login/bootstrap/forced-password-change flows in a browser. The UI suite needs Playwright + a Chromium (`PW_CHROMIUM` env to point at one) and skips cleanly when absent. No network access is required — Square and the hub are mocked locally.
+The pressure suites (`tests/`) boot the actual servers on throwaway databases and attack the seams: LA DST-spanning cycles (asserting the exact offsets sent to Square), same-day and retroactive deliveries, standing-order failure visibility, ingest dedup on retried pushes, roast-fill idempotency and On Hand ledger math, role walls, two-shop portal isolation, and the login/bootstrap/forced-password-change flows in a browser. The UI suite needs Playwright + a Chromium (`PW_CHROMIUM` env to point at one) and skips cleanly when absent. No network access is required — Square and the hub are mocked locally.

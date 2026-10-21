@@ -1,6 +1,7 @@
 // Shop-app pressure tests: delivery-cycle torture (LA DST included), Square
 // date-filter correctness, two-pool analytics edges, and standing-order
-// failure visibility. Boots the real backend against a mock Square + mock hub.
+// failure visibility. Boots the real backend in PORTAL mode against a mock
+// Square + a mock hub speaking the portal API — the only mode in production.
 const path = require('path');
 const { ok, near, section, finish, freshDir, client, startServer, waitUp, mockSquare, mockHub, sqlite } = require('./helpers');
 
@@ -14,16 +15,18 @@ const LB = 453.592;
   const { state: sq } = await mockSquare(SQ);
   const { state: hub } = await mockHub(HUB);
   const server = startServer('backend', 'server.js', {
-    DB_PATH: path.join(dir, 'dose.db'), PORT: String(PORT), SETUP_SECRET: 'ptest',
-    SQUARE_ACCESS_TOKEN: 'fake', SQUARE_BASE_URL: `http://127.0.0.1:${SQ}`,
+    DB_PATH: path.join(dir, 'dose.db'), PORT: String(PORT),
+    PORTAL_KEY: 'ptest-portal', DEFAULT_HUB_URL: `http://127.0.0.1:${HUB}`,
+    DOSE_SECRET_KEY: 'ptest-secret', SQUARE_BASE_URL: `http://127.0.0.1:${SQ}`,
   });
 
   try {
     await waitUp(`${API}/api/auth-status`);
-    const su = await j('POST', '/api/setup', { username: 'admin1', password: 'ptest-pass-123', setup_code: 'ptest' });
+    const su = await j('POST', '/api/login', { username: 'admin1', password: 'ptest-pass-123' });
     const T = su.body.token;
-    ok(!!T, 'setup + login');
+    ok(!!T, 'portal login (hub resolves the shop — no keys anywhere)');
 
+    await j('POST', '/api/settings', { square_access_token: 'fake' }, T);
     // One espresso recipe so analytics has something to count.
     await j('POST', '/api/recipes', { square_item_name: 'Latte', method: 'espresso', coffee_grams: 18 }, T);
     sq.orders = [{ line_items: [{ name: 'Latte', quantity: '10' }, { name: 'Muffin', quantity: '3' }] }];
@@ -75,7 +78,6 @@ const LB = 453.592;
     ok(r.body.available === true && r.body.pools.espresso.days_left === null, 'zero burn → no fake days-left');
 
     section('standing orders: failure is visible, not log-only');
-    await j('POST', '/api/settings', { hub_url: `http://127.0.0.1:${HUB}`, hub_api_key: 'dose_testkey' }, T);
     r = await j('POST', '/api/standing-orders', { frequency: 'weekly', items: [{ coffee_id: 1, roast: 'espresso', lbs: 10 }] }, T);
     ok(r.status === 200, 'standing order created against the hub price list');
     const soId = r.body.id;

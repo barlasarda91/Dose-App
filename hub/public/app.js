@@ -1169,7 +1169,7 @@
   // ─── Shops ──────────────────────────────────────────────────────────────────
   async function renderShops() {
     const page = document.getElementById('page');
-    page.innerHTML = header('Roastery', 'Shops', 'Client shops connected to the hub — each authenticates with its own API key. Receipts and confirmations go to the registered email.');
+    page.innerHTML = header('Roastery', 'Shops', 'Client shops on the Dose portal — each signs in with its own account. Receipts and confirmations go to the registered email.');
     let shops = [];
     try { shops = await api('/api/shops'); }
     catch (e) { if (e.message !== 'Unauthorized') page.innerHTML += `<div class="err">${esc(e.message)}</div>`; return; }
@@ -1178,8 +1178,8 @@
       <div class="card">
         <label class="lbl">Add Shop</label>
         <div style="font-size:11px;color:var(--drift);margin-bottom:10px">
-          Creating a shop creates its account and API key, and emails the shop an invite to set its own password
-          (username is generated from the name). No passwords pass through you.
+          Creating a shop creates its portal account and emails the shop an invite to set its own password
+          (username is generated from the name). No passwords or keys pass through you.
         </div>
         <div style="display:flex;gap:10px;flex-wrap:wrap">
           <input id="new-shop" placeholder="Shop name, e.g. Boxx Kadıköy" style="min-width:190px">
@@ -1210,23 +1210,10 @@
             <button class="btn-sm btn" data-pricing="${s.id}">Pricing</button>
             <button class="btn-sm btn" data-editshop="${s.id}">Edit</button>
             <button class="btn-sm btn" data-invite="${s.id}">${s.has_password ? 'Send Password Reset' : 'Send Invite'}</button>
-            <button class="btn-sm btn" data-rotate="${s.id}">Rotate Key</button>
           </div></td>
         </tr>`).join('')}</tbody></table></div>` : '<div class="empty">No shops yet.</div>';
       wireList();
     }
-
-    const showKey = (name, key) => {
-      document.getElementById('add-result').innerHTML = `
-        <div class="keybox">
-          <strong>${esc(name)}</strong> — API key (shown once, copy it now):<br>
-          <code>${esc(key)}</code>
-          <button class="btn-sm btn" id="copy-key" style="margin-left:8px">Copy</button><br>
-          Paste it into that shop's Dose app → Settings → Ordering → Hub API Key, along with this hub's URL.
-        </div>`;
-      document.getElementById('copy-key').onclick = () =>
-        navigator.clipboard.writeText(key).then(() => { document.getElementById('copy-key').textContent = 'Copied ✓'; });
-    };
 
     const inviteHtml = (shop, invite) => invite.sent
       ? `<div class="ok">✉ Invite emailed to ${esc(invite.to)} — ${esc(shop.name)} signs in as <strong>${esc(shop.login_username)}</strong> once they set their password.</div>`
@@ -1244,8 +1231,7 @@
       try {
         const data = await api('/api/shops', { method: 'POST', body: JSON.stringify({ name, email }) });
         shops = [...shops, data.shop].sort((a, b) => a.name.localeCompare(b.name));
-        showKey(data.shop.name, data.api_key);
-        document.getElementById('add-result').insertAdjacentHTML('beforeend', inviteHtml(data.shop, data.invite));
+        document.getElementById('add-result').innerHTML = inviteHtml(data.shop, data.invite);
         wireCopy();
         document.getElementById('new-shop').value = ''; document.getElementById('new-email').value = '';
         drawList();
@@ -1253,15 +1239,6 @@
     };
 
     function wireList() {
-      document.querySelectorAll('[data-rotate]').forEach(btn => btn.onclick = async () => {
-        if (!window.confirm('Rotate this shop’s API key? The old key stops working immediately.')) return;
-        try {
-          const shop = shops.find(s => String(s.id) === btn.dataset.rotate);
-          const data = await api(`/api/shops/${btn.dataset.rotate}/rotate-key`, { method: 'POST' });
-          showKey(shop ? shop.name : 'Shop', data.api_key);
-          window.scrollTo({ top: 0, behavior: 'smooth' });
-        } catch (e) { alert(e.message); }
-      });
       document.querySelectorAll('[data-editshop]').forEach(btn => btn.onclick = async () => {
         const shop = shops.find(s => String(s.id) === btn.dataset.editshop);
         const name = window.prompt('Shop name:', shop.name);

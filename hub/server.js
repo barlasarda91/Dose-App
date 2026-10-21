@@ -25,7 +25,6 @@ db.exec(`
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     name TEXT NOT NULL UNIQUE,
     email TEXT,
-    api_key_hash TEXT NOT NULL,
     created_at TEXT DEFAULT (datetime('now'))
   );
 
@@ -194,10 +193,16 @@ db.exec('CREATE TABLE IF NOT EXISTS hub_meta (key TEXT PRIMARY KEY, value TEXT)'
 function rebuildTable(table, needle, createSql, columns) {
   const row = db.prepare("SELECT sql FROM sqlite_master WHERE type='table' AND name=?").get(table);
   if (!row || row.sql.includes(needle)) return;
+  // legacy_alter_table: RENAME must NOT rewrite other tables' FK references
+  // to point at the throwaway _migr name (they'd dangle after the DROP).
+  db.pragma('foreign_keys = OFF');
+  db.pragma('legacy_alter_table = ON');
   db.exec(`ALTER TABLE ${table} RENAME TO ${table}_migr`);
   db.exec(createSql);
   db.exec(`INSERT INTO ${table} (${columns}) SELECT ${columns} FROM ${table}_migr`);
   db.exec(`DROP TABLE ${table}_migr`);
+  db.pragma('legacy_alter_table = OFF');
+  db.pragma('foreign_keys = ON');
   console.log(`Migrated ${table} schema`);
 }
 rebuildTable('orders', "'shipped'", `CREATE TABLE orders (
@@ -232,14 +237,47 @@ rebuildTable('order_items', "'retail_espresso'", `CREATE TABLE order_items (
 db.prepare("INSERT OR IGNORE INTO roast_math (coffee_id, profile, green_in, roasted_out) VALUES (0,'espresso',55,47.5)").run();
 db.prepare("INSERT OR IGNORE INTO roast_math (coffee_id, profile, green_in, roasted_out) VALUES (0,'filter',55,48)").run();
 
+// Per-shop API keys are gone: every shop signs in at the portal with its own
+// account, and the portal itself authenticates with PORTAL_KEY. Databases
+// from the per-deployment era drop the column in place.
+{
+  const row = db.prepare("SELECT sql FROM sqlite_master WHERE type='table' AND name='shops'").get();
+  if (row && row.sql.includes('api_key_hash')) {
+    const cols = 'id, name, email, app_url, login_username, password_hash, salt, invite_token_hash, invite_expires_at, last_auth_ok_at, last_auth_fail_at, auth_fail_count, created_at';
+    db.pragma('foreign_keys = OFF');
+  db.pragma('legacy_alter_table = ON'); // keep orders/price_rules FK text pointing at "shops"
+    db.exec('ALTER TABLE shops RENAME TO shops_migr');
+    db.exec(`CREATE TABLE shops (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      name TEXT NOT NULL UNIQUE,
+      email TEXT,
+      app_url TEXT,
+      login_username TEXT,
+      password_hash TEXT,
+      salt TEXT,
+      invite_token_hash TEXT,
+      invite_expires_at TEXT,
+      last_auth_ok_at TEXT,
+      last_auth_fail_at TEXT,
+      auth_fail_count INTEGER DEFAULT 0,
+      created_at TEXT DEFAULT (datetime('now'))
+    )`);
+    db.exec(`INSERT INTO shops (${cols}) SELECT ${cols} FROM shops_migr`);
+    db.exec('DROP TABLE shops_migr');
+    db.pragma('legacy_alter_table = OFF');
+  db.pragma('foreign_keys = ON');
+    console.log('Migrated shops schema — per-shop API keys removed');
+  }
+}
+
 const sha256 = s => crypto.createHash('sha256').update(String(s)).digest('hex');
 const SESSION_DAYS = 30;
 const money = v => `${CURRENCY}${(Math.round(v * 100) / 100).toFixed(2)}`;
 
 // ─── Shop login credentials ──────────────────────────────────────────────────
-// The hub is the identity provider for shop apps: each shop has a login
-// username (derived from its name), an email, and a password. Shop
-// deployments verify logins against /api/ingest/auth using their API key.
+// The hub is the identity provider for the shop portal: each shop has a login
+// username (derived from its name), an email, and a password. The portal
+// verifies logins against /api/portal/auth with the PORTAL_KEY credential.
 const { promisify } = require('util');
 const scryptAsync = promisify(crypto.scrypt);
 const SHOP_PASSWORD_MIN = 8;
@@ -279,8 +317,7 @@ const RESEND_KEY = cleanEnv(process.env.RESEND_API_KEY);
 
 // Master credential for the Dose Portal — the single shop-app deployment that
 // serves every shop. It authenticates once with this key and names the shop
-// per request; the per-shop-key /api/ingest/* endpoints stay for legacy
-// single-shop installs.
+// per request. Humans never hold keys: they sign in with their accounts.
 const PORTAL_KEY = cleanEnv(process.env.PORTAL_KEY);
 
 // Boot + live diagnostics: which optional config the running process actually
@@ -623,13 +660,7 @@ function orderEmailHtml(order, items, shop, headline, sub, opts = {}) {
   </div>`;
 }
 
-// ─── Shop ingest (per-shop API key) — before the dashboard gate ──────────────
-function shopFromBearer(req) {
-  const auth = req.get('authorization') || '';
-  const apiKey = auth.startsWith('Bearer ') ? auth.slice(7).trim() : '';
-  return apiKey ? db.prepare('SELECT * FROM shops WHERE api_key_hash=?').get(sha256(apiKey)) : null;
-}
-
+// ─── Shop-facing catalog + order intake (used by the portal routes) ──────────
 function shopCatalog(shopId) {
   const items = db.prepare('SELECT * FROM catalog').all();
   const grants = db.prepare('SELECT * FROM catalog_visibility').all();
@@ -637,16 +668,8 @@ function shopCatalog(shopId) {
   return catalogForShop(items, shopId, grants, rules);
 }
 
-app.get('/api/ingest/catalog', (req, res) => {
-  const shop = shopFromBearer(req);
-  if (!shop) return res.status(401).json({ error: 'Invalid shop API key' });
-  // shop_id lets a portal deployment link a legacy shop's data to its hub
-  // identity from nothing but the API key it already holds.
-  res.json({ currency: CURRENCY, shop_id: shop.id, shop_name: shop.name, items: shopCatalog(shop.id) });
-});
-
-// The receiving core, shared by the legacy per-key ingest route and the
-// portal route — everything after "which shop is this?" is identical.
+// The order-receiving core (called by the portal route): price, dedupe,
+// store, email the receipt.
 async function receiveShopOrder(shop, b) {
   if (!b.order_date) return { code: 400, payload: { error: 'order_date required' } };
 
@@ -701,94 +724,12 @@ async function receiveShopOrder(shop, b) {
   return { code: 200, payload: { ok: true, hub_order_id: orderId, total_lbs: totalLbs, total_cost: priced ? priced.total_cost : null, receipt } };
 }
 
-app.post('/api/ingest/orders', async (req, res) => {
-  try {
-    const shop = shopFromBearer(req);
-    if (!shop) return res.status(401).json({ error: 'Invalid shop API key' });
-    const { code, payload } = await receiveShopOrder(shop, req.body || {});
-    res.status(code).json(payload);
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: err.message });
-  }
-});
-
-// Shop deployments verify user logins here. Rate-limited per shop+username.
-// 409 no_login_password lets pre-upgrade deployments fall back to their
-// local accounts until a password is set in the hub.
 // A reset re-establishes identity — stale brute-force lockouts must not
 // keep the freshly-reset password from working.
 function clearShopAuthLocks(shop) {
-  for (const key of [...loginFailures.keys()]) {
-    if (key.startsWith(`shopauth:${shop.id}:`) ||
-        (shop.login_username && key === `shopauth:portal:${shop.login_username}`)) loginFailures.delete(key);
-  }
+  if (!shop.login_username) return;
+  loginFailures.delete(`shopauth:portal:${shop.login_username}`);
 }
-
-app.post('/api/ingest/auth', async (req, res) => {
-  try {
-    const shop = shopFromBearer(req);
-    if (!shop) return res.status(401).json({ error: 'Invalid shop API key' });
-    const username = String((req.body && req.body.username) || '').toLowerCase().trim();
-    const password = (req.body && req.body.password) || '';
-    const lockKey = `shopauth:${shop.id}:${username}`;
-    const wait = lockedFor(lockKey);
-    if (wait > 0) return res.status(429).json({ error: `Too many attempts — try again in ${wait}s` });
-    if (!shop.password_hash) return res.status(409).json({ error: 'no_login_password' });
-    if (username !== (shop.login_username || '')) {
-      // Whole-username mismatch: they're almost certainly at the WRONG SHOP's
-      // deployment (credentials are bound to the deployment's API key). Say
-      // so — a plain 'wrong password' sends people chasing password resets.
-      recordFailure(lockKey);
-      db.prepare("UPDATE shops SET last_auth_fail_at=datetime('now'), auth_fail_count=COALESCE(auth_fail_count,0)+1 WHERE id=?").run(shop.id);
-      return res.status(401).json({ error: `"${username}" is not the account for this shop's app — this deployment belongs to a different shop. Check you're at the right Dose URL.` });
-    }
-    if (!(await verifyShopPassword(shop, password))) {
-      recordFailure(lockKey);
-      db.prepare("UPDATE shops SET last_auth_fail_at=datetime('now'), auth_fail_count=COALESCE(auth_fail_count,0)+1 WHERE id=?").run(shop.id);
-      return res.status(401).json({ error: 'Wrong username or password' });
-    }
-    loginFailures.delete(lockKey);
-    db.prepare("UPDATE shops SET last_auth_ok_at=datetime('now') WHERE id=?").run(shop.id);
-    res.json({ ok: true, username: shop.login_username, role: 'admin', shop_name: shop.name });
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: err.message });
-  }
-});
-
-// Shop users change their hub-managed password from inside the shop app.
-app.post('/api/ingest/change-password', async (req, res) => {
-  try {
-    const shop = shopFromBearer(req);
-    if (!shop) return res.status(401).json({ error: 'Invalid shop API key' });
-    const { username, current_password, new_password } = req.body || {};
-    if (String(username || '').toLowerCase().trim() !== (shop.login_username || '') ||
-        !(await verifyShopPassword(shop, current_password || ''))) {
-      return res.status(401).json({ error: 'Current password is wrong' });
-    }
-    if (String(new_password || '').length < SHOP_PASSWORD_MIN)
-      return res.status(400).json({ error: `Password must be at least ${SHOP_PASSWORD_MIN} characters` });
-    const { salt, hash } = await hashPassword(new_password);
-    db.prepare('UPDATE shops SET password_hash=?, salt=? WHERE id=?').run(hash, salt, shop.id);
-    res.json({ ok: true });
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: err.message });
-  }
-});
-
-// Shops poll this to reflect roastery confirmations in their order history.
-app.get('/api/ingest/order-status', (req, res) => {
-  const shop = shopFromBearer(req);
-  if (!shop) return res.status(401).json({ error: 'Invalid shop API key' });
-  const ids = String(req.query.ids || '').split(',').map(s => parseInt(s, 10)).filter(Number.isFinite).slice(0, 200);
-  if (!ids.length) return res.json([]);
-  const rows = db.prepare(
-    `SELECT source_order_id, status FROM orders WHERE shop_id=? AND source_order_id IN (${ids.map(() => '?').join(',')})`
-  ).all(shop.id, ...ids);
-  res.json(rows);
-});
 
 // ─── Portal API (single-URL shop app; PORTAL_KEY master credential) ──────────
 // One trusted deployment serves every shop: it authenticates with PORTAL_KEY
@@ -935,7 +876,7 @@ app.post('/api/public/set-password', async (req, res) => {
 
 // ─── Dashboard auth gate ──────────────────────────────────────────────────────
 app.use('/api', (req, res, next) => {
-  if (['/login', '/setup-owner', '/auth-mode'].includes(req.path) || req.path.startsWith('/ingest/') || req.path.startsWith('/public/') || req.path.startsWith('/portal/')) return next();
+  if (['/login', '/setup-owner', '/auth-mode'].includes(req.path) || req.path.startsWith('/public/') || req.path.startsWith('/portal/')) return next();
   const token = req.get('x-hub-key') || '';
   const row = token && db.prepare(
     `SELECT u.id, u.username, u.role, u.must_change_password
@@ -1334,13 +1275,12 @@ app.post('/api/shops', requireOwner, async (req, res) => {
     const email = String((req.body && req.body.email) || '').trim() || null;
     if (name.length < 2) return res.status(400).json({ error: 'Shop name required (2+ characters)' });
     if (!email) return res.status(400).json({ error: 'Registered email required — the password invite is sent there' });
-    const apiKey = 'dose_' + crypto.randomBytes(24).toString('hex');
     const loginUsername = genLoginUsername(name);
-    const r = db.prepare('INSERT INTO shops (name, email, api_key_hash, login_username) VALUES (?,?,?,?)')
-      .run(name, email, sha256(apiKey), loginUsername);
+    const r = db.prepare('INSERT INTO shops (name, email, login_username) VALUES (?,?,?)')
+      .run(name, email, loginUsername);
     const invite = await createInvite(r.lastInsertRowid, req);
     audit(req, `created shop "${name}"`);
-    res.json({ shop: shopWithStats(db.prepare('SELECT * FROM shops WHERE id=?').get(r.lastInsertRowid)), api_key: apiKey, invite });
+    res.json({ shop: shopWithStats(db.prepare('SELECT * FROM shops WHERE id=?').get(r.lastInsertRowid)), invite });
   } catch (err) {
     if (String(err.message).includes('UNIQUE')) return res.status(400).json({ error: 'A shop with that name already exists' });
     console.error(err);
@@ -1394,15 +1334,6 @@ app.put('/api/shops/:id', (req, res) => {
   if (name.length < 2) return res.status(400).json({ error: 'Shop name required' });
   db.prepare('UPDATE shops SET name=?, email=?, app_url=? WHERE id=?').run(name, email, appUrl, shop.id);
   res.json(shopWithStats(db.prepare('SELECT * FROM shops WHERE id=?').get(shop.id)));
-});
-
-app.post('/api/shops/:id/rotate-key', requireOwner, (req, res) => {
-  const shop = db.prepare('SELECT * FROM shops WHERE id=?').get(req.params.id);
-  if (!shop) return res.status(404).json({ error: 'Shop not found' });
-  const apiKey = 'dose_' + crypto.randomBytes(24).toString('hex');
-  db.prepare('UPDATE shops SET api_key_hash=? WHERE id=?').run(sha256(apiKey), shop.id);
-  audit(req, `rotated the API key for shop "${shop.name}"`);
-  res.json({ ok: true, api_key: apiKey });
 });
 
 // ─── Per-shop pricing rules ───────────────────────────────────────────────────

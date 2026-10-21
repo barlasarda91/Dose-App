@@ -83,8 +83,8 @@ function mockSquare(port) {
   return new Promise(resolve => server.listen(port, () => resolve({ state, server })));
 }
 
-// Mock hub for shop-side tests: serves a price list and accepts order pushes.
-// state.mode: 'ok' | 'catalog-down' | 'orders-down'.
+// Mock hub for shop-side tests: serves the portal API (auth, price list,
+// order intake). state.mode: 'ok' | 'catalog-down' | 'orders-down'.
 function mockHub(port) {
   const state = {
     mode: 'ok',
@@ -100,12 +100,19 @@ function mockHub(port) {
   const server = http.createServer((req, res) => {
     res.setHeader('Content-Type', 'application/json');
     const authed = (req.headers.authorization || '').startsWith('Bearer ');
-    if (!authed) { res.statusCode = 401; return res.end(JSON.stringify({ error: 'Invalid shop API key' })); }
-    if (req.url === '/api/ingest/catalog') {
+    if (!authed) { res.statusCode = 401; return res.end(JSON.stringify({ error: 'Invalid portal key' })); }
+    if (req.url === '/api/portal/auth' && req.method === 'POST') {
+      let b = ''; req.on('data', c => b += c);
+      return req.on('end', () => {
+        const body = JSON.parse(b || '{}');
+        res.end(JSON.stringify({ ok: true, shop_id: 1, shop_name: state.catalog.shop_name, username: body.username, role: 'admin' }));
+      });
+    }
+    if (req.url.startsWith('/api/portal/catalog')) {
       if (state.mode === 'catalog-down') { res.statusCode = 500; return res.end(JSON.stringify({ error: 'hub exploded' })); }
       return res.end(JSON.stringify(state.catalog));
     }
-    if (req.url === '/api/ingest/orders' && req.method === 'POST') {
+    if (req.url === '/api/portal/orders' && req.method === 'POST') {
       let b = ''; req.on('data', c => b += c);
       return req.on('end', () => {
         if (state.mode === 'orders-down') { res.statusCode = 500; return res.end(JSON.stringify({ error: 'hub order intake down' })); }
@@ -114,8 +121,8 @@ function mockHub(port) {
         res.end(JSON.stringify({ ok: true, hub_order_id: state.pushes.length, receipt: { sent: true, to: 'shop@example.com' } }));
       });
     }
-    if (req.url === '/api/ingest/order-status') {
-      return res.end(JSON.stringify({ statuses: {} }));
+    if (req.url.startsWith('/api/portal/order-status')) {
+      return res.end(JSON.stringify([]));
     }
     res.statusCode = 404; res.end('{}');
   });

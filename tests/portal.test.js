@@ -1,11 +1,11 @@
 // Portal pressure tests: two shops on ONE portal deployment against the real
 // hub. Login routing, hard data isolation across every table, per-shop
-// pricing, cross-shop reach attempts, operator-only backups, local staff
-// accounts, and the legacy single-shop → portal migration path.
+// pricing, cross-shop reach attempts, operator-only backups, and local
+// staff accounts. There are no per-shop API keys anywhere in this flow.
 const path = require('path');
 const { ok, section, finish, freshDir, client, startServer, waitUp, mockSquare, sqlite } = require('./helpers');
 
-const HUB = 4530, APP = 4531, SQ = 4532, LEGACY = 4533;
+const HUB = 4530, APP = 4531, SQ = 4532;
 const HUB_API = `http://127.0.0.1:${HUB}`;
 const API = `http://127.0.0.1:${APP}`;
 const jh = client(HUB_API, 'x-hub-key');
@@ -23,7 +23,7 @@ const waitExit = proc => new Promise(r => { proc.on('exit', code => r(code)); se
     HUB_DB_PATH: path.join(dir, 'hub.db'), PORT: String(HUB), HUB_PASSWORD: 'ptest-boot',
     PORTAL_KEY: PKEY,
   });
-  let app; let legacy; const extras = [];
+  let app; const extras = [];
 
   try {
     await waitUp(`${HUB_API}/api/health`);
@@ -33,7 +33,7 @@ const waitExit = proc => new Promise(r => { proc.on('exit', code => r(code)); se
     r = await jh('POST', '/api/catalog', { name: 'House Blend', price_per_lb: 14 }, OWNER);
     const houseId = r.body.id;
     r = await jh('POST', '/api/shops', { name: 'Alpha Cafe', email: 'alpha@example.com' }, OWNER);
-    const alphaHubId = r.body.shop.id, alphaKey = r.body.api_key;
+    const alphaHubId = r.body.shop.id;
     r = await jh('POST', '/api/shops', { name: 'Bravo Beans', email: 'bravo@example.com' }, OWNER);
     const bravoHubId = r.body.shop.id;
     // A coffee only Bravo can see — pricing isolation must survive the portal.
@@ -202,42 +202,6 @@ const waitExit = proc => new Promise(r => { proc.on('exit', code => r(code)); se
     ok(r.body.square_token_set === false && r.body.resend_configured === false,
       'Settings reports the truth: no per-shop credential means not configured');
 
-    section('legacy single-shop database joins the portal');
-    // A deployment that lived as Alpha's own URL: legacy hub mode, data on
-    // shop 1, hub key in settings — then the SAME database boots as portal.
-    const ldir = freshDir('portal-legacy');
-    legacy = startServer('backend', 'server.js', {
-      DB_PATH: path.join(ldir, 'dose.db'), PORT: String(LEGACY), SETUP_SECRET: 'lsetup',
-      DEFAULT_HUB_URL: HUB_API,
-    });
-    const jl = client(`http://127.0.0.1:${LEGACY}`, 'x-dose-key');
-    await waitUp(`http://127.0.0.1:${LEGACY}/api/auth-status`);
-    r = await jl('POST', '/api/setup', { mode: 'hub', setup_code: 'lsetup', hub_api_key: alphaKey });
-    ok(r.status === 200 && r.body.connected, 'legacy deployment connects with its per-shop key');
-    r = await jl('POST', '/api/login', { username: ALPHA, password: 'alpha-pass-1' });
-    const TL = r.body.token;
-    ok(r.status === 200, 'legacy login (old ingest path) works');
-    await jl('POST', '/api/recipes', { square_item_name: 'Legacy Flat White', method: 'espresso', coffee_grams: 17 }, TL);
-    legacy.kill();
-    await waitExit(legacy);
-
-    const portal2 = startServer('backend', 'server.js', {
-      DB_PATH: path.join(ldir, 'dose.db'), PORT: '4534', PORTAL_KEY: PKEY,
-      DEFAULT_HUB_URL: HUB_API, DOSE_SECRET_KEY: 'portal-test-secret',
-    });
-    legacy = portal2;
-    const jp = client('http://127.0.0.1:4534', 'x-dose-key');
-    await waitUp('http://127.0.0.1:4534/api/auth-status');
-    r = await jp('POST', '/api/login', { username: ALPHA, password: 'alpha-pass-1' });
-    ok(r.status === 200, 'same database, now in portal mode: Alpha logs in');
-    r = await jp('GET', '/api/recipes', null, r.body.token);
-    ok(r.body.length === 1 && r.body[0].square_item_name === 'Legacy Flat White',
-      'pre-portal data linked to the hub identity — nothing re-entered, no duplicate shop');
-    const db3 = new (sqlite())(path.join(ldir, 'dose.db'));
-    const linkRow = db3.prepare('SELECT * FROM shops WHERE id=1').get();
-    const shopCount = db3.prepare('SELECT COUNT(*) n FROM shops').get().n;
-    db3.close();
-    ok(linkRow.hub_shop_id === alphaHubId && shopCount === 1, `shop 1 carries the hub id, no stray rows (hub ${linkRow.hub_shop_id}, ${shopCount} shop)`);
   } catch (e) {
     ok(false, `suite crashed: ${e.message}`);
     console.log('--- hub log tail ---\n' + hub.log.slice(-1200));
@@ -245,7 +209,6 @@ const waitExit = proc => new Promise(r => { proc.on('exit', code => r(code)); se
   } finally {
     hub.kill();
     if (app) app.kill();
-    if (legacy) try { legacy.kill(); } catch { /* already dead */ }
     for (const p of extras) try { p.kill(); } catch { /* already dead */ }
   }
   finish();
