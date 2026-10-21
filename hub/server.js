@@ -170,8 +170,8 @@ try { db.exec('ALTER TABLE stock_moves ADD COLUMN created_by TEXT'); } catch { /
 try { db.exec('ALTER TABLE shops ADD COLUMN app_url TEXT'); } catch { /* present */ }
 // Pre-chain databases keep login columns ON shops until the shop_logins
 // migration below lifts them out; fresh databases never grow them.
-const loginsMigrated = !!db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='shop_logins'").get();
-if (!loginsMigrated) {
+const preChainShops = ((db.prepare("SELECT sql FROM sqlite_master WHERE type='table' AND name='shops'").get() || { sql: '' }).sql || '').includes('login_username');
+if (preChainShops) {
   for (const col of ['last_auth_ok_at TEXT', 'last_auth_fail_at TEXT', 'auth_fail_count INTEGER DEFAULT 0']) {
     try { db.exec(`ALTER TABLE shops ADD COLUMN ${col}`); } catch { /* present */ }
   }
@@ -179,8 +179,8 @@ if (!loginsMigrated) {
 for (const col of ['confirmed_by TEXT', 'confirmed_at TEXT', 'shipped_by TEXT', 'shipped_at TEXT']) {
   try { db.exec(`ALTER TABLE orders ADD COLUMN ${col}`); } catch { /* present */ }
 }
-if (!loginsMigrated) {
-  for (const col of ['login_username TEXT', 'password_hash TEXT', 'salt TEXT', 'invite_token_hash TEXT', 'invite_expires_at TEXT']) {
+if (preChainShops) {
+  for (const col of ['password_hash TEXT', 'salt TEXT', 'invite_token_hash TEXT', 'invite_expires_at TEXT']) {
     try { db.exec(`ALTER TABLE shops ADD COLUMN ${col}`); } catch { /* present */ }
   }
 }
@@ -315,6 +315,8 @@ db.exec(`
       grant.run(r.lastInsertRowid, sh.id);
     }
     const cols2 = 'id, name, email, app_url, created_at';
+    db.pragma('foreign_keys = OFF');
+    db.pragma('legacy_alter_table = ON');
     db.exec('ALTER TABLE shops RENAME TO shops_migr2');
     db.exec(`CREATE TABLE shops (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -325,6 +327,8 @@ db.exec(`
     )`);
     db.exec(`INSERT INTO shops (${cols2}) SELECT ${cols2} FROM shops_migr2`);
     db.exec('DROP TABLE shops_migr2');
+    db.pragma('legacy_alter_table = OFF');
+    db.pragma('foreign_keys = ON');
     console.log('Migrated shop logins to chain accounts (owners span stores)');
   }
 }

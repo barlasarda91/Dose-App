@@ -727,18 +727,36 @@ app.post('/api/login', asyncRoute(async (req, res) => {
         return res.json({ ok: true, token: issueToken(cand.id), user: publicUser(cand) });
       }
     }
-    // The hub resolves which shop this username belongs to — one URL for
-    // everyone, no wrong-deployment failure mode. The hub also rate-limits
-    // per username, so nothing is counted locally.
+    // The hub resolves who this username is — an Owner gets every store of
+    // their chain, a Manager exactly one. The hub also rate-limits per
+    // username, so nothing is counted locally.
     try {
       const auth = await portalFetch('/api/portal/auth', {
         method: 'POST', body: JSON.stringify({ username: uname, password: password || '' }),
       });
-      const shopId = await ensureLocalShop(auth.shop_id, auth.shop_name);
-      const u = upsertHubUser(auth.username, auth.role || 'admin', shopId);
-      await cacheHubLogin(auth.username, password || '', auth.role || 'admin', shopId);
+      const localRole = (auth.role || 'admin') === 'manager' ? 'user' : 'admin';
+      const hubShops = Array.isArray(auth.shops) && auth.shops.length
+        ? auth.shops : [{ id: auth.shop_id, name: auth.shop_name }];
+      // One local user row per accessible store; revoked stores fall away.
+      const rows = [];
+      for (const hs of hubShops) {
+        const shopId = await ensureLocalShop(hs.id, hs.name);
+        rows.push(upsertHubUser(auth.username, localRole, shopId));
+      }
+      const keepIds = rows.map(r => r.id);
+      for (const stale of db.prepare("SELECT id FROM users WHERE username=? AND source='hub'").all(normUsername(auth.username))) {
+        if (!keepIds.includes(stale.id)) {
+          db.prepare('DELETE FROM sessions WHERE user_id=?').run(stale.id);
+          db.prepare('DELETE FROM users WHERE id=?').run(stale.id);
+        }
+      }
+      // Land in the store they last worked in; first store otherwise.
+      const lastUsed = db.prepare(`SELECT s.user_id FROM sessions s WHERE s.user_id IN (${keepIds.map(() => '?').join(',')})
+        ORDER BY s.created_at DESC LIMIT 1`).get(...keepIds);
+      const active = rows.find(r => lastUsed && r.id === lastUsed.user_id) || rows[0];
+      await cacheHubLogin(auth.username, password || '', localRole, active.shop_id);
       clearFailures(ipKey, userKey);
-      return res.json({ ok: true, token: issueToken(u.id), user: publicUser(u) });
+      return res.json({ ok: true, token: issueToken(active.id), user: publicUser(active) });
     } catch (err) {
       if (err.hubStatus === 401 || err.hubStatus === 409) {
         return res.status(401).json({ error: err.message || 'Wrong username or password' });
@@ -775,7 +793,31 @@ app.post('/api/login', asyncRoute(async (req, res) => {
   res.json({ ok: true, token: issueToken(u.id), user: publicUser(u) });
 }));
 
-app.get('/api/me', (req, res) => res.json(req.user));
+app.get('/api/me', (req, res) => {
+  const me = { ...req.user };
+  me.shop_name = (db.prepare('SELECT name FROM shops WHERE id=?').get(req.shopId) || {}).name || '';
+  // Chain owners hold one hub-sourced user row per store — those are the
+  // stores the header switcher offers.
+  const self = db.prepare('SELECT source FROM users WHERE id=?').get(req.user.id);
+  if (self && self.source === 'hub') {
+    me.shops = db.prepare(`SELECT u.id AS user_id, u.shop_id, sh.name FROM users u JOIN shops sh ON sh.id=u.shop_id
+      WHERE u.username=? AND u.source='hub' ORDER BY sh.name`).all(req.user.username)
+      .map(r => ({ shop_id: r.shop_id, name: r.name, active: r.shop_id === req.shopId }));
+  } else {
+    me.shops = [{ shop_id: req.shopId, name: me.shop_name, active: true }];
+  }
+  res.json(me);
+});
+
+// Switch the session to another store of the same chain login. Only rows the
+// hub itself created for this username are switchable — nothing is trusted
+// from the client beyond picking among them.
+app.post('/api/me/switch-shop', (req, res) => {
+  const target = db.prepare("SELECT * FROM users WHERE username=? AND source='hub' AND shop_id=?")
+    .get(req.user.username, parseInt((req.body || {}).shop_id, 10) || -1);
+  if (!target) return res.status(404).json({ error: 'You do not have access to that store' });
+  res.json({ ok: true, token: issueToken(target.id), user: publicUser(target) });
+});
 
 // The guided tour shows once per user, tracked server-side so it follows the
 // person across devices. Replayable from Settings regardless.

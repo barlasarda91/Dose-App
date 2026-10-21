@@ -204,8 +204,9 @@ const j = client(API, 'x-hub-key');
     ok(r.status === 401, 'wrong portal key rejected');
     r = await portal('GET', '/shops');
     const roster = r.body.find(s => s.id === 1);
-    ok(r.status === 200 && roster && roster.login_username === shopUname && roster.has_password === true,
-      'roster sync carries id, username, and password state');
+    const rosterOwner = roster && roster.logins.find(l => l.role === 'owner');
+    ok(r.status === 200 && rosterOwner && rosterOwner.username === shopUname && rosterOwner.has_password === true,
+      'roster sync carries each store\'s logins with roles and password state');
 
     r = await portal('POST', '/auth', { username: shopUname, password: 'fresh-after-call' });
     ok(r.status === 200 && r.body.shop_id === 1 && r.body.shop_name === 'Pressure Shop',
