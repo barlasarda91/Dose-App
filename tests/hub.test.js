@@ -204,8 +204,9 @@ const j = client(API, 'x-hub-key');
     ok(r.status === 401, 'wrong portal key rejected');
     r = await portal('GET', '/shops');
     const roster = r.body.find(s => s.id === 1);
-    ok(r.status === 200 && roster && roster.login_username === shopUname && roster.has_password === true,
-      'roster sync carries id, username, and password state');
+    const rosterOwner = roster && roster.logins.find(l => l.role === 'owner');
+    ok(r.status === 200 && rosterOwner && rosterOwner.username === shopUname && rosterOwner.has_password === true,
+      'roster sync carries each store\'s logins with roles and password state');
 
     r = await portal('POST', '/auth', { username: shopUname, password: 'fresh-after-call' });
     ok(r.status === 200 && r.body.shop_id === 1 && r.body.shop_name === 'Pressure Shop',
@@ -334,6 +335,45 @@ const j = client(API, 'x-hub-key');
       'cup profile and brew notes untouched by the import');
     r = await j('GET', '/api/activity', null, OWNER);
     ok(r.body.some(a => /imported the info sheet for "El Encanto Papayo" from the product doc/.test(a.action)), 'import audited per coffee');
+
+    section('chain accounts: owners span stores, managers do not');
+    r = await j('POST', '/api/shops', { name: 'Pressure Shop Venice', email: 'venice@example.com' }, OWNER);
+    const shop2 = r.body.shop.id;
+    ok(r.body.shop.logins.length === 1 && r.body.shop.logins[0].role === 'owner', 'new store is born with its Owner login');
+    r = await j('GET', '/api/shops', null, OWNER);
+    const chainOwner = r.body.find(x => x.id === 1).logins.find(l => l.role === 'owner');
+    r = await j('POST', `/api/logins/${chainOwner.id}/grant`, { shop_id: shop2 }, OWNER);
+    ok(r.status === 200 && r.body.login.shop_ids.length === 2, 'owner granted the second store');
+    r = await shopAuth(shopUname, 'post-reset-77');
+    ok(r.status === 200 && r.body.role === 'owner' && r.body.shops.length === 2, `auth hands back the whole chain (${r.body.shops && r.body.shops.length} stores)`);
+
+    r = await j('POST', `/api/shops/${shop2}/logins`, { username: 'venice-sam', email: 'sam@example.com', role: 'manager' }, STAFF);
+    ok(r.status === 403, 'staff cannot add logins');
+    r = await j('POST', `/api/shops/${shop2}/logins`, { username: 'venice-sam', email: 'sam@example.com', role: 'manager' }, OWNER);
+    ok(r.status === 200 && r.body.invite && r.body.login.role === 'manager', 'manager created with an invite');
+    const mgrId = r.body.login.id;
+    r = await j('POST', `/api/logins/${mgrId}/grant`, { shop_id: 1 }, OWNER);
+    ok(r.status === 400, 'managers cannot span stores');
+    r = await shopAuth('venice-sam', 'anything-1');
+    ok(r.status === 409, 'manager without a password is told to use the invite');
+    await j('POST', `/api/logins/${mgrId}/reset`, { new_password: 'sam-pass-99' }, OWNER);
+    r = await shopAuth('venice-sam', 'sam-pass-99');
+    ok(r.status === 200 && r.body.role === 'manager' && r.body.shops.length === 1 && r.body.shops[0].id === shop2,
+      'manager signs in to exactly their store, as a manager');
+
+    r = await j('POST', `/api/logins/${chainOwner.id}/revoke`, { shop_id: shop2 }, OWNER);
+    ok(r.status === 200, 'owner revoked from the second store');
+    r = await shopAuth(shopUname, 'post-reset-77');
+    ok(r.body.shops.length === 1, 'the chain shrinks with the revoke');
+    r = await j('POST', `/api/logins/${chainOwner.id}/revoke`, { shop_id: 1 }, OWNER);
+    ok(r.status === 400, 'the last store cannot be revoked away');
+    r = await j('DELETE', `/api/logins/${mgrId}`, null, OWNER);
+    ok(r.status === 200, 'manager removed');
+    r = await shopAuth('venice-sam', 'sam-pass-99');
+    ok(r.status === 401, 'a removed manager cannot sign in');
+    r = await j('GET', '/api/activity', null, OWNER);
+    ok(r.body.some(a => /added manager login "venice-sam"/.test(a.action)) && r.body.some(a => /removed manager login "venice-sam"/.test(a.action)),
+      'login lifecycle is audited');
 
     section('adjustment guards');
     r = await j('POST', '/api/on-hand/adjust', { coffee_id: coffeeId, profile: 'espresso', delta_lbs: 0 }, STAFF);

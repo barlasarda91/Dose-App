@@ -6,7 +6,7 @@ import Order     from './pages/Order';
 import Recipes   from './pages/Recipes';
 import Settings  from './pages/Settings';
 import Tour      from './Tour';
-import { api, setKey, clearKey } from './api';
+import { api, apiJson, setKey, clearKey } from './api';
 
 // First run on a standalone deployment (gated by the setup code from the
 // server logs): create a local admin. On the portal, setup never shows —
@@ -128,6 +128,17 @@ export default function App() {
     window.location.reload();
   }
 
+  // Chain owners carry several stores on one login; switching swaps the
+  // session token and reloads into the chosen store.
+  async function switchShop(shopId) {
+    try {
+      const data = await apiJson('/api/me/switch-shop', { method: 'POST', body: JSON.stringify({ shop_id: shopId }) });
+      if (data.token) { setKey(data.token); window.location.reload(); }
+    } catch (e) {
+      if (!e.unauthorized) alert(e.message);
+    }
+  }
+
   if (auth === 'checking') return null;
   if (auth === 'setup') return <Gate mode="setup" />;
   if (auth === 'login') return <Gate mode="login" />;
@@ -143,6 +154,16 @@ export default function App() {
     <>
       <nav className="nav">
         <span className="nav-logo">Dose · Boxx Coffee Roasters Co.</span>
+        {me && me.shops && me.shops.length > 1 && (
+          <select className="store-switch" title="Switch store"
+            value={me.shops.find(s => s.active)?.shop_id ?? ''}
+            onChange={e => switchShop(parseInt(e.target.value, 10))}>
+            {me.shops.map(s => <option key={s.shop_id} value={s.shop_id}>{s.name}</option>)}
+          </select>
+        )}
+        {me && me.shop_name && (!me.shops || me.shops.length <= 1) && (
+          <span className="store-name">{me.shop_name}</span>
+        )}
         <ul className="nav-links">
           {pages.map(p => (
             <li key={p.id}>
@@ -152,7 +173,7 @@ export default function App() {
             </li>
           ))}
           <li>
-            <span className="nav-link" onClick={logout} title={me ? `Signed in as ${me.username}` : ''}>
+            <span className="nav-link" onClick={logout} title={me ? `Signed in as ${me.username} (${me.role === 'admin' ? 'Owner' : 'Manager'})` : ''}>
               {me ? `${me.username} · Sign Out` : 'Sign Out'}
             </span>
           </li>
