@@ -168,14 +168,21 @@ for (const col of ['info_country TEXT', 'info_region TEXT', 'info_producer TEXT'
 try { db.exec('ALTER TABLE hub_users ADD COLUMN email TEXT'); } catch { /* present */ }
 try { db.exec('ALTER TABLE stock_moves ADD COLUMN created_by TEXT'); } catch { /* present */ }
 try { db.exec('ALTER TABLE shops ADD COLUMN app_url TEXT'); } catch { /* present */ }
-for (const col of ['last_auth_ok_at TEXT', 'last_auth_fail_at TEXT', 'auth_fail_count INTEGER DEFAULT 0']) {
-  try { db.exec(`ALTER TABLE shops ADD COLUMN ${col}`); } catch { /* present */ }
+// Pre-chain databases keep login columns ON shops until the shop_logins
+// migration below lifts them out; fresh databases never grow them.
+const loginsMigrated = !!db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='shop_logins'").get();
+if (!loginsMigrated) {
+  for (const col of ['last_auth_ok_at TEXT', 'last_auth_fail_at TEXT', 'auth_fail_count INTEGER DEFAULT 0']) {
+    try { db.exec(`ALTER TABLE shops ADD COLUMN ${col}`); } catch { /* present */ }
+  }
 }
 for (const col of ['confirmed_by TEXT', 'confirmed_at TEXT', 'shipped_by TEXT', 'shipped_at TEXT']) {
   try { db.exec(`ALTER TABLE orders ADD COLUMN ${col}`); } catch { /* present */ }
 }
-for (const col of ['login_username TEXT', 'password_hash TEXT', 'salt TEXT', 'invite_token_hash TEXT', 'invite_expires_at TEXT']) {
-  try { db.exec(`ALTER TABLE shops ADD COLUMN ${col}`); } catch { /* present */ }
+if (!loginsMigrated) {
+  for (const col of ['login_username TEXT', 'password_hash TEXT', 'salt TEXT', 'invite_token_hash TEXT', 'invite_expires_at TEXT']) {
+    try { db.exec(`ALTER TABLE shops ADD COLUMN ${col}`); } catch { /* present */ }
+  }
 }
 for (const col of ['requested_date TEXT', 'total_lbs REAL DEFAULT 0', 'total_cost REAL']) {
   try { db.exec(`ALTER TABLE orders ADD COLUMN ${col}`); } catch { /* present */ }
@@ -270,6 +277,58 @@ db.prepare("INSERT OR IGNORE INTO roast_math (coffee_id, profile, green_in, roas
   }
 }
 
+// ─── Chain accounts: logins live apart from stores ───────────────────────────
+// An OWNER login can be granted to several stores of one chain; a MANAGER
+// belongs to exactly one. Existing shop logins migrate as the Owner of their
+// store, then the login columns leave the shops table for good.
+db.exec(`
+  CREATE TABLE IF NOT EXISTS shop_logins (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    username TEXT NOT NULL UNIQUE,
+    email TEXT,
+    role TEXT NOT NULL DEFAULT 'owner' CHECK(role IN ('owner','manager')),
+    password_hash TEXT,
+    salt TEXT,
+    invite_token_hash TEXT,
+    invite_expires_at TEXT,
+    last_auth_ok_at TEXT,
+    last_auth_fail_at TEXT,
+    auth_fail_count INTEGER DEFAULT 0,
+    created_at TEXT DEFAULT (datetime('now'))
+  );
+  CREATE TABLE IF NOT EXISTS shop_login_access (
+    login_id INTEGER NOT NULL REFERENCES shop_logins(id),
+    shop_id INTEGER NOT NULL REFERENCES shops(id),
+    PRIMARY KEY (login_id, shop_id)
+  );
+`);
+{
+  const row = db.prepare("SELECT sql FROM sqlite_master WHERE type='table' AND name='shops'").get();
+  if (row && row.sql.includes('login_username')) {
+    const ins = db.prepare(`INSERT INTO shop_logins
+      (username, email, role, password_hash, salt, invite_token_hash, invite_expires_at, last_auth_ok_at, last_auth_fail_at, auth_fail_count)
+      VALUES (?,?,?,?,?,?,?,?,?,?)`);
+    const grant = db.prepare('INSERT INTO shop_login_access (login_id, shop_id) VALUES (?,?)');
+    for (const sh of db.prepare('SELECT * FROM shops WHERE login_username IS NOT NULL').all()) {
+      const r = ins.run(sh.login_username, sh.email, 'owner', sh.password_hash, sh.salt,
+        sh.invite_token_hash, sh.invite_expires_at, sh.last_auth_ok_at, sh.last_auth_fail_at, sh.auth_fail_count || 0);
+      grant.run(r.lastInsertRowid, sh.id);
+    }
+    const cols2 = 'id, name, email, app_url, created_at';
+    db.exec('ALTER TABLE shops RENAME TO shops_migr2');
+    db.exec(`CREATE TABLE shops (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      name TEXT NOT NULL UNIQUE,
+      email TEXT,
+      app_url TEXT,
+      created_at TEXT DEFAULT (datetime('now'))
+    )`);
+    db.exec(`INSERT INTO shops (${cols2}) SELECT ${cols2} FROM shops_migr2`);
+    db.exec('DROP TABLE shops_migr2');
+    console.log('Migrated shop logins to chain accounts (owners span stores)');
+  }
+}
+
 const sha256 = s => crypto.createHash('sha256').update(String(s)).digest('hex');
 const SESSION_DAYS = 30;
 const money = v => `${CURRENCY}${(Math.round(v * 100) / 100).toFixed(2)}`;
@@ -302,7 +361,7 @@ function genLoginUsername(name) {
     .replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '');
   if (base.length < 3) base = ('shop-' + base).replace(/-$/, '');
   let candidate = base, n = 2;
-  while (db.prepare('SELECT 1 FROM shops WHERE login_username=?').get(candidate)) candidate = `${base}-${n++}`;
+  while (db.prepare('SELECT 1 FROM shop_logins WHERE username=?').get(candidate)) candidate = `${base}-${n++}`;
   return candidate;
 }
 
@@ -528,7 +587,7 @@ app.post('/api/login', async (req, res) => {
       // Wrong door: shop accounts don't log in at the hub. Signpost instead
       // of a dead 'wrong password' (the person typing already knows the name).
       if (!user) {
-        const asShop = db.prepare('SELECT * FROM shops WHERE login_username=?').get(uname);
+        const asShop = db.prepare('SELECT l.username, s.app_url FROM shop_logins l LEFT JOIN shop_login_access a ON a.login_id=l.id LEFT JOIN shops s ON s.id=a.shop_id AND s.app_url IS NOT NULL WHERE l.username=? LIMIT 1').get(uname);
         if (asShop) {
           return res.status(401).json({
             error: `This is the roastery sign-in. "${uname}" is a shop account — sign in at your shop's Dose app${asShop.app_url ? `: ${asShop.app_url}` : ' instead'}.`,
@@ -726,9 +785,8 @@ async function receiveShopOrder(shop, b) {
 
 // A reset re-establishes identity — stale brute-force lockouts must not
 // keep the freshly-reset password from working.
-function clearShopAuthLocks(shop) {
-  if (!shop.login_username) return;
-  loginFailures.delete(`shopauth:portal:${shop.login_username}`);
+function clearShopAuthLocks(login) {
+  if (login && login.username) loginFailures.delete(`shopauth:portal:${login.username}`);
 }
 
 // ─── Portal API (single-URL shop app; PORTAL_KEY master credential) ──────────
@@ -755,13 +813,19 @@ function portalShop(req, res) {
 
 // Roster sync: everything the portal needs to mirror shops locally.
 app.get('/api/portal/shops', (req, res) => {
+  const logins = db.prepare(`SELECT a.shop_id, l.username, l.role, l.password_hash FROM shop_login_access a
+    JOIN shop_logins l ON l.id=a.login_id`).all();
   res.json(db.prepare('SELECT * FROM shops ORDER BY id').all().map(s => ({
-    id: s.id, name: s.name, login_username: s.login_username || null,
-    has_password: !!s.password_hash,
+    id: s.id, name: s.name,
+    logins: logins.filter(x => x.shop_id === s.id).map(x => ({ username: x.username, role: x.role, has_password: !!x.password_hash })),
   })));
 });
 
-// Login: the username alone decides which shop this is.
+// Login: the username alone decides who this is — an Owner gets every store
+// of their chain, a Manager gets exactly one.
+const loginShops = loginId => db.prepare(
+  'SELECT s.id, s.name FROM shop_login_access a JOIN shops s ON s.id=a.shop_id WHERE a.login_id=? ORDER BY s.name').all(loginId);
+
 app.post('/api/portal/auth', async (req, res) => {
   try {
     const username = String((req.body && req.body.username) || '').toLowerCase().trim();
@@ -769,22 +833,28 @@ app.post('/api/portal/auth', async (req, res) => {
     const lockKey = `shopauth:portal:${username}`;
     const wait = lockedFor(lockKey);
     if (wait > 0) return res.status(429).json({ error: `Too many attempts — try again in ${wait}s` });
-    const shop = username ? db.prepare('SELECT * FROM shops WHERE login_username=?').get(username) : null;
-    if (shop && !shop.password_hash)
-      return res.status(409).json({ error: 'This shop has no login password yet — ask the roastery to send a password invite.' });
-    const okPw = shop ? await verifyShopPassword(shop, password) : (await hashPassword('timing-equalizer'), false);
+    const login = username ? db.prepare('SELECT * FROM shop_logins WHERE username=?').get(username) : null;
+    if (login && !login.password_hash)
+      return res.status(409).json({ error: 'This account has no password yet — ask the roastery to send a password invite.' });
+    const okPw = login ? await verifyShopPassword(login, password) : (await hashPassword('timing-equalizer'), false);
     if (!okPw) {
       recordFailure(lockKey);
-      if (shop) db.prepare("UPDATE shops SET last_auth_fail_at=datetime('now'), auth_fail_count=COALESCE(auth_fail_count,0)+1 WHERE id=?").run(shop.id);
+      if (login) db.prepare("UPDATE shop_logins SET last_auth_fail_at=datetime('now'), auth_fail_count=COALESCE(auth_fail_count,0)+1 WHERE id=?").run(login.id);
       // Wrong door: roastery people sign in at the hub, not the shop portal.
-      if (!shop && db.prepare('SELECT 1 FROM hub_users WHERE username=?').get(username)) {
+      if (!login && db.prepare('SELECT 1 FROM hub_users WHERE username=?').get(username)) {
         return res.status(401).json({ error: `"${username}" is a roastery account — sign in at the Dose Hub dashboard, not the shop app.` });
       }
       return res.status(401).json({ error: 'Wrong username or password' });
     }
+    const shops = loginShops(login.id);
+    if (!shops.length) return res.status(403).json({ error: 'This account has no store access — ask the roastery to grant it a store.' });
     loginFailures.delete(lockKey);
-    db.prepare("UPDATE shops SET last_auth_ok_at=datetime('now') WHERE id=?").run(shop.id);
-    res.json({ ok: true, shop_id: shop.id, shop_name: shop.name, username: shop.login_username, role: 'admin' });
+    db.prepare("UPDATE shop_logins SET last_auth_ok_at=datetime('now') WHERE id=?").run(login.id);
+    res.json({
+      ok: true, username: login.username, role: login.role, shops,
+      // Pre-chain portals read a single shop — keep them working mid-deploy.
+      shop_id: shops[0].id, shop_name: shops[0].name,
+    });
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: err.message });
@@ -821,18 +891,16 @@ app.get('/api/portal/order-status', (req, res) => {
 
 app.post('/api/portal/change-password', async (req, res) => {
   try {
-    const shop = portalShop(req, res);
-    if (!shop) return;
     const { username, current_password, new_password } = req.body || {};
-    if (String(username || '').toLowerCase().trim() !== (shop.login_username || '') ||
-        !(await verifyShopPassword(shop, current_password || ''))) {
+    const login = db.prepare('SELECT * FROM shop_logins WHERE username=?').get(String(username || '').toLowerCase().trim());
+    if (!login || !(await verifyShopPassword(login, current_password || ''))) {
       return res.status(401).json({ error: 'Current password is wrong' });
     }
     if (String(new_password || '').length < SHOP_PASSWORD_MIN)
       return res.status(400).json({ error: `Password must be at least ${SHOP_PASSWORD_MIN} characters` });
     const { salt, hash } = await hashPassword(new_password);
-    db.prepare('UPDATE shops SET password_hash=?, salt=? WHERE id=?').run(hash, salt, shop.id);
-    clearShopAuthLocks(shop);
+    db.prepare('UPDATE shop_logins SET password_hash=?, salt=? WHERE id=?').run(hash, salt, login.id);
+    clearShopAuthLocks(login);
     res.json({ ok: true });
   } catch (err) {
     console.error(err);
@@ -841,33 +909,39 @@ app.post('/api/portal/change-password', async (req, res) => {
 });
 
 // ─── Public invite endpoints (token-authenticated, no session) ───────────────
-function shopFromInviteToken(token) {
+function loginFromInviteToken(token) {
   if (!token) return null;
   return db.prepare(
-    "SELECT * FROM shops WHERE invite_token_hash=? AND invite_expires_at > datetime('now')"
+    "SELECT * FROM shop_logins WHERE invite_token_hash=? AND invite_expires_at > datetime('now')"
   ).get(sha256(String(token)));
 }
 
 app.post('/api/public/invite-info', (req, res) => {
-  const shop = shopFromInviteToken(req.body && req.body.token);
-  if (!shop) return res.status(404).json({ error: 'This link is invalid or has expired — ask the roastery to send a new one.' });
-  res.json({ shop_name: shop.name, login_username: shop.login_username, app_url: shop.app_url || null });
+  const login = loginFromInviteToken(req.body && req.body.token);
+  if (!login) return res.status(404).json({ error: 'This link is invalid or has expired — ask the roastery to send a new one.' });
+  const shops = loginShops(login.id);
+  res.json({
+    shop_name: shops.map(x => x.name).join(' · ') || null,
+    login_username: login.username, role: login.role,
+    app_url: (db.prepare('SELECT s.app_url FROM shop_login_access a JOIN shops s ON s.id=a.shop_id WHERE a.login_id=? AND s.app_url IS NOT NULL LIMIT 1').get(login.id) || {}).app_url || null,
+  });
 });
 
 app.post('/api/public/set-password', async (req, res) => {
   try {
-    const shop = shopFromInviteToken(req.body && req.body.token);
-    if (!shop) return res.status(404).json({ error: 'This link is invalid or has expired — ask the roastery to send a new one.' });
+    const login = loginFromInviteToken(req.body && req.body.token);
+    if (!login) return res.status(404).json({ error: 'This link is invalid or has expired — ask the roastery to send a new one.' });
     const password = (req.body && req.body.password) || '';
     if (String(password).length < SHOP_PASSWORD_MIN)
       return res.status(400).json({ error: `Password must be at least ${SHOP_PASSWORD_MIN} characters` });
     const { salt, hash } = await hashPassword(password);
-    db.prepare('UPDATE shops SET password_hash=?, salt=?, invite_token_hash=NULL, invite_expires_at=NULL WHERE id=?')
-      .run(hash, salt, shop.id);
-    clearShopAuthLocks(shop);
+    db.prepare('UPDATE shop_logins SET password_hash=?, salt=?, invite_token_hash=NULL, invite_expires_at=NULL WHERE id=?')
+      .run(hash, salt, login.id);
+    clearShopAuthLocks(login);
+    const shops = loginShops(login.id);
     db.prepare('INSERT INTO audit_log (username, action) VALUES (?, ?)')
-      .run('shop', `"${shop.name}" set a new password via its invite link`);
-    res.json({ ok: true, login_username: shop.login_username, shop_name: shop.name });
+      .run('shop', `"${login.username}" set a new password via its invite link`);
+    res.json({ ok: true, login_username: login.username, shop_name: shops.map(x => x.name).join(' · ') || null });
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: err.message });
@@ -1217,15 +1291,37 @@ app.put('/api/catalog/:id', requireOwner, (req, res) => {
 });
 
 // ─── Shops management ─────────────────────────────────────────────────────────
-const shopWithStats = s => ({
-  id: s.id, name: s.name, email: s.email, login_username: s.login_username, app_url: s.app_url || null,
-  last_auth_ok_at: s.last_auth_ok_at || null, last_auth_fail_at: s.last_auth_fail_at || null, auth_fail_count: s.auth_fail_count || 0,
-  has_password: !!s.password_hash,
-  invite_pending: !!(s.invite_token_hash && !s.password_hash),
-  created_at: s.created_at,
-  orders_count: db.prepare('SELECT COUNT(*) n FROM orders WHERE shop_id=?').get(s.id).n,
-  last_order_date: db.prepare('SELECT MAX(order_date) d FROM orders WHERE shop_id=?').get(s.id).d,
+const publicLogin = l => ({
+  id: l.id, username: l.username, email: l.email, role: l.role,
+  has_password: !!l.password_hash,
+  invite_pending: !!(l.invite_token_hash && !l.password_hash),
+  last_auth_ok_at: l.last_auth_ok_at || null, last_auth_fail_at: l.last_auth_fail_at || null,
+  auth_fail_count: l.auth_fail_count || 0,
+  shop_ids: db.prepare('SELECT shop_id FROM shop_login_access WHERE login_id=?').all(l.id).map(x => x.shop_id),
 });
+
+const shopLogins = shopId => db.prepare(
+  `SELECT l.* FROM shop_logins l JOIN shop_login_access a ON a.login_id=l.id
+   WHERE a.shop_id=? ORDER BY l.role DESC, l.username`).all(shopId).map(publicLogin);
+
+// The first Owner login doubles as the shop-level summary, so screens and
+// checks built around "the shop's login" keep reading something true.
+const shopWithStats = s => {
+  const logins = shopLogins(s.id);
+  const head = logins.find(l => l.role === 'owner') || logins[0] || {};
+  return {
+    id: s.id, name: s.name, email: s.email, app_url: s.app_url || null,
+    login_username: head.username || null,
+    has_password: !!head.has_password,
+    invite_pending: !!head.invite_pending,
+    last_auth_ok_at: head.last_auth_ok_at || null, last_auth_fail_at: head.last_auth_fail_at || null,
+    auth_fail_count: head.auth_fail_count || 0,
+    logins,
+    created_at: s.created_at,
+    orders_count: db.prepare('SELECT COUNT(*) n FROM orders WHERE shop_id=?').get(s.id).n,
+    last_order_date: db.prepare('SELECT MAX(order_date) d FROM orders WHERE shop_id=?').get(s.id).d,
+  };
+};
 
 app.get('/api/shops', (req, res) => {
   res.json(db.prepare('SELECT * FROM shops ORDER BY name').all().map(shopWithStats));
@@ -1235,16 +1331,16 @@ app.get('/api/shops', (req, res) => {
 // The shop sets its OWN password via a single-use, 7-day invite link emailed
 // to the registered address. If hub email isn't configured, the link is
 // returned to the roastery dashboard to pass on manually.
-function inviteEmailHtml(shop, link) {
+function inviteEmailHtml(login, shopNames, link) {
   return `
   <div style="max-width:520px;margin:0 auto;background:#F5EFE3;border:1px solid #DDD6CC;">
     <div style="background:#1A1916;padding:22px 26px;">
       <div style="font-family:Georgia,serif;font-size:18px;color:#F5EFE3;">Welcome to Dose</div>
-      <div style="font-family:monospace;font-size:11px;color:#B8AFA3;letter-spacing:0.14em;text-transform:uppercase;margin-top:6px;">${esc(shop.name)}</div>
+      <div style="font-family:monospace;font-size:11px;color:#B8AFA3;letter-spacing:0.14em;text-transform:uppercase;margin-top:6px;">${esc(shopNames)}</div>
     </div>
     <div style="padding:20px 26px;font-family:monospace;font-size:12px;color:#3D3A34;line-height:1.8;">
-      Your roastery set up Dose for your shop. Your sign-in username is
-      <strong>${esc(shop.login_username)}</strong> — click below to choose your password.
+      Your roastery set up Dose for you. Your sign-in username is
+      <strong>${esc(login.username)}</strong> — click below to choose your password.
       The link works once and expires in 7 days.
     </div>
     <div style="padding:0 26px 24px;">
@@ -1256,29 +1352,38 @@ function inviteEmailHtml(shop, link) {
   </div>`;
 }
 
-async function createInvite(shopId, req) {
+async function createInvite(loginId, req) {
   const token = crypto.randomBytes(32).toString('hex');
-  db.prepare("UPDATE shops SET invite_token_hash=?, invite_expires_at=datetime('now','+7 days') WHERE id=?")
-    .run(sha256(token), shopId);
-  const shop = db.prepare('SELECT * FROM shops WHERE id=?').get(shopId);
+  db.prepare("UPDATE shop_logins SET invite_token_hash=?, invite_expires_at=datetime('now','+7 days') WHERE id=?")
+    .run(sha256(token), loginId);
+  const login = db.prepare('SELECT * FROM shop_logins WHERE id=?').get(loginId);
+  const shopNames = loginShops(loginId).map(x => x.name).join(' · ');
   const link = `${req.protocol}://${req.get('host')}/set-password?token=${token}`;
-  const email = await sendEmail(shop.email, `Set your Dose password — ${shop.name}`, inviteEmailHtml(shop, link));
+  const email = await sendEmail(login.email, `Set your Dose password — ${shopNames || login.username}`, inviteEmailHtml(login, shopNames, link));
   return { ...email, link };
 }
 
-// Creating a shop creates its ACCOUNT: login username (from the name),
-// registered email, and API key (returned once). The password is set by the
-// shop itself through the invite link.
+// The shop's primary Owner login (raw row), for the shop-level invite/reset
+// endpoints that predate chain accounts.
+function ownerLoginOf(shopId) {
+  return db.prepare(`SELECT l.* FROM shop_logins l JOIN shop_login_access a ON a.login_id=l.id
+    WHERE a.shop_id=? AND l.role='owner' ORDER BY l.id LIMIT 1`).get(shopId);
+}
+
+// Creating a shop creates its ACCOUNT: an Owner login (username from the
+// name) granted to this store, with the password set by the shop itself
+// through the invite link.
 app.post('/api/shops', requireOwner, async (req, res) => {
   try {
     const name = String((req.body && req.body.name) || '').trim();
     const email = String((req.body && req.body.email) || '').trim() || null;
     if (name.length < 2) return res.status(400).json({ error: 'Shop name required (2+ characters)' });
     if (!email) return res.status(400).json({ error: 'Registered email required — the password invite is sent there' });
-    const loginUsername = genLoginUsername(name);
-    const r = db.prepare('INSERT INTO shops (name, email, login_username) VALUES (?,?,?)')
-      .run(name, email, loginUsername);
-    const invite = await createInvite(r.lastInsertRowid, req);
+    const r = db.prepare('INSERT INTO shops (name, email) VALUES (?,?)').run(name, email);
+    const login = db.prepare("INSERT INTO shop_logins (username, email, role) VALUES (?,?, 'owner')")
+      .run(genLoginUsername(name), email);
+    db.prepare('INSERT INTO shop_login_access (login_id, shop_id) VALUES (?,?)').run(login.lastInsertRowid, r.lastInsertRowid);
+    const invite = await createInvite(login.lastInsertRowid, req);
     audit(req, `created shop "${name}"`);
     res.json({ shop: shopWithStats(db.prepare('SELECT * FROM shops WHERE id=?').get(r.lastInsertRowid)), invite });
   } catch (err) {
@@ -1288,23 +1393,114 @@ app.post('/api/shops', requireOwner, async (req, res) => {
   }
 });
 
-// Re-send (or hand out) a fresh invite — also how a lost password gets reset
-// by the shop itself.
-app.post('/api/shops/:id/invite', requireOwner, async (req, res) => {
+// Add a login to a store: a Manager (this store only) or another Owner.
+app.post('/api/shops/:id/logins', requireOwner, async (req, res) => {
   try {
     const shop = db.prepare('SELECT * FROM shops WHERE id=?').get(req.params.id);
     if (!shop) return res.status(404).json({ error: 'Shop not found' });
-    if (!shop.email) return res.status(400).json({ error: 'Set a registered email for this shop first (Edit)' });
-    audit(req, `sent a password invite for shop "${shop.name}"`);
-    res.json({ ok: true, invite: await createInvite(shop.id, req) });
+    const role = (req.body && req.body.role) === 'owner' ? 'owner' : 'manager';
+    const email = String((req.body && req.body.email) || '').trim().toLowerCase();
+    if (!EMAIL_RE.test(email)) return res.status(400).json({ error: 'A valid email is required — the password invite is sent there' });
+    let username = String((req.body && req.body.username) || '').trim().toLowerCase();
+    if (username && !/^[a-z0-9][a-z0-9._-]{2,31}$/.test(username))
+      return res.status(400).json({ error: 'Username: 3–32 chars, lowercase letters/numbers/._- only' });
+    if (!username) username = genLoginUsername(`${shop.name} ${role}`);
+    if (db.prepare('SELECT 1 FROM shop_logins WHERE username=?').get(username))
+      return res.status(400).json({ error: 'That username is taken' });
+    const r = db.prepare('INSERT INTO shop_logins (username, email, role) VALUES (?,?,?)').run(username, email, role);
+    db.prepare('INSERT INTO shop_login_access (login_id, shop_id) VALUES (?,?)').run(r.lastInsertRowid, shop.id);
+    const invite = await createInvite(r.lastInsertRowid, req);
+    audit(req, `added ${role} login "${username}" to "${shop.name}"`);
+    res.json({ login: publicLogin(db.prepare('SELECT * FROM shop_logins WHERE id=?').get(r.lastInsertRowid)), invite });
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: err.message });
   }
 });
 
-// Set or reset a shop's login password (also backfills the login username
-// for shops created before accounts existed).
+// Grant / revoke an Owner login's access to a store (chains).
+app.post('/api/logins/:id/grant', requireOwner, (req, res) => {
+  const login = db.prepare('SELECT * FROM shop_logins WHERE id=?').get(req.params.id);
+  if (!login) return res.status(404).json({ error: 'Login not found' });
+  if (login.role !== 'owner') return res.status(400).json({ error: 'Managers belong to exactly one store — add a separate manager login instead' });
+  const shop = db.prepare('SELECT * FROM shops WHERE id=?').get(parseInt((req.body || {}).shop_id, 10) || -1);
+  if (!shop) return res.status(404).json({ error: 'Shop not found' });
+  db.prepare('INSERT OR IGNORE INTO shop_login_access (login_id, shop_id) VALUES (?,?)').run(login.id, shop.id);
+  audit(req, `granted "${login.username}" access to "${shop.name}"`);
+  res.json({ login: publicLogin(db.prepare('SELECT * FROM shop_logins WHERE id=?').get(login.id)) });
+});
+
+app.post('/api/logins/:id/revoke', requireOwner, (req, res) => {
+  const login = db.prepare('SELECT * FROM shop_logins WHERE id=?').get(req.params.id);
+  if (!login) return res.status(404).json({ error: 'Login not found' });
+  const shopId = parseInt((req.body || {}).shop_id, 10);
+  const count = db.prepare('SELECT COUNT(*) n FROM shop_login_access WHERE login_id=?').get(login.id).n;
+  if (count <= 1) return res.status(400).json({ error: 'That is this login\'s last store — remove the login instead if that is really the intent' });
+  db.prepare('DELETE FROM shop_login_access WHERE login_id=? AND shop_id=?').run(login.id, shopId);
+  const shop = db.prepare('SELECT name FROM shops WHERE id=?').get(shopId);
+  audit(req, `revoked "${login.username}" from "${(shop || {}).name || shopId}"`);
+  res.json({ login: publicLogin(db.prepare('SELECT * FROM shop_logins WHERE id=?').get(login.id)) });
+});
+
+// Remove a login outright. The portal drops its local access at the person's
+// next login; the hub stops authenticating them immediately.
+app.delete('/api/logins/:id', requireOwner, (req, res) => {
+  const login = db.prepare('SELECT * FROM shop_logins WHERE id=?').get(req.params.id);
+  if (!login) return res.status(404).json({ error: 'Login not found' });
+  db.prepare('DELETE FROM shop_login_access WHERE login_id=?').run(login.id);
+  db.prepare('DELETE FROM shop_logins WHERE id=?').run(login.id);
+  audit(req, `removed ${login.role} login "${login.username}"`);
+  res.json({ ok: true });
+});
+
+// Reset a login's password directly, or re-send its invite.
+app.post('/api/logins/:id/reset', requireOwner, async (req, res) => {
+  try {
+    const login = db.prepare('SELECT * FROM shop_logins WHERE id=?').get(req.params.id);
+    if (!login) return res.status(404).json({ error: 'Login not found' });
+    const password = (req.body && req.body.new_password) || '';
+    if (String(password).length < SHOP_PASSWORD_MIN)
+      return res.status(400).json({ error: `Password must be at least ${SHOP_PASSWORD_MIN} characters` });
+    const { salt, hash } = await hashPassword(password);
+    db.prepare('UPDATE shop_logins SET password_hash=?, salt=? WHERE id=?').run(hash, salt, login.id);
+    clearShopAuthLocks(login);
+    audit(req, `reset the password for login "${login.username}"`);
+    res.json({ ok: true, login_username: login.username });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.post('/api/logins/:id/invite', requireOwner, async (req, res) => {
+  try {
+    const login = db.prepare('SELECT * FROM shop_logins WHERE id=?').get(req.params.id);
+    if (!login) return res.status(404).json({ error: 'Login not found' });
+    if (!login.email) return res.status(400).json({ error: 'This login has no email — set one first' });
+    audit(req, `sent a password invite to login "${login.username}"`);
+    res.json({ ok: true, invite: await createInvite(login.id, req) });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Shop-level invite/reset (pre-chain shape): act on the store's Owner login.
+app.post('/api/shops/:id/invite', requireOwner, async (req, res) => {
+  try {
+    const shop = db.prepare('SELECT * FROM shops WHERE id=?').get(req.params.id);
+    if (!shop) return res.status(404).json({ error: 'Shop not found' });
+    const login = ownerLoginOf(shop.id);
+    if (!login) return res.status(400).json({ error: 'This shop has no Owner login — add one first' });
+    if (!login.email) return res.status(400).json({ error: 'Set a registered email for this shop first (Edit)' });
+    audit(req, `sent a password invite for shop "${shop.name}"`);
+    res.json({ ok: true, invite: await createInvite(login.id, req) });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
 app.post('/api/shops/:id/reset-login', requireOwner, async (req, res) => {
   try {
     const shop = db.prepare('SELECT * FROM shops WHERE id=?').get(req.params.id);
@@ -1312,12 +1508,19 @@ app.post('/api/shops/:id/reset-login', requireOwner, async (req, res) => {
     const password = (req.body && req.body.new_password) || '';
     if (String(password).length < SHOP_PASSWORD_MIN)
       return res.status(400).json({ error: `Password must be at least ${SHOP_PASSWORD_MIN} characters` });
-    const loginUsername = shop.login_username || genLoginUsername(shop.name);
+    let login = ownerLoginOf(shop.id);
+    if (!login) {
+      // A store that predates logins entirely: mint its Owner on the spot.
+      const r = db.prepare("INSERT INTO shop_logins (username, email, role) VALUES (?,?, 'owner')")
+        .run(genLoginUsername(shop.name), shop.email);
+      db.prepare('INSERT INTO shop_login_access (login_id, shop_id) VALUES (?,?)').run(r.lastInsertRowid, shop.id);
+      login = db.prepare('SELECT * FROM shop_logins WHERE id=?').get(r.lastInsertRowid);
+    }
     const { salt, hash } = await hashPassword(password);
-    db.prepare('UPDATE shops SET login_username=?, password_hash=?, salt=? WHERE id=?').run(loginUsername, hash, salt, shop.id);
-    clearShopAuthLocks(db.prepare('SELECT * FROM shops WHERE id=?').get(shop.id)); // fresh row — the username may just have been backfilled
+    db.prepare('UPDATE shop_logins SET password_hash=?, salt=? WHERE id=?').run(hash, salt, login.id);
+    clearShopAuthLocks(login);
     audit(req, `reset the shop login for "${shop.name}"`);
-    res.json({ ok: true, login_username: loginUsername });
+    res.json({ ok: true, login_username: login.username });
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: err.message });
