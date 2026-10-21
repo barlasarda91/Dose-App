@@ -26,6 +26,7 @@ const j = client(API, 'x-hub-key');
   const dir = freshDir('hub-ui');
   const server = startServer('hub', 'server.js', {
     HUB_DB_PATH: path.join(dir, 'hub.db'), PORT: String(PORT), HUB_PASSWORD: 'ui-boot-code',
+    PORTAL_KEY: 'ui-portal-key',
   });
   let browser;
   try {
@@ -82,11 +83,11 @@ const j = client(API, 'x-hub-key');
     // Seed a shop + order via API (owner token from the first page's storage).
     const tok = await page.evaluate(() => localStorage.getItem('hub_key'));
     await j('POST', '/api/catalog', { name: 'Blend No. 1', price_per_lb: 14.5 }, tok);
-    const shopRes = await j('POST', '/api/shops', { name: 'UI Test Shop', email: 'shop@example.com' }, tok);
-    await fetch(`${API}/api/ingest/orders`, {
+    await j('POST', '/api/shops', { name: 'UI Test Shop', email: 'shop@example.com' }, tok);
+    await fetch(`${API}/api/portal/orders`, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${shopRes.body.api_key}` },
-      body: JSON.stringify({ order_date: '2026-06-01', items: [{ coffee_id: 1, roast: 'espresso', lbs: 10 }] }),
+      headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ui-portal-key' },
+      body: JSON.stringify({ shop_id: 1, order_date: '2026-06-01', items: [{ coffee_id: 1, roast: 'espresso', lbs: 10 }] }),
     });
     await p2.click('[data-tab="orders"]');
     await p2.waitForSelector('.neworder', { timeout: 5000 });

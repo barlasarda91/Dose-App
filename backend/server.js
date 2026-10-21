@@ -461,8 +461,9 @@ async function verifyUser(username, password, shopId = DEFAULT_SHOP_ID) {
 // When a roastery hub is connected, credentials are verified against the hub
 // (the hub is the identity provider). A successful login is cached (hashed)
 // for 24h so a hub outage doesn't lock out people who logged in recently.
-function isHubConfigured(cfg, shopId = DEFAULT_SHOP_ID) {
-  return PORTAL_MODE || !!hubConn(cfg, shopId).key; // the URL always resolves (default hub)
+function isHubConfigured() {
+  // The portal is the only hub-connected mode; per-shop API keys are gone.
+  return PORTAL_MODE;
 }
 
 // Hub identities get a local user row so sessions, created_by stamps, and
@@ -484,15 +485,6 @@ async function cacheHubLogin(username, password, role, shopId = DEFAULT_SHOP_ID)
   const { salt, hash } = await hashPassword(password);
   db.prepare(`INSERT OR REPLACE INTO hub_login_cache (shop_id, username, password_hash, salt, role, verified_at)
     VALUES (?,?,?,?,?, datetime('now'))`).run(shopId, normUsername(username), hash, salt, role);
-}
-
-async function verifyCachedHubLogin(username, password, shopId = DEFAULT_SHOP_ID) {
-  const row = db.prepare(
-    "SELECT * FROM hub_login_cache WHERE shop_id=? AND username=? AND verified_at > datetime('now','-24 hours')"
-  ).get(shopId, normUsername(username));
-  if (!row) return null;
-  const { hash } = await hashPassword(password, row.salt);
-  return crypto.timingSafeEqual(Buffer.from(hash, 'hex'), Buffer.from(row.password_hash, 'hex')) ? row : null;
 }
 
 function usersExist() {
@@ -693,35 +685,16 @@ app.get('/api/auth-status', (req, res) => {
   });
 });
 
-// First run only, gated by the setup code from the server logs. Two modes:
-//  - mode 'hub': connect this deployment to a roastery hub (validated against
-//    the hub before saving); logins are then hub credentials.
-//  - default: create a standalone local admin account.
+// First run only (standalone deployments), gated by the setup code from the
+// server logs: creates the local admin account. Portal deployments never set
+// up here — identities live at the hub.
 app.post('/api/setup', asyncRoute(async (req, res) => {
-  if (usersExist() || isHubConfigured(getSettings())) return res.status(400).json({ error: 'Already set up — use login' });
-  const { username, password, setup_code, mode } = req.body || {};
+  if (usersExist() || isHubConfigured()) return res.status(400).json({ error: 'Already set up — use login' });
+  const { username, password, setup_code } = req.body || {};
   if (!setupCode || !crypto.timingSafeEqual(
     crypto.createHash('sha256').update(String(setup_code || '')).digest(),
     crypto.createHash('sha256').update(setupCode).digest()
   )) return res.status(403).json({ error: 'Wrong setup code — find it in the server logs (Railway → Deployments → View Logs)' });
-
-  if (mode === 'hub') {
-    const hubUrl = String(req.body.hub_url || '').trim().replace(/\/+$/, '') || DEFAULT_HUB_URL;
-    const hubApiKey = String(req.body.hub_api_key || '').trim();
-    if (!/^https?:\/\//.test(hubUrl)) return res.status(400).json({ error: 'A valid hub URL is required (https://…)' });
-    if (!hubApiKey) return res.status(400).json({ error: 'Hub API key is required' });
-    try {
-      const test = await fetch(`${hubUrl}/api/ingest/catalog`, { headers: { 'Authorization': `Bearer ${hubApiKey}` } });
-      if (test.status === 401) return res.status(400).json({ error: 'The hub rejected this API key' });
-      if (!test.ok) return res.status(400).json({ error: `The hub responded with an error (${test.status})` });
-    } catch (err) {
-      return res.status(400).json({ error: `Could not reach the hub: ${err.message}` });
-    }
-    if (hubUrl !== DEFAULT_HUB_URL) setSetting('hub_url', hubUrl);
-    setSetting('hub_api_key', encryptSecret(hubApiKey));
-    setupCode = null;
-    return res.json({ ok: true, connected: true }); // no session — log in with hub credentials
-  }
 
   const uname = normUsername(username);
   if (!USERNAME_RE.test(uname)) return res.status(400).json({ error: 'Username: 3–32 chars, letters/numbers/._- only' });
@@ -734,9 +707,7 @@ app.post('/api/setup', asyncRoute(async (req, res) => {
 app.post('/api/login', asyncRoute(async (req, res) => {
   const { username, password } = req.body || {};
   const uname = normUsername(username);
-  const cfg = getSettings();
-  const hubMode = isHubConfigured(cfg);
-  if (!usersExist() && !hubMode) return res.status(409).json({ error: 'Setup required' });
+  if (!usersExist() && !PORTAL_MODE) return res.status(409).json({ error: 'Setup required' });
   const ipKey = `ip:${req.ip}`;
   const userKey = `u:${uname}`;
   const wait = Math.max(lockedFor(ipKey), lockedFor(userKey));
@@ -795,44 +766,6 @@ app.post('/api/login', asyncRoute(async (req, res) => {
     }
   }
 
-  if (hubMode) {
-    let hubUser = null;
-    let fallThroughToLocal = false;
-    try {
-      hubUser = await hubFetch(cfg, '/api/ingest/auth', {
-        method: 'POST', body: JSON.stringify({ username: uname, password: password || '' }),
-      });
-    } catch (err) {
-      if (err.hubStatus === 401) {
-        // The hub is the rate limiter for hub logins — counting locally too
-        // left clients locked out even after the roastery reset the password.
-        // Relay the hub's message: it distinguishes wrong-password from
-        // 'this username belongs to a different shop's deployment'.
-        return res.status(401).json({ error: err.message || 'Wrong username or password' });
-      }
-      if (err.hubStatus === 429) return res.status(429).json({ error: err.message });
-      if (err.hubStatus === 409) {
-        fallThroughToLocal = true; // hub shop has no login password yet — legacy local accounts still apply
-      } else {
-        // Hub unreachable: accept recently verified credentials from the cache.
-        const cached = await verifyCachedHubLogin(uname, password || '');
-        if (cached) {
-          const u = upsertHubUser(cached.username, cached.role);
-          clearFailures(ipKey, userKey);
-          return res.json({ ok: true, token: issueToken(u.id), user: publicUser(u), cached: true });
-        }
-        return res.status(502).json({ error: 'Cannot reach the roastery hub to verify your login — try again shortly.' });
-      }
-    }
-    if (hubUser) {
-      const u = upsertHubUser(hubUser.username, hubUser.role || 'admin');
-      await cacheHubLogin(hubUser.username, password || '', hubUser.role || 'admin');
-      clearFailures(ipKey, userKey);
-      return res.json({ ok: true, token: issueToken(u.id), user: publicUser(u) });
-    }
-    if (!fallThroughToLocal) return res.status(500).json({ error: 'Login failed' });
-  }
-
   const u = await verifyUser(uname, password || '');
   if (!u) {
     recordFailure(ipKey); recordFailure(userKey);
@@ -852,7 +785,7 @@ app.post('/api/me/tour-done', (req, res) => {
 });
 
 // Change your own password; signs out your other sessions. Hub-managed
-// identities change their password AT the hub (proxied with the API key).
+// identities change their password AT the hub (proxied via the portal).
 app.post('/api/change-password', asyncRoute(async (req, res) => {
   const { current_password, new_password } = req.body || {};
   const u = db.prepare('SELECT * FROM users WHERE id=?').get(req.user.id);
@@ -922,8 +855,10 @@ app.delete('/api/users/:id', requireAdmin, (req, res) => {
 });
 
 // ─── Settings ─────────────────────────────────────────────────────────────────
-const SECRET_SETTINGS = ['square_access_token', 'resend_api_key', 'hub_api_key'];
-const HIDDEN_SETTINGS = new Set([...SECRET_SETTINGS, 'auth_password_hash', 'auth_salt']);
+const SECRET_SETTINGS = ['square_access_token', 'resend_api_key'];
+// hub_api_key is no longer settable (per-shop keys are gone), but databases
+// from that era still hold the row — never echo it back.
+const HIDDEN_SETTINGS = new Set([...SECRET_SETTINGS, 'hub_api_key', 'auth_password_hash', 'auth_salt']);
 
 app.get('/api/settings', (req, res) => {
   const cfg = getSettings(req.shopId);
@@ -936,7 +871,7 @@ app.get('/api/settings', (req, res) => {
   s.resend_configured = !!getSecret('resend_api_key', 'RESEND_API_KEY', req.shopId);
   s.resend_source = (cfg.resend_api_key || '').trim() ? 'settings'
     : (process.env.RESEND_API_KEY ? 'env' : null);
-  s.hub_configured = isHubConfigured(cfg, req.shopId);
+  s.hub_configured = isHubConfigured();
   s.auth_mode = s.hub_configured ? 'hub' : 'local';
   s.portal_mode = PORTAL_MODE;
   s.password_protected = true; // login is always required
@@ -960,7 +895,7 @@ app.post('/api/settings', (req, res) => {
     setSetting(key, SECRET_SETTINGS.includes(key) ? encryptSecret(value) : value, req.shopId);
   }
   if (req.body.square_access_token !== undefined) locationCaches.delete(req.shopId); // token changed → re-resolve locations
-  if (req.body.hub_url !== undefined || req.body.hub_api_key !== undefined) catalogCaches.delete(req.shopId);
+  if (req.body.hub_url !== undefined) catalogCaches.delete(req.shopId);
   res.json({ success: true });
 });
 
@@ -1461,13 +1396,6 @@ async function sendOrderEmail(shopId, order, cfg, items = []) {
 }
 
 // ─── Hub connection ──────────────────────────────────────────────────────────
-function hubConn(cfg, shopId = DEFAULT_SHOP_ID) {
-  return {
-    url: (cfg.hub_url || '').trim().replace(/\/+$/, '') || DEFAULT_HUB_URL,
-    key: getSecret('hub_api_key', 'HUB_API_KEY', shopId),
-  };
-}
-
 async function rawHubFetch(url, key, path, opts = {}, timeoutMs = 6000) {
   const controller = new AbortController();
   const t = setTimeout(() => controller.abort(), timeoutMs);
@@ -1489,13 +1417,6 @@ async function rawHubFetch(url, key, path, opts = {}, timeoutMs = 6000) {
   }
 }
 
-// Legacy transport: this shop's own API key identifies it to the hub.
-async function hubFetch(cfg, path, opts = {}, timeoutMs = 6000, shopId = DEFAULT_SHOP_ID) {
-  const { url, key } = hubConn(cfg, shopId);
-  if (!url || !key) throw new Error('Hub not configured');
-  return rawHubFetch(url, key, path, opts, timeoutMs);
-}
-
 // Portal transport: one master key, the shop named per request by ITS HUB ID.
 async function portalFetch(path, opts = {}, timeoutMs = 6000) {
   const url = (getSettings(0).hub_url || '').trim().replace(/\/+$/, '') || DEFAULT_HUB_URL;
@@ -1510,50 +1431,29 @@ function hubShopIdOf(shopId) {
 
 // Operation-level helpers: each call site names the LOCAL shop; whether that
 // travels as a per-shop key (legacy) or a portal request is decided here.
+function requirePortal() {
+  if (!PORTAL_MODE) throw new Error('Hub not configured');
+}
 async function hubCatalogFetch(shopId) {
-  if (PORTAL_MODE) return portalFetch(`/api/portal/catalog?shop_id=${hubShopIdOf(shopId)}`);
-  return hubFetch(getSettings(shopId), '/api/ingest/catalog', {}, 6000, shopId);
+  requirePortal();
+  return portalFetch(`/api/portal/catalog?shop_id=${hubShopIdOf(shopId)}`);
 }
 async function hubOrderPush(shopId, body) {
-  if (PORTAL_MODE) return portalFetch('/api/portal/orders', { method: 'POST', body: JSON.stringify({ ...body, shop_id: hubShopIdOf(shopId) }) });
-  return hubFetch(getSettings(shopId), '/api/ingest/orders', { method: 'POST', body: JSON.stringify(body) }, 6000, shopId);
+  requirePortal();
+  return portalFetch('/api/portal/orders', { method: 'POST', body: JSON.stringify({ ...body, shop_id: hubShopIdOf(shopId) }) });
 }
 async function hubOrderStatuses(shopId, ids) {
-  if (PORTAL_MODE) return portalFetch(`/api/portal/order-status?shop_id=${hubShopIdOf(shopId)}&ids=${ids.join(',')}`, {}, 3000);
-  return hubFetch(getSettings(shopId), `/api/ingest/order-status?ids=${ids.join(',')}`, {}, 3000, shopId);
+  requirePortal();
+  return portalFetch(`/api/portal/order-status?shop_id=${hubShopIdOf(shopId)}&ids=${ids.join(',')}`, {}, 3000);
 }
 async function hubPasswordChange(shopId, body) {
-  if (PORTAL_MODE) return portalFetch('/api/portal/change-password', { method: 'POST', body: JSON.stringify({ ...body, shop_id: hubShopIdOf(shopId) }) });
-  return hubFetch(getSettings(shopId), '/api/ingest/change-password', { method: 'POST', body: JSON.stringify(body) }, 6000, shopId);
-}
-
-// Pre-portal local shops don't know their hub id. Their stored API key does:
-// the hub's catalog response names the shop it belongs to, so linking is
-// zero-touch on the first portal login after cutover.
-async function linkLegacyShops() {
-  for (const s of db.prepare('SELECT * FROM shops WHERE hub_shop_id IS NULL').all()) {
-    const key = getSecret('hub_api_key', 'HUB_API_KEY', s.id);
-    if (!key) continue;
-    try {
-      const data = await hubFetch(getSettings(s.id), '/api/ingest/catalog', {}, 6000, s.id);
-      if (data.shop_id != null) {
-        db.prepare("UPDATE shops SET hub_shop_id=?, name=COALESCE(NULLIF(?, ''), name) WHERE id=?")
-          .run(data.shop_id, data.shop_name || '', s.id);
-        console.log(`Linked local shop ${s.id} to hub shop ${data.shop_id} (${data.shop_name || 'unnamed'})`);
-      }
-    } catch (err) {
-      console.error(`Could not link local shop ${s.id} to the hub: ${err.message}`);
-    }
-  }
+  requirePortal();
+  return portalFetch('/api/portal/change-password', { method: 'POST', body: JSON.stringify({ ...body, shop_id: hubShopIdOf(shopId) }) });
 }
 
 // A hub shop's local mirror row, created on its first portal login.
 async function ensureLocalShop(hubShopId, name) {
   let s = db.prepare('SELECT * FROM shops WHERE hub_shop_id=?').get(hubShopId);
-  if (!s) {
-    await linkLegacyShops(); // the migrated single-shop row may be this very shop
-    s = db.prepare('SELECT * FROM shops WHERE hub_shop_id=?').get(hubShopId);
-  }
   if (!s) {
     const r = db.prepare('INSERT INTO shops (hub_shop_id, name) VALUES (?,?)').run(hubShopId, name || '');
     seedShopSettings(r.lastInsertRowid);

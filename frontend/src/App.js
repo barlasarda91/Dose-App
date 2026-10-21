@@ -8,47 +8,35 @@ import Settings  from './pages/Settings';
 import Tour      from './Tour';
 import { api, setKey, clearKey } from './api';
 
-// First run (gated by the setup code from the server logs): either connect
-// this deployment to the roastery hub — logins are then the hub-issued shop
-// credentials — or create a standalone local admin. Every other visit: log
-// in. Credentials are exchanged for a session token stored in localStorage;
+// First run on a standalone deployment (gated by the setup code from the
+// server logs): create a local admin. On the portal, setup never shows —
+// identities live at the roastery hub. Every other visit: log in.
+// Credentials are exchanged for a session token stored in localStorage;
 // the password itself is never kept.
 function Gate({ mode }) {
   const [username, setUsername] = useState('');
   const [pw, setPw]           = useState('');
   const [confirm, setConfirm] = useState('');
   const [code, setCode]       = useState('');
-  const [hubKey, setHubKey]   = useState('');
-  const [setupMode, setSetupMode] = useState('hub'); // 'hub' | 'standalone'
   const [err, setErr]         = useState(null);
-  const [msg, setMsg]         = useState(null);
   const [busy, setBusy]       = useState(false);
   const isSetup = mode === 'setup';
-  const isHubSetup = isSetup && setupMode === 'hub';
 
   async function submit(e) {
     e.preventDefault();
     if (busy) return;
-    if (isHubSetup) { if (!code || !hubKey) return; }
-    else {
-      if (!pw || !username) return;
-      if (isSetup && pw !== confirm) { setErr('Passwords do not match'); return; }
-    }
+    if (!pw || !username) return;
+    if (isSetup && pw !== confirm) { setErr('Passwords do not match'); return; }
     setBusy(true); setErr(null);
     try {
-      const body = isHubSetup
-        ? { mode: 'hub', setup_code: code, hub_api_key: hubKey }
-        : { username, password: pw, ...(isSetup ? { setup_code: code } : {}) };
+      const body = { username, password: pw, ...(isSetup ? { setup_code: code } : {}) };
       const res = await fetch(isSetup ? '/api/setup' : '/api/login', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(body),
       });
       const data = await res.json().catch(() => ({}));
-      if (res.ok && data.connected) {
-        setMsg('✓ Connected to the roastery hub. Sign in with the shop credentials the roastery gave you.');
-        setTimeout(() => window.location.reload(), 1800);
-      } else if (res.ok && data.token) {
+      if (res.ok && data.token) {
         setKey(data.token);
         window.location.reload();
       } else {
@@ -68,19 +56,8 @@ function Gate({ mode }) {
         <div className="login-sub">Boxx Coffee Roasters Co.</div>
 
         {isSetup && (
-          <div style={{ display: 'flex', gap: 6, marginBottom: 16 }}>
-            <button type="button" className={`btn ${setupMode === 'hub' ? 'btn-primary' : 'btn-ghost'}`} style={{ flex: 1, padding: '7px 6px' }}
-              onClick={() => { setSetupMode('hub'); setErr(null); }}>Connect to Hub</button>
-            <button type="button" className={`btn ${setupMode === 'standalone' ? 'btn-primary' : 'btn-ghost'}`} style={{ flex: 1, padding: '7px 6px' }}
-              onClick={() => { setSetupMode('standalone'); setErr(null); }}>Standalone</button>
-          </div>
-        )}
-
-        {isSetup && (
           <p style={{ fontFamily: 'var(--font-mono)', fontSize: 11, color: 'var(--graphite)', lineHeight: 1.7, marginBottom: 14 }}>
-            {isHubSetup
-              ? <>Connect this shop to the roastery's Dose Hub. You need this shop's API key (from the roastery), plus the setup code from this server's logs.</>
-              : <>Run this shop without a roastery hub: create a local <strong>admin</strong> account. You need the setup code from the server logs.</>}
+            Run this shop without a roastery hub: create a local <strong>admin</strong> account. You need the setup code from the server logs.
           </p>
         )}
 
@@ -92,13 +69,7 @@ function Gate({ mode }) {
           </>
         )}
 
-        {isHubSetup ? (
-          <>
-            <label className="form-lbl" htmlFor="dose-hubkey" style={{ marginTop: 8 }}>Shop API Key</label>
-            <input id="dose-hubkey" type="password" className="form-input" placeholder="dose_…"
-              value={hubKey} onChange={e => setHubKey(e.target.value)} />
-          </>
-        ) : (
+        {(
           <>
             <label className="form-lbl" htmlFor="dose-user" style={isSetup ? { marginTop: 8 } : undefined}>{isSetup ? 'Admin Username' : 'Username'}</label>
             <input id="dose-user" type="text" className="form-input" autoFocus autoCapitalize="none" autoCorrect="off"
@@ -117,10 +88,9 @@ function Gate({ mode }) {
         )}
 
         {err && <div className="login-err">{err}</div>}
-        {msg && <div className="login-err" style={{ color: 'var(--olive)' }}>{msg}</div>}
         <button className="btn btn-primary" type="submit" style={{ marginTop: 14, width: '100%' }}
-          disabled={busy || (isHubSetup ? (!code || !hubKey) : (!pw || !username || (isSetup && !code)))}>
-          {busy ? '…' : isHubSetup ? 'Connect Shop' : isSetup ? 'Create Admin & Enter' : 'Enter'}
+          disabled={busy || !pw || !username || (isSetup && !code)}>
+          {busy ? '…' : isSetup ? 'Create Admin & Enter' : 'Enter'}
         </button>
       </form>
     </div>
