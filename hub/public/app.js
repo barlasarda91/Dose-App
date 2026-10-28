@@ -1192,26 +1192,38 @@
       <div id="pricing-panel"></div>`;
 
     function drawList() {
-      document.getElementById('shop-list').innerHTML = shops.length ? `<div class="table-wrap"><table>
-        <thead><tr><th>Shop</th><th>Login</th><th>Login health</th><th>Email</th><th>Orders</th><th>Last order</th><th></th></tr></thead>
-        <tbody>${shops.map(s => `<tr>
-          <td style="font-weight:500">${esc(s.name)}</td>
-          <td style="color:var(--drift)">${esc(s.login_username || '—')}${s.has_password ? '' : (s.invite_pending ? ' <span class="badge seasonal">Invite pending</span>' : ' <span class="badge low">No login yet</span>')}</td>
-          <td style="font-size:11px;line-height:1.7">${
-            !s.last_auth_ok_at && !s.last_auth_fail_at
-              ? '<span style="color:var(--warn)">no login attempt has ever reached the hub</span>'
-              : `${s.last_auth_ok_at ? `<span style="color:var(--olive)">✓ last success ${esc(fmtLA(s.last_auth_ok_at))}</span>` : '<span style="color:var(--red)">never succeeded</span>'}
-                 ${s.last_auth_fail_at ? `<br><span style="color:var(--drift)">✕ last failure ${esc(fmtLA(s.last_auth_fail_at))} · ${s.auth_fail_count} total</span>` : ''}`
-          }</td>
-          <td style="color:var(--drift)">${esc(s.email || '— none —')}</td>
-          <td>${s.orders_count}</td>
-          <td>${esc(s.last_order_date || '—')}</td>
-          <td><div style="display:flex;gap:6px;flex-wrap:wrap">
+      const el = document.getElementById('shop-list');
+      if (!shops.length) { el.innerHTML = '<div class="empty">No shops yet.</div>'; return; }
+      const health = l => !l.last_auth_ok_at && !l.last_auth_fail_at
+        ? '<span style="color:var(--warn)">never signed in</span>'
+        : `${l.last_auth_ok_at ? `<span style="color:var(--olive)">✓ ${esc(fmtLA(l.last_auth_ok_at))}</span>` : '<span style="color:var(--red)">never succeeded</span>'}${l.last_auth_fail_at ? ` <span style="color:var(--drift)">· ✕ ${esc(fmtLA(l.last_auth_fail_at))} (${l.auth_fail_count})</span>` : ''}`;
+      const loginRow = (s, l) => `
+        <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap;padding:8px 0;border-top:1px solid var(--stone);font-size:12px">
+          <span class="role-chip ${l.role === 'owner' ? 'owner' : 'staff'}">${l.role === 'owner' ? 'Owner' : 'Manager'}</span>
+          <strong>${esc(l.username)}</strong>
+          ${l.shop_ids.length > 1 ? `<span style="font-size:10px;color:var(--olive)">sees ${l.shop_ids.length} stores</span>` : ''}
+          ${l.has_password ? '' : (l.invite_pending ? '<span class="badge seasonal">Invite pending</span>' : '<span class="badge low">No password yet</span>')}
+          <span style="font-size:10px">${health(l)}</span>
+          <span style="flex:1"></span>
+          <button class="btn-sm btn" data-linvite="${l.id}" data-user="${esc(l.username)}">Send Invite</button>
+          <button class="btn-sm btn" data-lreset="${l.id}" data-user="${esc(l.username)}">Reset PW</button>
+          ${l.role === 'owner'
+            ? (l.shop_ids.length > 1 ? `<button class="btn-sm btn" data-lrevoke="${l.id}" data-shop="${s.id}" data-user="${esc(l.username)}">Revoke here</button>` : '')
+            : `<button class="btn-danger btn" data-lremove="${l.id}" data-user="${esc(l.username)}">Remove</button>`}
+        </div>`;
+      el.innerHTML = shops.map(s => `
+        <div class="card" style="margin-top:12px">
+          <div style="display:flex;gap:12px;align-items:baseline;flex-wrap:wrap">
+            <span style="font-family:var(--serif);font-size:15px;color:var(--ink)">${esc(s.name)}</span>
+            <span style="font-size:11px;color:var(--drift)">${esc(s.email || '— no email —')} · ${s.orders_count} orders · last ${esc(s.last_order_date || '—')}</span>
+            <span style="flex:1"></span>
             <button class="btn-sm btn" data-pricing="${s.id}">Pricing</button>
             <button class="btn-sm btn" data-editshop="${s.id}">Edit</button>
-            <button class="btn-sm btn" data-invite="${s.id}">${s.has_password ? 'Send Password Reset' : 'Send Invite'}</button>
-          </div></td>
-        </tr>`).join('')}</tbody></table></div>` : '<div class="empty">No shops yet.</div>';
+            <button class="btn-sm btn" data-addmgr="${s.id}" data-name="${esc(s.name)}">+ Add Manager</button>
+            <button class="btn-sm btn" data-grant="${s.id}" data-name="${esc(s.name)}">+ Grant Owner Access</button>
+          </div>
+          ${s.logins.map(l => loginRow(s, l)).join('') || '<div style="padding:8px 0;border-top:1px solid var(--stone);font-size:11px;color:var(--warn)">no logins yet — Add Manager, or Reset Login to mint the Owner</div>'}
+        </div>`).join('');
       wireList();
     }
 
@@ -1239,6 +1251,11 @@
     };
 
     function wireList() {
+      const refresh = async () => { shops = await api('/api/shops'); drawList(); };
+      const loginByUsername = u => {
+        for (const sh of shops) for (const l of sh.logins) if (l.username === u) return l;
+        return null;
+      };
       document.querySelectorAll('[data-editshop]').forEach(btn => btn.onclick = async () => {
         const shop = shops.find(s => String(s.id) === btn.dataset.editshop);
         const name = window.prompt('Shop name:', shop.name);
@@ -1253,14 +1270,59 @@
           drawList();
         } catch (e) { alert(e.message); }
       });
-      document.querySelectorAll('[data-invite]').forEach(btn => btn.onclick = async () => {
-        const shop = shops.find(s => String(s.id) === btn.dataset.invite);
+      document.querySelectorAll('[data-addmgr]').forEach(btn => btn.onclick = async () => {
+        const username = window.prompt(`Manager username for ${btn.dataset.name} (lowercase, 3–32 chars — blank to auto-generate):`, '');
+        if (username === null) return;
+        const email = window.prompt('Manager email (the password invite goes there):', '');
+        if (email === null || !email.trim()) return;
         try {
-          const data = await api(`/api/shops/${shop.id}/invite`, { method: 'POST' });
-          document.getElementById('add-result').innerHTML = inviteHtml(shop, data.invite);
+          const data = await api(`/api/shops/${btn.dataset.addmgr}/logins`, { method: 'POST', body: JSON.stringify({ username: username.trim(), email: email.trim(), role: 'manager' }) });
+          document.getElementById('add-result').innerHTML = inviteHtml({ name: btn.dataset.name, login_username: data.login.username }, data.invite);
           wireCopy();
-          if (!shop.has_password) { shops = shops.map(s => s.id === shop.id ? { ...s, invite_pending: true } : s); drawList(); }
+          await refresh();
           window.scrollTo({ top: 0, behavior: 'smooth' });
+        } catch (e) { alert(e.message); }
+      });
+      document.querySelectorAll('[data-grant]').forEach(btn => btn.onclick = async () => {
+        const uname = window.prompt(`Grant which existing OWNER access to ${btn.dataset.name}? (their username)`, '');
+        if (uname === null || !uname.trim()) return;
+        const login = loginByUsername(uname.trim().toLowerCase());
+        if (!login) return alert(`No login named "${uname.trim()}" exists yet — owners are created with their first store.`);
+        try {
+          await api(`/api/logins/${login.id}/grant`, { method: 'POST', body: JSON.stringify({ shop_id: parseInt(btn.dataset.grant, 10) }) });
+          await refresh();
+        } catch (e) { alert(e.message); }
+      });
+      document.querySelectorAll('[data-linvite]').forEach(btn => btn.onclick = async () => {
+        try {
+          const data = await api(`/api/logins/${btn.dataset.linvite}/invite`, { method: 'POST' });
+          document.getElementById('add-result').innerHTML = inviteHtml({ name: btn.dataset.user, login_username: btn.dataset.user }, data.invite);
+          wireCopy();
+          await refresh();
+          window.scrollTo({ top: 0, behavior: 'smooth' });
+        } catch (e) { alert(e.message); }
+      });
+      document.querySelectorAll('[data-lreset]').forEach(btn => btn.onclick = async () => {
+        const pw = window.prompt(`New password for ${btn.dataset.user} (min 8 chars):`, '');
+        if (pw === null || !pw) return;
+        try {
+          await api(`/api/logins/${btn.dataset.lreset}/reset`, { method: 'POST', body: JSON.stringify({ new_password: pw }) });
+          alert(`Password reset for ${btn.dataset.user}.`);
+          await refresh();
+        } catch (e) { alert(e.message); }
+      });
+      document.querySelectorAll('[data-lrevoke]').forEach(btn => btn.onclick = async () => {
+        if (!window.confirm(`Revoke ${btn.dataset.user}'s access to this store? Their other stores stay.`)) return;
+        try {
+          await api(`/api/logins/${btn.dataset.lrevoke}/revoke`, { method: 'POST', body: JSON.stringify({ shop_id: parseInt(btn.dataset.shop, 10) }) });
+          await refresh();
+        } catch (e) { alert(e.message); }
+      });
+      document.querySelectorAll('[data-lremove]').forEach(btn => btn.onclick = async () => {
+        if (!window.confirm(`Remove the manager login ${btn.dataset.user}? They stop signing in immediately.`)) return;
+        try {
+          await api(`/api/logins/${btn.dataset.lremove}`, { method: 'DELETE' });
+          await refresh();
         } catch (e) { alert(e.message); }
       });
       document.querySelectorAll('[data-pricing]').forEach(btn => btn.onclick = () => openPricing(btn.dataset.pricing));

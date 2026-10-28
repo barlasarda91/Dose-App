@@ -54,8 +54,8 @@ function UsersSection() {
       <div className="section-title">Users</div>
       <div className="settings-card">
         <div className="settings-field-hint" style={{ marginBottom: 14 }}>
-          There is no self-registration — accounts exist only when you create them here. Admins can manage users
-          and credentials; regular users can run reports, log stock, and place orders.
+          There is no self-registration — accounts exist only when you create them here. Owners manage accounts
+          and credentials; Managers run reports, log stock, and place orders.
         </div>
 
         {users.length > 0 && (
@@ -66,7 +66,7 @@ function UsersSection() {
                 {users.map(u => (
                   <tr key={u.id}>
                     <td style={{ fontWeight: 500 }}>{u.username}</td>
-                    <td style={{ color: u.role === 'admin' ? 'var(--olive)' : 'var(--drift)' }}>{u.role}</td>
+                    <td style={{ color: u.role === 'admin' ? 'var(--olive)' : 'var(--drift)' }}>{u.role === 'admin' ? 'Owner' : 'Manager'}</td>
                     <td style={{ color: 'var(--drift)', fontSize: 12 }}>{(u.created_at || '').slice(0, 10)}</td>
                     <td><div style={{ display: 'flex', gap: 6 }}>
                       <button className="btn btn-secondary btn-sm" onClick={() => resetPassword(u)}>Reset Password</button>
@@ -94,8 +94,8 @@ function UsersSection() {
           <div className="form-group">
             <label className="form-lbl">Role</label>
             <select className="form-select" value={form.role} onChange={e => setForm(p => ({ ...p, role: e.target.value }))}>
-              <option value="user">User</option>
-              <option value="admin">Admin</option>
+              <option value="user">Manager</option>
+              <option value="admin">Owner</option>
             </select>
           </div>
           <button className="btn btn-primary" onClick={addUser} disabled={!form.username || !form.password}>
@@ -304,7 +304,7 @@ export default function Settings({ me, onReplayTour }) {
               Changing your password signs you out on every other device.
               {status.authMode === 'hub'
                 ? ' Your login is managed by the roastery hub — changing it here updates it at the hub for everyone using this shop account.'
-                : (!isAdmin ? ' Forgot it? Ask your admin to reset it.' : '')}
+                : (!isAdmin ? ' Forgot it? Ask your shop Owner to reset it.' : '')}
             </div>
             <div style={{ display: 'flex', flexDirection: 'column', gap: 10, maxWidth: 320 }}>
               <input type="password" placeholder="Current password" value={pwForm.current}
