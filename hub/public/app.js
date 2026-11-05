@@ -1156,7 +1156,8 @@
               + sames.map(c => `<tr style="opacity:.55">
                 <td></td><td>${esc(c.coffee_name)}</td>
                 <td class="num">${money2(c.ws)} =</td><td class="num">${money2(c.retail)} =</td>
-              </tr>`).join('')) : ''}
+              </tr>`).join('')) + `<div style="font-size:11px;color:var(--drift);margin-top:6px">
+                Wholesale platform: 12oz bags are billed at the per-lb price. Yield's consumer retail price is ignored.</div>` : ''}
             ${news.length ? sect('New in Yield — not in the catalog') + tbl(
               news.map((c, i) => `<tr>
                 <td><input type="checkbox" data-n="${i}"></td>
@@ -1179,9 +1180,9 @@
           </div></div>`;
         const picked = () => ({
           updates: ups.filter((c, i) => wrap.querySelector(`[data-u="${i}"]`).checked)
-            .map(c => ({ coffee_id: c.coffee_id, price_per_lb: c.ws, retail_price: c.retail })),
+            .map(c => ({ coffee_id: c.coffee_id, price_per_lb: c.ws })),
           creates: news.filter((c, i) => wrap.querySelector(`[data-n="${i}"]`).checked)
-            .map((c) => ({ name: (wrap.querySelector(`[data-nname="${news.indexOf(c)}"]`).value || c.name).trim(), price_per_lb: c.ws, retail_price: c.retail })),
+            .map((c) => ({ name: (wrap.querySelector(`[data-nname="${news.indexOf(c)}"]`).value || c.name).trim(), price_per_lb: c.ws })),
         });
         const recount = () => {
           const p = picked();

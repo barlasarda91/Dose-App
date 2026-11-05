@@ -1324,14 +1324,17 @@ app.get('/api/yield/preview', requireOwner, async (req, res) => {
   for (const c of rows) {
     const name = String(c.name || `${c.origin || ''} ${c.farm || ''}`).trim().slice(0, 120);
     const ws = c.final_ws_price == null ? null : cents(c.final_ws_price);
-    const retail = c.final_retail_price == null ? null : cents(c.final_retail_price);
+    // Yield's final_retail_price is the CONSUMER retail — it never applies
+    // here. Dose is the wholesale side: a 12oz bag is billed to shops at the
+    // same figure as the wholesale per-lb price.
+    const retail = ws;
     if (!(ws > 0)) { out.push({ name, kind: 'skip', reason: 'No final wholesale price set in Yield' }); continue; }
     const matchId = suggestMatch(name, items.filter(i => !claimed.has(i.id)));
     const item = matchId ? items.find(i => i.id === matchId) : null;
     if (!item) { out.push({ name, kind: 'new', ws, retail }); continue; }
     claimed.add(item.id);
     const samePrice = cents(item.price_per_lb) === ws
-      && (retail === null || (item.retail_price != null && cents(item.retail_price) === retail));
+      && item.retail_price != null && cents(item.retail_price) === ws;
     out.push({
       name, kind: samePrice && item.active ? 'same' : 'update', ws, retail,
       coffee_id: item.id, coffee_name: item.name,
@@ -1355,10 +1358,10 @@ app.post('/api/yield/apply', requireOwner, (req, res) => {
     if (!item) { results.push({ ok: false, error: 'No such coffee' }); continue; }
     const ws = cents(u.price_per_lb);
     if (!(ws > 0)) { results.push({ ok: false, error: `A price above zero is required for "${item.name}"` }); continue; }
-    const retail = parseFloat(u.retail_price) > 0 ? cents(u.retail_price) : item.retail_price;
+    // Wholesale platform: the 12oz bag price always mirrors the per-lb price.
     // A priced coffee goes live: restoring here is what lets a doc-sync
     // creation (hidden, unpriced) reach shop price lists once Yield prices it.
-    db.prepare('UPDATE catalog SET price_per_lb=?, retail_price=?, active=1 WHERE id=?').run(ws, retail, item.id);
+    db.prepare('UPDATE catalog SET price_per_lb=?, retail_price=?, active=1 WHERE id=?').run(ws, ws, item.id);
     audit(req, `synced "${item.name}" from Yield (${item.price_per_lb} → ${ws}/lb${item.active ? '' : ', restored'})`);
     results.push({ ok: true, coffee_id: item.id, name: item.name, restored: !item.active });
   }
@@ -1370,8 +1373,7 @@ app.post('/api/yield/apply', requireOwner, (req, res) => {
     if (db.prepare('SELECT 1 FROM catalog WHERE name=?').get(name)) {
       results.push({ ok: false, error: `"${name}" already exists — match it instead` }); continue;
     }
-    const retail = parseFloat(c.retail_price) > 0 ? cents(c.retail_price) : null;
-    const r = db.prepare('INSERT INTO catalog (name, price_per_lb, retail_price, active) VALUES (?,?,?,1)').run(name, ws, retail);
+    const r = db.prepare('INSERT INTO catalog (name, price_per_lb, retail_price, active) VALUES (?,?,?,1)').run(name, ws, ws);
     audit(req, `created coffee "${name}" from Yield at ${ws}/lb`);
     results.push({ ok: true, coffee_id: r.lastInsertRowid, name, created: true });
   }
