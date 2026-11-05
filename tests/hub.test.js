@@ -287,7 +287,7 @@ const j = client(API, 'x-hub-key');
 
     section('cup profiles: vocabulary walls and the palate math');
     r = await j('GET', '/api/profile-vocab', null, STAFF);
-    ok(r.body.vocab.length === 18 && r.body.vocab.includes('Tea-like') && r.body.vocab.includes('Stone Fruit'),
+    ok(r.body.vocab.length === 20 && r.body.vocab.includes('Tea-like') && r.body.vocab.includes('Umami') && r.body.vocab.includes('Spice-forward'),
       `house vocabulary carries the 2025 additions (${r.body.vocab.length} chips)`);
     r = await j('PUT', `/api/catalog/${coffeeId}/sheet`, { profile_tags: ['stone fruit', 'TEA-LIKE'] }, OWNER);
     ok(r.status === 200 && JSON.stringify(r.body.profile_tags) === '["Stone Fruit","Tea-like"]',
