@@ -962,7 +962,21 @@
       document.body.appendChild(wrap);
       let coffees = null; // parsed preview, or null = input step
 
-      async function drawInput() {
+      // One click: a saved doc link syncs straight to the preview.
+      async function start() {
+        let savedUrl = '';
+        try { savedUrl = (await api('/api/import-doc')).doc_url || ''; } catch { /* fresh */ }
+        if (!savedUrl) return drawInput();
+        wrap.innerHTML = `<div class="modal" style="width:420px"><div class="modal-body" style="font-size:12px;color:var(--drift)">Reading the product doc…</div></div>`;
+        try {
+          coffees = (await api('/api/import-doc', { method: 'POST', body: JSON.stringify({}) })).coffees;
+          drawPreview();
+        } catch (e) {
+          drawInput(e.message);
+        }
+      }
+
+      async function drawInput(err) {
         let savedUrl = '';
         try { savedUrl = (await api('/api/import-doc')).doc_url || ''; } catch { /* fresh */ }
         wrap.innerHTML = `<div class="modal" style="width:680px">
@@ -972,7 +986,8 @@
             <input id="imp-url" value="${esc(savedUrl)}" placeholder="https://docs.google.com/document/d/…" style="width:100%;box-sizing:border-box">
             <div style="font-size:11px;color:var(--drift);line-height:1.7;margin-top:8px">
               The doc must be shared <strong>"Anyone with the link — Viewer"</strong> for the hub to read it
-              (nothing is ever written back). Or paste the doc text below instead.
+              (nothing is ever written back). To sync ONE tab (e.g. Active Coffees), open that tab in the doc
+              and copy the URL from the address bar — the tab id rides along. Or paste the doc text below instead.
             </div>
             <label class="lbl" style="margin-top:14px">…or paste the doc text</label>
             <textarea id="imp-text" rows="5" placeholder="Select all in the doc, copy, paste here" style="width:100%;box-sizing:border-box"></textarea>
@@ -982,6 +997,7 @@
               <button class="btn" id="imp-go">Fetch &amp; Preview</button>
             </div>
           </div></div>`;
+        if (err) wrap.querySelector('#imp-err').textContent = err;
         wrap.querySelector('#imp-cancel').onclick = () => wrap.remove();
         wrap.querySelector('#imp-go').onclick = async () => {
           const body = {};
@@ -1001,6 +1017,7 @@
 
       function drawPreview() {
         const active = items.filter(i => i.active);
+        const matchedActive = c => c.match_id && active.some(i => i.id === c.match_id);
         const factRow = (k, v) => `<div style="display:grid;grid-template-columns:76px 1fr;gap:8px;font-size:11px">
           <span style="color:var(--drift);text-transform:uppercase;letter-spacing:.1em;font-size:9px;padding-top:1px">${k}</span>
           <span>${v ? esc(v) : '<span style="color:var(--linen);font-style:italic">not in the doc</span>'}</span></div>`;
@@ -1012,7 +1029,7 @@
               return `<div style="border:1px solid var(--stone);margin-bottom:12px;${past ? 'opacity:.6' : ''}" data-row="${idx}">
                 <div style="display:flex;gap:10px;align-items:center;padding:10px 12px;border-bottom:1px solid var(--stone);flex-wrap:wrap">
                   <label style="display:flex;gap:8px;align-items:center;cursor:pointer;font-family:var(--serif);font-size:14px">
-                    <input type="checkbox" data-inc="${idx}" ${past ? '' : 'checked'}> ${esc(c.title)}
+                    <input type="checkbox" data-inc="${idx}" ${!past && matchedActive(c) ? 'checked' : ''}> ${esc(c.title)}
                   </label>
                   ${c.group ? `<span class="badge">${esc(c.group)}</span>` : ''}
                 </div>
@@ -1030,6 +1047,7 @@
                   <span class="lbl" style="margin:0">Apply to</span>
                   <select data-target="${idx}">
                     <option value="">— skip / pick a coffee</option>
+                    <option value="__new__" ${!c.match_id ? 'selected' : ''}>➕ Create as new coffee (hidden until priced)</option>
                     ${active.map(i => `<option value="${i.id}" ${i.id === c.match_id ? 'selected' : ''}>${esc(i.name)}</option>`).join('')}
                   </select>
                   <span data-warn="${idx}" style="color:var(--warn)"></span>
@@ -1039,14 +1057,16 @@
           </div>
           <div style="display:flex;gap:10px;justify-content:flex-end;padding:14px 18px;border-top:1px solid var(--stone)">
             <span class="err" id="imp-err" style="margin-right:auto"></span>
-            <button class="btn btn-ghost" id="imp-back">Back</button>
+            <button class="btn btn-ghost" id="imp-link">Change Doc Link</button>
+            <button class="btn btn-ghost" id="imp-cancel2">Cancel</button>
             <button class="btn" id="imp-apply"></button>
           </div></div>`;
         const warnFor = idx => {
           const sel = wrap.querySelector(`[data-target="${idx}"]`);
           const target = items.find(i => String(i.id) === sel.value);
           wrap.querySelector(`[data-warn="${idx}"]`).textContent =
-            target && hasSheet(target) ? '⚠ replaces this coffee’s facts and sections (brew notes & cup profile untouched)' : '';
+            sel.value === '__new__' ? 'created hidden — set its price, then Restore it to put it on sale'
+            : target && hasSheet(target) ? '⚠ replaces this coffee’s facts and sections (brew notes & cup profile untouched)' : '';
         };
         const countApply = () => {
           const n = coffees.filter((c, idx) =>
@@ -1061,19 +1081,24 @@
           wrap.querySelector(`[data-inc="${idx}"]`).onchange = countApply;
         });
         countApply();
-        wrap.querySelector('#imp-back').onclick = drawInput;
+        wrap.querySelector('#imp-link').onclick = () => drawInput();
+        wrap.querySelector('#imp-cancel2').onclick = () => wrap.remove();
         wrap.querySelector('#imp-apply').onclick = async () => {
           const payload = coffees
             .map((c, idx) => ({ c, inc: wrap.querySelector(`[data-inc="${idx}"]`).checked, id: wrap.querySelector(`[data-target="${idx}"]`).value }))
             .filter(x => x.inc && x.id)
-            .map(x => ({ coffee_id: parseInt(x.id, 10), facts: x.c.facts, sections: x.c.sections }));
+            .map(x => x.id === '__new__'
+              ? { create_name: x.c.title, facts: x.c.facts, sections: x.c.sections }
+              : { coffee_id: parseInt(x.id, 10), facts: x.c.facts, sections: x.c.sections });
           if (!payload.length) return;
           wrap.querySelector('#imp-apply').disabled = true;
           try {
             const r = await api('/api/import-doc/apply', { method: 'POST', body: JSON.stringify({ items: payload }) });
             items = await api('/api/catalog');
             wrap.remove(); drawList();
-            alert(`Imported ${r.applied} info sheet${r.applied === 1 ? '' : 's'} from the product doc.`);
+            const made = r.results.filter(x => x.created).length;
+            alert(`Synced ${r.applied} coffee${r.applied === 1 ? '' : 's'} from the product doc.` +
+              (made ? ` ${made} created hidden (under Archived) — set a price, then Restore to put them on sale.` : ''));
           } catch (e) {
             wrap.querySelector('#imp-apply').disabled = false;
             wrap.querySelector('#imp-err').textContent = e.message;
@@ -1081,7 +1106,7 @@
         };
       }
 
-      drawInput();
+      start();
     }
 
     // Info-sheet editor: label facts, brew notes (filter/espresso), then the

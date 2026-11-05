@@ -1182,11 +1182,15 @@ app.get('/api/catalog', (req, res) => {
   res.json(db.prepare('SELECT * FROM catalog ORDER BY active DESC, name').all().map(i => catalogItemFull(i.id)));
 });
 
-// ─── Product-doc import ──────────────────────────────────────────────────────
-// Pull the roastery's product-pages Google Doc, parse each coffee's page into
-// info-sheet fields, and show a preview — nothing is written until the owner
-// applies, per coffee, against an explicit catalog match. Import fills
-// SHEETS only: pricing, brew notes, and cup profiles are never touched.
+// ─── Product-doc sync ────────────────────────────────────────────────────────
+// One click pulls the roastery's product-pages Google Doc (the saved link —
+// if it carries a ?tab= id, only that tab, e.g. the Active Coffees tab),
+// parses each coffee's page, and shows a preview. Nothing is written until
+// the owner applies: matched coffees get their sheets refreshed, unmatched
+// ones can be created hidden (active=0, no price) so they never reach a
+// shop's price list until priced and restored. Brew notes, cup profiles,
+// and existing pricing are never touched.
+const DOC_EXPORT_BASE = (process.env.DOC_EXPORT_BASE || 'https://docs.google.com').replace(/\/+$/, '');
 const metaGet = k => (db.prepare('SELECT value FROM hub_meta WHERE key=?').get(k) || {}).value || '';
 const metaSet = (k, v) => db.prepare('INSERT OR REPLACE INTO hub_meta (key, value) VALUES (?,?)').run(k, String(v));
 
@@ -1196,15 +1200,19 @@ app.post('/api/import-doc', requireOwner, async (req, res) => {
   try {
     const b = req.body || {};
     let text = typeof b.text === 'string' ? b.text : '';
-    const docUrl = String(b.doc_url || '').trim();
+    // No link and no pasted text = the one-click sync: use the saved link.
+    const docUrl = String(b.doc_url || '').trim() || (text ? '' : metaGet('product_doc_url'));
     if (!text && docUrl) {
       const m = docUrl.match(/\/document\/d\/([a-zA-Z0-9_-]{20,})/);
       if (!m) return res.status(400).json({ error: 'That does not look like a Google Doc link (expected …/document/d/…)' });
+      // A ?tab= id in the saved link scopes the pull to that tab — copy the
+      // URL from the browser while the Active Coffees tab is open.
+      const tabM = docUrl.match(/[?&#]tab=(t\.[A-Za-z0-9_-]+)/);
       // The markdown export keeps headings; needs "anyone with the link" sharing.
       const controller = new AbortController();
       const t = setTimeout(() => controller.abort(), 12000);
       try {
-        const r = await fetch(`https://docs.google.com/document/d/${m[1]}/export?format=markdown`, {
+        const r = await fetch(`${DOC_EXPORT_BASE}/document/d/${m[1]}/export?format=markdown${tabM ? `&tab=${tabM[1]}` : ''}`, {
           signal: controller.signal, redirect: 'follow',
         });
         if (!r.ok) {
@@ -1218,7 +1226,7 @@ app.post('/api/import-doc', requireOwner, async (req, res) => {
       }
       metaSet('product_doc_url', docUrl);
     }
-    if (!text.trim()) return res.status(400).json({ error: 'Give the doc link or paste its text' });
+    if (!text.trim()) return res.status(400).json({ error: 'No saved doc link yet — give the link or paste the doc text' });
     const coffees = parseProductDoc(text).slice(0, 100);
     if (!coffees.length) return res.status(400).json({ error: 'No coffee pages found — the parser keys on your section headings (Intro, Relationship, Country, Region, Farm, Variety, Process)' });
     const items = db.prepare('SELECT id, name FROM catalog WHERE active=1').all();
@@ -1235,7 +1243,21 @@ app.post('/api/import-doc/apply', requireOwner, (req, res) => {
   if (!given.length) return res.status(400).json({ error: 'Nothing selected to apply' });
   const results = [];
   for (const it of given) {
-    const item = db.prepare('SELECT * FROM catalog WHERE id=?').get(parseInt((it || {}).coffee_id, 10) || -1);
+    let item = null;
+    if (it && it.create_name !== undefined) {
+      // New coffee from the doc: created HIDDEN (active=0, no price) so it
+      // cannot appear on any shop's price list until priced and restored.
+      const name = String(it.create_name || '').trim().slice(0, 120);
+      if (name.length < 2) { results.push({ ok: false, error: 'Coffee name required to create' }); continue; }
+      if (db.prepare('SELECT 1 FROM catalog WHERE name=?').get(name)) {
+        results.push({ ok: false, error: `"${name}" already exists — match it instead` }); continue;
+      }
+      const r = db.prepare("INSERT INTO catalog (name, price_per_lb, active) VALUES (?, 0, 0)").run(name);
+      item = db.prepare('SELECT * FROM catalog WHERE id=?').get(r.lastInsertRowid);
+      audit(req, `created coffee "${name}" from the product doc (hidden until priced)`);
+    } else {
+      item = db.prepare('SELECT * FROM catalog WHERE id=?').get(parseInt((it || {}).coffee_id, 10) || -1);
+    }
     if (!item) { results.push({ coffee_id: it && it.coffee_id, ok: false, error: 'No such coffee' }); continue; }
     const f = it.facts || {};
     const fact = v => v ? String(v).slice(0, 160).trim() || null : null;
@@ -1247,7 +1269,7 @@ app.post('/api/import-doc/apply', requireOwner, (req, res) => {
       .run(fact(f.country), fact(f.region), fact(f.producer), fact(f.variety), fact(f.process), fact(f.altitude),
         sections.length ? JSON.stringify(sections) : null, item.id);
     audit(req, `imported the info sheet for "${item.name}" from the product doc`);
-    results.push({ coffee_id: item.id, name: item.name, ok: true });
+    results.push({ coffee_id: item.id, name: item.name, ok: true, created: !!(it && it.create_name !== undefined) });
   }
   res.json({ applied: results.filter(r => r.ok).length, results });
 });

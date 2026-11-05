@@ -2,6 +2,7 @@
 // edit guards, roast-fill idempotency and On Hand math, delete semantics,
 // role walls. Boots the real hub against a throwaway database.
 const path = require('path');
+const http = require('http');
 const { ok, near, section, finish, freshDir, client, startServer, waitUp } = require('./helpers');
 
 const PORT = 4520;
@@ -10,9 +11,26 @@ const j = client(API, 'x-hub-key');
 
 (async () => {
   const dir = freshDir('hub');
+  // Mock Google Docs export: tab-scoped markdown with the REAL export's
+  // backslash-escaped punctuation ("Region \- Nyamasheke").
+  const DOC_ACTIVE = [
+    '## Rwanda \\- Apricot Notes, Pear Sweetness', '',
+    '# Rwanda – Inzovu Washed', '',
+    '#### Intro', 'A standout washed lot.', '',
+    '#### Region \\- Nyamasheke', 'Grown from 1,700 to 2,000 meters above sea level.', '',
+    '#### Washing Station \\- Inzovu', 'Perched above the lake.', '',
+    '#### Process \\- Fully Washed', 'Classic double wash\\.',
+  ].join('\n');
+  const DOC_FULL = DOC_ACTIVE + ['', '# Peru – Old Lot', '', '#### Intro', 'Two seasons ago.'].join('\n');
+  const docSrv = http.createServer((req, res) => {
+    res.setHeader('Content-Type', 'text/markdown');
+    res.end(/tab=t\.act/.test(req.url) ? DOC_ACTIVE : DOC_FULL);
+  });
+  await new Promise(r => docSrv.listen(4525, r));
+
   const server = startServer('hub', 'server.js', {
     HUB_DB_PATH: path.join(dir, 'hub.db'), PORT: String(PORT), HUB_PASSWORD: 'ptest-boot',
-    PORTAL_KEY: 'portal-master-key',
+    PORTAL_KEY: 'portal-master-key', DOC_EXPORT_BASE: 'http://127.0.0.1:4525',
   });
   // Orders arrive through the portal: one master key, shop named per request.
   const PKEY = 'portal-master-key';
@@ -336,6 +354,30 @@ const j = client(API, 'x-hub-key');
     r = await j('GET', '/api/activity', null, OWNER);
     ok(r.body.some(a => /imported the info sheet for "El Encanto Papayo" from the product doc/.test(a.action)), 'import audited per coffee');
 
+    section('doc sync: one button, the saved tab, create-hidden');
+    r = await j('POST', '/api/import-doc', { doc_url: 'http://127.0.0.1:4525/document/d/abcdefghijklmnopqrstuv1234/edit?tab=t.act' }, OWNER);
+    ok(r.status === 200 && r.body.coffees.length === 1 && r.body.coffees[0].title === 'Rwanda – Inzovu Washed',
+      'tab-scoped fetch pulls only that tab; summary junk dropped');
+    const inz = r.body.coffees[0];
+    ok(inz.facts.region === 'Nyamasheke' && inz.facts.producer === 'Inzovu' && inz.facts.altitude === '1,700–2,000 masl',
+      `escaped headings still yield facts; Washing Station counts as producer (${JSON.stringify(inz.facts).slice(0, 80)})`);
+    ok(!inz.sections.some(x => x.body.includes('\\')), 'export escapes cleaned out of story text');
+    r = await j('POST', '/api/import-doc', {}, OWNER);
+    ok(r.status === 200 && r.body.coffees.length === 1, 'empty call syncs from the SAVED link — the one-click path');
+
+    r = await j('POST', '/api/import-doc/apply', { items: [{ create_name: 'Rwanda Inzovu Washed', facts: inz.facts, sections: inz.sections }] }, OWNER);
+    ok(r.status === 200 && r.body.applied === 1 && r.body.results[0].created === true, 'unmatched doc coffee created on apply');
+    r = await j('GET', '/api/catalog', null, OWNER);
+    const inzCat = r.body.find(i => i.name === 'Rwanda Inzovu Washed');
+    ok(inzCat && inzCat.active === 0 && inzCat.price_per_lb === 0 && inzCat.info_region === 'Nyamasheke',
+      'created HIDDEN with no price, sheet filled');
+    r = await portalCatalog(1);
+    ok(!r.items.some(i => i.name === 'Rwanda Inzovu Washed'), 'hidden coffee never reaches a shop price list');
+    r = await j('POST', '/api/import-doc/apply', { items: [{ create_name: 'Rwanda Inzovu Washed', facts: {}, sections: [] }] }, OWNER);
+    ok(r.body.applied === 0 && /already exists/.test(r.body.results[0].error), 'duplicate name refused, not duplicated');
+    r = await j('GET', '/api/activity', null, OWNER);
+    ok(r.body.some(a => /created coffee "Rwanda Inzovu Washed" from the product doc \(hidden until priced\)/.test(a.action)), 'creation audited');
+
     section('chain accounts: owners span stores, managers do not');
     r = await j('POST', '/api/shops', { name: 'Pressure Shop Venice', email: 'venice@example.com' }, OWNER);
     const shop2 = r.body.shop.id;
@@ -387,6 +429,7 @@ const j = client(API, 'x-hub-key');
     console.log(server.log.slice(-1500));
   } finally {
     server.kill();
+    docSrv.close();
   }
   finish();
 })();

@@ -5,14 +5,18 @@
 // any other heading is a coffee title. Facts ride heading suffixes
 // ("Region – Huila / Pitalito"); altitude is fished out of the Region prose.
 
-const SECTION_RE = /^(intro|relationship|country|region|farm|processing station|station|variety|process|brew)/i;
+const SECTION_RE = /^(intro|relationship|country|region|farm|processing station|washing station|station|variety|process|brew)/i;
 const GROUP_RE = /^(draft|active|past)\b.*coffees?\s*$/i;
+
+// Google's markdown export backslash-escapes punctuation ("Region \- Nyeri",
+// "2024\."); unescape before any parsing or the suffixes vanish.
+const unescapeMd = s => s.replace(/\\([\\`*_{}[\]()#+\-.!>~|&<>"'])/g, '$1');
 
 // "#### **Region – Huila / Pitalito**" → "Region – Huila / Pitalito"
 function headingText(line) {
   const m = line.match(/^#{1,6}\s+(.*)$/);
   if (!m) return null;
-  return m[1].replace(/\[([^\]]*)\]\([^)]*\)/g, '$1').replace(/\*\*/g, '').trim();
+  return unescapeMd(m[1]).replace(/\[([^\]]*)\]\([^)]*\)/g, '$1').replace(/\*\*/g, '').trim();
 }
 
 // "Region – Huila / Pitalito" → { name: "Region", suffix: "Huila / Pitalito" }
@@ -25,7 +29,7 @@ function splitHeading(text) {
 // Canonical section name, or null if this heading is not a section.
 function sectionName(name) {
   const n = name.toLowerCase();
-  if (n.startsWith('processing station') || n === 'station') return 'Processing Station';
+  if (n.startsWith('processing station') || n.startsWith('washing station') || n === 'station') return 'Processing Station';
   if (n.startsWith('intro')) return 'Intro';
   if (n.startsWith('relationship')) return 'Relationship';
   if (n.startsWith('country')) return 'Country';
@@ -46,7 +50,7 @@ function findAltitude(text) {
   return null;
 }
 
-const cleanBody = s => s.replace(/\*\*/g, '').replace(/^\s*\\?[-*]\s*$/gm, '').trim();
+const cleanBody = s => unescapeMd(s).replace(/\*\*/g, '').replace(/^\s*[-*]\s*$/gm, '').trim();
 
 function parseProductDoc(text) {
   const lines = String(text || '').split(/\r?\n/);
@@ -64,7 +68,7 @@ function parseProductDoc(text) {
   };
   const closeCoffee = () => {
     closeSection();
-    if (coffee && (coffee.sections.length || Object.values(coffee.facts).some(Boolean))) coffees.push(coffee);
+    if (coffee && coffee.sections.length) coffees.push(coffee);
     coffee = null;
   };
 
@@ -81,7 +85,7 @@ function parseProductDoc(text) {
     if (!sec) {
       // A heading that isn't a section or a group starts a new coffee.
       closeCoffee();
-      coffee = { title: h, group, facts: { country: '', region: '', producer: '', variety: '', process: '', altitude: '' }, sections: [] };
+      coffee = { title: h.replace(/[:\s]+$/, ''), group, facts: { country: '', region: '', producer: '', variety: '', process: '', altitude: '' }, sections: [] };
       continue;
     }
     if (!coffee) continue; // section before any coffee title — stray, skip
