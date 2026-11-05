@@ -1124,7 +1124,7 @@ const SHEET_FACTS = ['info_country', 'info_region', 'info_producer', 'info_varie
 // boxxcoffee.la): character, texture, and fruit-family chips — never specific
 // tasting notes, which live in each coffee's notes field.
 const PROFILE_VOCAB = ['Juicy', 'Winey', 'Buttery', 'Bright', 'Chocolatey', 'Clean', 'Nutty', 'Floral', 'Jammy', 'Funky',
-  'Tea-like', 'Honeyed', 'Citrus', 'Stone Fruit', 'Tropical', 'Syrupy', 'Creamy', 'Balanced'];
+  'Tea-like', 'Honeyed', 'Citrus', 'Stone Fruit', 'Tropical', 'Syrupy', 'Creamy', 'Balanced', 'Umami', 'Spice-forward'];
 const PROFILE_MAX = 3;
 
 app.get('/api/profile-vocab', (req, res) => res.json({ vocab: PROFILE_VOCAB, max: PROFILE_MAX }));
