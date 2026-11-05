@@ -1120,7 +1120,11 @@ const SHEET_FACTS = ['info_country', 'info_region', 'info_producer', 'info_varie
 // The cup-profile house vocabulary. Fixed on purpose: free-text tags would
 // splinter into "fruity"/"fruit-forward"/"fruity!" and kill the cross-shop
 // analysis. Three per coffee at most — a coffee that is everything is nothing.
-const PROFILE_VOCAB = ['Juicy', 'Winey', 'Buttery', 'Bright', 'Chocolatey', 'Clean', 'Nutty', 'Floral', 'Jammy', 'Funky'];
+// The house cup vocabulary, mined from the roastery's own product copy (doc +
+// boxxcoffee.la): character, texture, and fruit-family chips — never specific
+// tasting notes, which live in each coffee's notes field.
+const PROFILE_VOCAB = ['Juicy', 'Winey', 'Buttery', 'Bright', 'Chocolatey', 'Clean', 'Nutty', 'Floral', 'Jammy', 'Funky',
+  'Tea-like', 'Honeyed', 'Citrus', 'Stone Fruit', 'Tropical', 'Syrupy', 'Creamy', 'Balanced'];
 const PROFILE_MAX = 3;
 
 app.get('/api/profile-vocab', (req, res) => res.json({ vocab: PROFILE_VOCAB, max: PROFILE_MAX }));

@@ -286,6 +286,12 @@ const j = client(API, 'x-hub-key');
     ok(r.status === 200, 'roaster reset clears the portal lockout too');
 
     section('cup profiles: vocabulary walls and the palate math');
+    r = await j('GET', '/api/profile-vocab', null, STAFF);
+    ok(r.body.vocab.length === 18 && r.body.vocab.includes('Tea-like') && r.body.vocab.includes('Stone Fruit'),
+      `house vocabulary carries the 2025 additions (${r.body.vocab.length} chips)`);
+    r = await j('PUT', `/api/catalog/${coffeeId}/sheet`, { profile_tags: ['stone fruit', 'TEA-LIKE'] }, OWNER);
+    ok(r.status === 200 && JSON.stringify(r.body.profile_tags) === '["Stone Fruit","Tea-like"]',
+      'two-word and hyphenated chips canonicalize like the rest');
     r = await j('PUT', `/api/catalog/${coffeeId}/sheet`, { profile_tags: ['Juicy'] }, STAFF);
     ok(r.status === 403, 'staff cannot set profile tags');
     r = await j('PUT', `/api/catalog/${coffeeId}/sheet`, { profile_tags: ['juicy', 'Winey', 'JUICY'] }, OWNER);
