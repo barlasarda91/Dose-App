@@ -1274,6 +1274,110 @@ app.post('/api/import-doc/apply', requireOwner, (req, res) => {
   res.json({ applied: results.filter(r => r.ok).length, results });
 });
 
+// ---------------------------------------------------------------------------
+// Yield price sync. Yield (the roastery's pricing app) is the source of truth
+// for the coffee list and base prices: one click reads its keyed registry
+// export, matches each Active Yield coffee to a catalog coffee by name, and
+// shows a preview. Nothing is written until the owner applies: matched coffees
+// get their base/retail prices updated (a hidden coffee is restored when it
+// gets a price), unmatched ones can be created live since they arrive priced.
+// Coffees without a final price in Yield are skipped; catalog coffees missing
+// from Yield are reported but never touched. Per-shop price rules, info
+// sheets, cup profiles and brew notes are never touched.
+const YIELD_URL = (process.env.YIELD_URL || '').replace(/\/+$/, '');
+const YIELD_KEY = process.env.YIELD_KEY || '';
+const cents = n => Math.round(parseFloat(n) * 100) / 100;
+
+async function fetchYieldRegistry() {
+  const controller = new AbortController();
+  const t = setTimeout(() => controller.abort(), 12000);
+  try {
+    const r = await fetch(`${YIELD_URL}/api/registry/export`, {
+      headers: { 'x-registry-key': YIELD_KEY }, signal: controller.signal, redirect: 'follow',
+    });
+    let body = null;
+    try { body = await r.json(); } catch { /* non-JSON answer */ }
+    if (!r.ok) {
+      const why = body && body.error ? body.error : `HTTP ${r.status}`;
+      throw new Error(`Yield answered: ${why}`);
+    }
+    if (!body || !Array.isArray(body.coffees)) throw new Error('Yield answered with an unexpected shape');
+    return body.coffees.slice(0, 200);
+  } finally {
+    clearTimeout(t);
+  }
+}
+
+app.get('/api/yield/preview', requireOwner, async (req, res) => {
+  if (!YIELD_URL || !YIELD_KEY) {
+    return res.status(400).json({ error: 'Yield is not connected — set YIELD_URL and YIELD_KEY on the hub service' });
+  }
+  let rows;
+  try { rows = await fetchYieldRegistry(); }
+  catch (err) {
+    const code = /Yield answered/.test(err.message) ? 400 : 502;
+    return res.status(code).json({ error: code === 502 ? `Could not reach Yield: ${err.message}` : err.message });
+  }
+  const items = db.prepare('SELECT id, name, price_per_lb, retail_price, active FROM catalog').all();
+  const claimed = new Set();
+  const out = [];
+  for (const c of rows) {
+    const name = String(c.name || `${c.origin || ''} ${c.farm || ''}`).trim().slice(0, 120);
+    const ws = c.final_ws_price == null ? null : cents(c.final_ws_price);
+    const retail = c.final_retail_price == null ? null : cents(c.final_retail_price);
+    if (!(ws > 0)) { out.push({ name, kind: 'skip', reason: 'No final wholesale price set in Yield' }); continue; }
+    const matchId = suggestMatch(name, items.filter(i => !claimed.has(i.id)));
+    const item = matchId ? items.find(i => i.id === matchId) : null;
+    if (!item) { out.push({ name, kind: 'new', ws, retail }); continue; }
+    claimed.add(item.id);
+    const samePrice = cents(item.price_per_lb) === ws
+      && (retail === null || (item.retail_price != null && cents(item.retail_price) === retail));
+    out.push({
+      name, kind: samePrice && item.active ? 'same' : 'update', ws, retail,
+      coffee_id: item.id, coffee_name: item.name,
+      old_ws: cents(item.price_per_lb), old_retail: item.retail_price == null ? null : cents(item.retail_price),
+      hidden: !item.active,
+    });
+  }
+  const notInYield = items.filter(i => i.active && !claimed.has(i.id)).map(i => ({ id: i.id, name: i.name }));
+  audit(req, `previewed a Yield price sync (${rows.length} Active coffee${rows.length === 1 ? '' : 's'} in the registry)`);
+  res.json({ coffees: out, not_in_yield: notInYield });
+});
+
+app.post('/api/yield/apply', requireOwner, (req, res) => {
+  const b = req.body || {};
+  const updates = (Array.isArray(b.updates) ? b.updates : []).slice(0, 200);
+  const creates = (Array.isArray(b.creates) ? b.creates : []).slice(0, 200);
+  if (!updates.length && !creates.length) return res.status(400).json({ error: 'Nothing selected to apply' });
+  const results = [];
+  for (const u of updates) {
+    const item = db.prepare('SELECT * FROM catalog WHERE id=?').get(parseInt(u.coffee_id, 10) || -1);
+    if (!item) { results.push({ ok: false, error: 'No such coffee' }); continue; }
+    const ws = cents(u.price_per_lb);
+    if (!(ws > 0)) { results.push({ ok: false, error: `A price above zero is required for "${item.name}"` }); continue; }
+    const retail = parseFloat(u.retail_price) > 0 ? cents(u.retail_price) : item.retail_price;
+    // A priced coffee goes live: restoring here is what lets a doc-sync
+    // creation (hidden, unpriced) reach shop price lists once Yield prices it.
+    db.prepare('UPDATE catalog SET price_per_lb=?, retail_price=?, active=1 WHERE id=?').run(ws, retail, item.id);
+    audit(req, `synced "${item.name}" from Yield (${item.price_per_lb} → ${ws}/lb${item.active ? '' : ', restored'})`);
+    results.push({ ok: true, coffee_id: item.id, name: item.name, restored: !item.active });
+  }
+  for (const c of creates) {
+    const name = String(c.name || '').trim().slice(0, 120);
+    const ws = cents(c.price_per_lb);
+    if (name.length < 2) { results.push({ ok: false, error: 'Coffee name required to create' }); continue; }
+    if (!(ws > 0)) { results.push({ ok: false, error: `A price above zero is required for "${name}"` }); continue; }
+    if (db.prepare('SELECT 1 FROM catalog WHERE name=?').get(name)) {
+      results.push({ ok: false, error: `"${name}" already exists — match it instead` }); continue;
+    }
+    const retail = parseFloat(c.retail_price) > 0 ? cents(c.retail_price) : null;
+    const r = db.prepare('INSERT INTO catalog (name, price_per_lb, retail_price, active) VALUES (?,?,?,1)').run(name, ws, retail);
+    audit(req, `created coffee "${name}" from Yield at ${ws}/lb`);
+    results.push({ ok: true, coffee_id: r.lastInsertRowid, name, created: true });
+  }
+  res.json({ applied: results.filter(r => r.ok).length, results });
+});
+
 const BADGES = ['Blend', 'Single Origin', 'Single Farm', 'Single Lot', 'Decaf'];
 
 function saveCatalogBody(b) {

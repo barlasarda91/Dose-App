@@ -820,10 +820,12 @@
     page.appendChild(formEl);
     if (isOwner()) {
       const tb = document.createElement('div');
-      tb.style.cssText = 'display:flex;justify-content:flex-end;margin:0 0 10px';
-      tb.innerHTML = '<button class="btn btn-ghost" id="c-import">Import from Product Doc</button>';
+      tb.style.cssText = 'display:flex;justify-content:flex-end;gap:10px;margin:0 0 10px';
+      tb.innerHTML = '<button class="btn btn-ghost" id="c-import">Import from Product Doc</button>'
+        + '<button class="btn" id="c-yield">Sync from Yield</button>';
       page.insertBefore(tb, formEl);
       tb.querySelector('#c-import').onclick = () => importModal();
+      tb.querySelector('#c-yield').onclick = () => yieldModal();
     }
     const listEl = document.createElement('div');
     page.appendChild(listEl);
@@ -1110,6 +1112,119 @@
       }
 
       start();
+    }
+
+    // Yield price sync: one click reads Yield's Active registry (final prices
+    // only), previews what would change, then applies only what's ticked.
+    // Yield is the source of truth for the list and base prices — info
+    // sheets, brew notes, cup profiles and per-shop price rules are never
+    // touched. A hidden coffee that gets a price is restored to the list.
+    function yieldModal() {
+      const wrap = document.createElement('div');
+      wrap.className = 'modal-bg show';
+      document.body.appendChild(wrap);
+      wrap.innerHTML = `<div class="modal" style="width:420px"><div class="modal-body" style="font-size:12px;color:var(--drift)">Reading the Yield registry…</div></div>`;
+
+      const money2 = v => v == null ? '—' : money(v);
+      const diffCell = (oldV, newV) => {
+        if (newV == null) return `<span style="color:var(--drift)">${money2(oldV)} · not set in Yield</span>`;
+        if (oldV != null && Math.abs(oldV - newV) < 0.005) return `<span style="color:var(--drift)">${money2(newV)} =</span>`;
+        const dir = oldV == null || newV > oldV
+          ? `<span style="color:var(--warn)">${money2(newV)} ↑</span>`
+          : `<span style="color:var(--olive)">${money2(newV)} ↓</span>`;
+        return `<span style="color:var(--drift);text-decoration:line-through;margin-right:8px">${money2(oldV)}</span>${dir}`;
+      };
+
+      function drawPreview(data) {
+        const ups = data.coffees.filter(c => c.kind === 'update');
+        const sames = data.coffees.filter(c => c.kind === 'same');
+        const news = data.coffees.filter(c => c.kind === 'new');
+        const skips = data.coffees.filter(c => c.kind === 'skip');
+        const sect = t => `<div class="lbl" style="margin:16px 0 6px">${t}</div>`;
+        const tbl = body => `<div class="table-wrap"><table><tbody>${body}</tbody></table></div>`;
+        wrap.innerHTML = `<div class="modal" style="width:760px;max-height:86vh;display:flex;flex-direction:column">
+          <div class="modal-title">Sync from Yield — nothing is written until you apply</div>
+          <div class="modal-body" style="overflow-y:auto">
+            ${ups.length || sames.length ? sect('Price updates — matched coffees') + tbl(
+              ups.map((c, i) => `<tr>
+                <td><input type="checkbox" data-u="${i}" checked></td>
+                <td><span style="font-family:var(--serif);font-size:13px;color:var(--ink)">${esc(c.coffee_name)}</span>
+                  <div style="font-size:10px;color:var(--drift)">${esc(c.name)} in Yield${c.hidden ? ' · <span style="color:var(--warn)">hidden — will be restored to the price list</span>' : ''}</div></td>
+                <td class="num">${diffCell(c.old_ws, c.ws)}<div style="font-size:9px;color:var(--drift)">base / lb</div></td>
+                <td class="num">${diffCell(c.old_retail, c.retail)}<div style="font-size:9px;color:var(--drift)">12oz bag</div></td>
+              </tr>`).join('')
+              + sames.map(c => `<tr style="opacity:.55">
+                <td></td><td>${esc(c.coffee_name)}</td>
+                <td class="num">${money2(c.ws)} =</td><td class="num">${money2(c.retail)} =</td>
+              </tr>`).join('')) : ''}
+            ${news.length ? sect('New in Yield — not in the catalog') + tbl(
+              news.map((c, i) => `<tr>
+                <td><input type="checkbox" data-n="${i}"></td>
+                <td><input data-nname="${i}" value="${esc(c.name)}" title="Catalog name for the new coffee"
+                  style="min-width:200px;font-family:var(--mono);font-size:11px;border:1px solid var(--stone);background:var(--parch);padding:5px 8px"></td>
+                <td class="num">${money2(c.ws)}<div style="font-size:9px;color:var(--drift)">base / lb</div></td>
+                <td class="num">${money2(c.retail)}<div style="font-size:9px;color:var(--drift)">12oz bag</div></td>
+              </tr>`).join('')) + `<div style="font-size:11px;color:var(--drift);margin-top:6px">
+                Unticked by default. A created coffee arrives priced from Yield, so it goes on shop price lists right away.</div>` : ''}
+            ${skips.length ? sect('Skipped') + tbl(skips.map(c =>
+              `<tr><td>${esc(c.name)}</td><td style="font-size:11px;color:var(--red)">${esc(c.reason || '')}</td></tr>`).join('')) : ''}
+            ${data.not_in_yield.length ? sect('In the catalog but not Active in Yield — left untouched') + tbl(
+              data.not_in_yield.map(c => `<tr><td>${esc(c.name)}</td><td style="font-size:11px;color:var(--drift)">archive it from the list below if it is gone for good</td></tr>`).join('')) : ''}
+          </div>
+          <div style="display:flex;gap:10px;justify-content:flex-end;align-items:center;padding:14px 18px;border-top:1px solid var(--stone)">
+            <span class="err" id="y-err" style="margin-right:auto"></span>
+            <span id="y-count" style="font-size:10px;color:var(--drift);letter-spacing:.08em"></span>
+            <button class="btn btn-ghost" id="y-cancel">Cancel</button>
+            <button class="btn" id="y-apply"></button>
+          </div></div>`;
+        const picked = () => ({
+          updates: ups.filter((c, i) => wrap.querySelector(`[data-u="${i}"]`).checked)
+            .map(c => ({ coffee_id: c.coffee_id, price_per_lb: c.ws, retail_price: c.retail })),
+          creates: news.filter((c, i) => wrap.querySelector(`[data-n="${i}"]`).checked)
+            .map((c) => ({ name: (wrap.querySelector(`[data-nname="${news.indexOf(c)}"]`).value || c.name).trim(), price_per_lb: c.ws, retail_price: c.retail })),
+        });
+        const recount = () => {
+          const p = picked();
+          const n = p.updates.length + p.creates.length;
+          wrap.querySelector('#y-count').textContent = `${n} change${n === 1 ? '' : 's'} selected`;
+          wrap.querySelector('#y-apply').textContent = 'Apply selected';
+          wrap.querySelector('#y-apply').disabled = !n;
+        };
+        wrap.querySelectorAll('[data-u],[data-n]').forEach(x => x.onchange = recount);
+        recount();
+        wrap.querySelector('#y-cancel').onclick = () => wrap.remove();
+        wrap.querySelector('#y-apply').onclick = async () => {
+          const p = picked();
+          wrap.querySelector('#y-apply').disabled = true;
+          try {
+            const r = await api('/api/yield/apply', { method: 'POST', body: JSON.stringify(p) });
+            items = await api('/api/catalog');
+            wrap.remove(); drawList();
+            const made = r.results.filter(x => x.created).length;
+            const restored = r.results.filter(x => x.restored).length;
+            const fails = r.results.filter(x => !x.ok);
+            alert(`Synced ${r.applied} coffee${r.applied === 1 ? '' : 's'} from Yield.`
+              + (made ? ` ${made} created.` : '') + (restored ? ` ${restored} restored to the price list.` : '')
+              + (fails.length ? `\n\nNot applied:\n${fails.map(f => `· ${f.error}`).join('\n')}` : ''));
+          } catch (e) {
+            wrap.querySelector('#y-apply').disabled = false;
+            wrap.querySelector('#y-err').textContent = e.message;
+          }
+        };
+      }
+
+      (async () => {
+        try { drawPreview(await api('/api/yield/preview')); }
+        catch (e) {
+          wrap.innerHTML = `<div class="modal" style="width:520px">
+            <div class="modal-title">Sync from Yield</div>
+            <div class="modal-body">
+              <div style="font-size:12px;color:var(--red);line-height:1.8">${esc(e.message)}</div>
+              <div style="display:flex;justify-content:flex-end;margin-top:14px"><button class="btn btn-ghost" id="y-close">Close</button></div>
+            </div></div>`;
+          wrap.querySelector('#y-close').onclick = () => wrap.remove();
+        }
+      })();
     }
 
     // Info-sheet editor: label facts, brew notes (filter/espresso), then the
