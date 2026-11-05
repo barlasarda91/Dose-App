@@ -408,6 +408,7 @@ const j = client(API, 'x-hub-key');
     const rw = r.body.coffees.find(c => c.name === 'Rwanda – Inzovu Washed');
     ok(rw && rw.kind === 'update' && rw.hidden === true && rw.old_ws === 0 && rw.ws === 13.25,
       'doc-created hidden coffee matched by name; price arrives, restore flagged');
+    ok(rw.retail === 13.25, 'wholesale platform: 12oz bag mirrors the per-lb price — Yield consumer retail (23) ignored');
     ok(r.body.coffees.find(c => c.name === 'Kenya – Nyeri Othaya').kind === 'new', 'unknown Yield coffee offered as a create');
     const peru = r.body.coffees.find(c => c.name === 'Peru – Cajamarca');
     ok(peru.kind === 'skip' && /No final wholesale price/.test(peru.reason), 'unpriced Yield coffee skipped, never created at $0');
@@ -416,16 +417,16 @@ const j = client(API, 'x-hub-key');
     r = await j('POST', '/api/yield/apply', {}, OWNER);
     ok(r.status === 400, 'empty apply rejected');
     r = await j('POST', '/api/yield/apply', {
-      updates: [{ coffee_id: rw.coffee_id, price_per_lb: rw.ws, retail_price: rw.retail }],
-      creates: [{ name: 'Kenya – Nyeri Othaya', price_per_lb: 15.5, retail_price: null }],
+      updates: [{ coffee_id: rw.coffee_id, price_per_lb: rw.ws }],
+      creates: [{ name: 'Kenya – Nyeri Othaya', price_per_lb: 15.5 }],
     }, OWNER);
     ok(r.status === 200 && r.body.applied === 2 && r.body.results[0].restored === true, 'both applied; hidden coffee restored with its price');
     r = await j('GET', '/api/catalog', null, OWNER);
     const rwCat = r.body.find(i => i.name === 'Rwanda Inzovu Washed');
     const keCat = r.body.find(i => i.name === 'Kenya – Nyeri Othaya');
-    ok(rwCat && rwCat.active === 1 && rwCat.price_per_lb === 13.25 && rwCat.retail_price === 23 && rwCat.info_region === 'Nyamasheke',
-      'restored coffee keeps its doc info sheet, now priced and live');
-    ok(keCat && keCat.active === 1 && keCat.price_per_lb === 15.5 && keCat.retail_price == null, 'created coffee live at the Yield price');
+    ok(rwCat && rwCat.active === 1 && rwCat.price_per_lb === 13.25 && rwCat.retail_price === 13.25 && rwCat.info_region === 'Nyamasheke',
+      'restored coffee keeps its doc info sheet, now priced and live, bag = lb');
+    ok(keCat && keCat.active === 1 && keCat.price_per_lb === 15.5 && keCat.retail_price === 15.5, 'created coffee live at the Yield price, bag = lb');
     r = await portalCatalog(1);
     ok(r.items.some(i => i.name === 'Rwanda Inzovu Washed') && r.items.some(i => i.name === 'Kenya – Nyeri Othaya'),
       'both reach the shop price list');
