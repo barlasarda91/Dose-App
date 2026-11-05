@@ -28,9 +28,27 @@ const j = client(API, 'x-hub-key');
   });
   await new Promise(r => docSrv.listen(4525, r));
 
+  // Mock Yield registry export: keyed feed of Active coffees + final prices.
+  let yieldMode = 'ok';
+  const YIELD_ROWS = [
+    { id: 1, year: 2026, origin: 'Rwanda', farm: 'Inzovu Washed', name: 'Rwanda – Inzovu Washed', final_ws_price: 13.25, final_retail_price: 23 },
+    { id: 2, year: 2026, origin: 'Kenya', farm: 'Nyeri Othaya', name: 'Kenya – Nyeri Othaya', final_ws_price: 15.5, final_retail_price: null },
+    { id: 3, year: 2026, origin: 'Peru', farm: 'Cajamarca', name: 'Peru – Cajamarca', final_ws_price: null, final_retail_price: 20 },
+  ];
+  const yieldSrv = http.createServer((req, res) => {
+    res.setHeader('Content-Type', 'application/json');
+    if (yieldMode !== 'ok' || req.headers['x-registry-key'] !== 'yield-key-test') {
+      res.statusCode = 401;
+      return res.end(JSON.stringify({ error: 'Invalid registry key' }));
+    }
+    res.end(JSON.stringify({ generated_at: new Date().toISOString(), coffees: YIELD_ROWS }));
+  });
+  await new Promise(r => yieldSrv.listen(4526, r));
+
   const server = startServer('hub', 'server.js', {
     HUB_DB_PATH: path.join(dir, 'hub.db'), PORT: String(PORT), HUB_PASSWORD: 'ptest-boot',
     PORTAL_KEY: 'portal-master-key', DOC_EXPORT_BASE: 'http://127.0.0.1:4525',
+    YIELD_URL: 'http://127.0.0.1:4526', YIELD_KEY: 'yield-key-test',
   });
   // Orders arrive through the portal: one master key, shop named per request.
   const PKEY = 'portal-master-key';
@@ -378,6 +396,47 @@ const j = client(API, 'x-hub-key');
     r = await j('GET', '/api/activity', null, OWNER);
     ok(r.body.some(a => /created coffee "Rwanda Inzovu Washed" from the product doc \(hidden until priced\)/.test(a.action)), 'creation audited');
 
+    section('yield sync: prices from the registry, restore on price, create live');
+    r = await j('GET', '/api/yield/preview', null, STAFF);
+    ok(r.status === 403, 'staff cannot preview a Yield sync');
+    yieldMode = 'down';
+    r = await j('GET', '/api/yield/preview', null, OWNER);
+    ok(r.status === 400 && /Yield answered: Invalid registry key/.test(r.body.error), 'Yield-side refusal relayed verbatim');
+    yieldMode = 'ok';
+    r = await j('GET', '/api/yield/preview', null, OWNER);
+    ok(r.status === 200 && r.body.coffees.length === 3, 'three registry rows previewed');
+    const rw = r.body.coffees.find(c => c.name === 'Rwanda – Inzovu Washed');
+    ok(rw && rw.kind === 'update' && rw.hidden === true && rw.old_ws === 0 && rw.ws === 13.25,
+      'doc-created hidden coffee matched by name; price arrives, restore flagged');
+    ok(r.body.coffees.find(c => c.name === 'Kenya – Nyeri Othaya').kind === 'new', 'unknown Yield coffee offered as a create');
+    const peru = r.body.coffees.find(c => c.name === 'Peru – Cajamarca');
+    ok(peru.kind === 'skip' && /No final wholesale price/.test(peru.reason), 'unpriced Yield coffee skipped, never created at $0');
+    ok(r.body.not_in_yield.some(c => c.name === 'Blend No. 1'), 'catalog coffee missing from Yield reported, not touched');
+
+    r = await j('POST', '/api/yield/apply', {}, OWNER);
+    ok(r.status === 400, 'empty apply rejected');
+    r = await j('POST', '/api/yield/apply', {
+      updates: [{ coffee_id: rw.coffee_id, price_per_lb: rw.ws, retail_price: rw.retail }],
+      creates: [{ name: 'Kenya – Nyeri Othaya', price_per_lb: 15.5, retail_price: null }],
+    }, OWNER);
+    ok(r.status === 200 && r.body.applied === 2 && r.body.results[0].restored === true, 'both applied; hidden coffee restored with its price');
+    r = await j('GET', '/api/catalog', null, OWNER);
+    const rwCat = r.body.find(i => i.name === 'Rwanda Inzovu Washed');
+    const keCat = r.body.find(i => i.name === 'Kenya – Nyeri Othaya');
+    ok(rwCat && rwCat.active === 1 && rwCat.price_per_lb === 13.25 && rwCat.retail_price === 23 && rwCat.info_region === 'Nyamasheke',
+      'restored coffee keeps its doc info sheet, now priced and live');
+    ok(keCat && keCat.active === 1 && keCat.price_per_lb === 15.5 && keCat.retail_price == null, 'created coffee live at the Yield price');
+    r = await portalCatalog(1);
+    ok(r.items.some(i => i.name === 'Rwanda Inzovu Washed') && r.items.some(i => i.name === 'Kenya – Nyeri Othaya'),
+      'both reach the shop price list');
+    r = await j('GET', '/api/yield/preview', null, OWNER);
+    ok(r.body.coffees.filter(c => c.kind === 'same').length === 2, 'second preview finds both already in agreement');
+    r = await j('POST', '/api/yield/apply', { creates: [{ name: 'Kenya – Nyeri Othaya', price_per_lb: 15.5 }] }, OWNER);
+    ok(r.body.applied === 0 && /already exists/.test(r.body.results[0].error), 'duplicate create refused, not duplicated');
+    r = await j('GET', '/api/activity', null, OWNER);
+    ok(r.body.some(a => /synced "Rwanda Inzovu Washed" from Yield/.test(a.action))
+      && r.body.some(a => /created coffee "Kenya – Nyeri Othaya" from Yield/.test(a.action)), 'sync audited per coffee');
+
     section('chain accounts: owners span stores, managers do not');
     r = await j('POST', '/api/shops', { name: 'Pressure Shop Venice', email: 'venice@example.com' }, OWNER);
     const shop2 = r.body.shop.id;
@@ -430,6 +489,7 @@ const j = client(API, 'x-hub-key');
   } finally {
     server.kill();
     docSrv.close();
+    yieldSrv.close();
   }
   finish();
 })();
