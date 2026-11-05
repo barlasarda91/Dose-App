@@ -1047,9 +1047,11 @@
                   <span class="lbl" style="margin:0">Apply to</span>
                   <select data-target="${idx}">
                     <option value="">— skip / pick a coffee</option>
-                    <option value="__new__" ${!c.match_id ? 'selected' : ''}>➕ Create as new coffee (hidden until priced)</option>
+                    <option value="__new__" ${!c.match_id ? 'selected' : ''}>➕ Create “${esc(c.title)}” — hidden until priced</option>
                     ${active.map(i => `<option value="${i.id}" ${i.id === c.match_id ? 'selected' : ''}>${esc(i.name)}</option>`).join('')}
                   </select>
+                  <input data-newname="${idx}" value="${esc(c.title)}" title="Catalog name for the new coffee"
+                    style="display:none;min-width:200px;font-family:var(--mono);font-size:11px;border:1px solid var(--stone);background:var(--parch);padding:5px 8px">
                   <span data-warn="${idx}" style="color:var(--warn)"></span>
                 </div>
               </div>`;
@@ -1064,8 +1066,9 @@
         const warnFor = idx => {
           const sel = wrap.querySelector(`[data-target="${idx}"]`);
           const target = items.find(i => String(i.id) === sel.value);
+          wrap.querySelector(`[data-newname="${idx}"]`).style.display = sel.value === '__new__' ? '' : 'none';
           wrap.querySelector(`[data-warn="${idx}"]`).textContent =
-            sel.value === '__new__' ? 'created hidden — set its price, then Restore it to put it on sale'
+            sel.value === '__new__' ? '← its catalog name (edit if you like) — created hidden; set a price, then Restore'
             : target && hasSheet(target) ? '⚠ replaces this coffee’s facts and sections (brew notes & cup profile untouched)' : '';
         };
         const countApply = () => {
@@ -1087,8 +1090,8 @@
           const payload = coffees
             .map((c, idx) => ({ c, inc: wrap.querySelector(`[data-inc="${idx}"]`).checked, id: wrap.querySelector(`[data-target="${idx}"]`).value }))
             .filter(x => x.inc && x.id)
-            .map(x => x.id === '__new__'
-              ? { create_name: x.c.title, facts: x.c.facts, sections: x.c.sections }
+            .map((x) => x.id === '__new__'
+              ? { create_name: (wrap.querySelector(`[data-newname="${coffees.indexOf(x.c)}"]`).value || x.c.title).trim(), facts: x.c.facts, sections: x.c.sections }
               : { coffee_id: parseInt(x.id, 10), facts: x.c.facts, sections: x.c.sections });
           if (!payload.length) return;
           wrap.querySelector('#imp-apply').disabled = true;
